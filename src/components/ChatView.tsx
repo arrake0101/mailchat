@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { api } from "../api";
 import type { Conversation, GroupInfo, GroupMember, Message, Status } from "../types";
 import { Avatar, clockTime, dayLabel, GroupAvatar, senderColor } from "../util";
@@ -16,6 +16,7 @@ import {
   IconTag,
   IconUsers,
 } from "./Icons";
+import { MarkdownText } from "./MarkdownText";
 import { startWindowDrag, toggleWindowMaximize } from "./WindowControls";
 
 interface Props {
@@ -74,6 +75,16 @@ export function ChatView({ conv, status, messages, onSent, onChanged, onGroupUpd
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ block: "end" });
   }, [messages.length, conv.peer]);
+
+  useLayoutEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = "0px";
+    const maxPx = 152;
+    const contentH = el.scrollHeight;
+    el.style.height = `${Math.min(Math.max(24, contentH), maxPx)}px`;
+    el.style.overflowY = contentH > maxPx ? "auto" : "hidden";
+  }, [text, conv.peer]);
 
   useEffect(() => {
     setText("");
@@ -338,7 +349,9 @@ export function ChatView({ conv, status, messages, onSent, onChanged, onGroupUpd
                 <IconClose size={13} />
               </button>
             </div>
-            <div className="summary-banner-body">{aiSummary}</div>
+            <div className="summary-banner-body">
+              <MarkdownText content={aiSummary} />
+            </div>
           </div>
         )}
 
@@ -531,6 +544,7 @@ export function ChatView({ conv, status, messages, onSent, onChanged, onGroupUpd
 
               <textarea
                 ref={inputRef}
+                rows={1}
                 value={text}
                 placeholder={
                   conv.is_group
@@ -544,15 +558,14 @@ export function ChatView({ conv, status, messages, onSent, onChanged, onGroupUpd
                     send();
                   }
                 }}
-                rows={Math.min(6, Math.max(1, text.split("\n").length))}
               />
 
               <button
                 type="button"
-                className="primary-btn send-circle"
+                className={`composer-send-btn ${!sending && text.trim() ? "ready" : ""}`}
                 onClick={send}
                 disabled={sending || !text.trim()}
-                title="发送"
+                title="发送 (Enter)"
               >
                 <IconSend size={15} />
               </button>

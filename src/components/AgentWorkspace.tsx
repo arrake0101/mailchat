@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from "react";
-import { api } from "../api";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { api, MODEL_PRESETS } from "../api";
 import type { ChatTurn, SecretPrompt, SecretStatus } from "../types";
 import { IconCheck, IconCode, IconKey, IconLock, IconSend, IconSliders, IconSparkles } from "./Icons";
+import { MarkdownText } from "./MarkdownText";
 import { startWindowDrag, toggleWindowMaximize } from "./WindowControls";
 
 interface RichTurn {
@@ -22,6 +23,17 @@ const STARTER_PROMPTS = [
   { title: "载入沙盒演示数据", desc: "免绑邮箱体验 4 人群聊与智能分流", text: "载入演示会话体验" },
 ];
 
+function parseActiveAgentMeta(tomlText: string) {
+  const agentBlockMatch = tomlText.match(/\[agent\]([\s\S]*?)(?:\n\[|$)/);
+  const section = agentBlockMatch ? agentBlockMatch[1] : tomlText;
+  const presetMatch = section.match(/^\s*preset\s*=\s*"([^"]+)"/m);
+  const modelMatch = section.match(/^\s*model\s*=\s*"([^"]+)"/m);
+  return {
+    presetId: presetMatch?.[1]?.trim() || "deepseek",
+    modelName: modelMatch?.[1]?.trim() || "deepseek-v4.1-flash",
+  };
+}
+
 export function AgentWorkspace({
   notify,
   onDataChanged,
@@ -41,9 +53,11 @@ export function AgentWorkspace({
   const [secrets, setSecrets] = useState<SecretStatus[]>([]);
   const [showToml, setShowToml] = useState(true);
   const [applyingToml, setApplyingToml] = useState(false);
+  const [showModelQuickMenu, setShowModelQuickMenu] = useState(false);
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const quickMenuRef = useRef<HTMLDivElement>(null);
 
   const loadBundle = async () => {
     try {
@@ -65,10 +79,35 @@ export function AgentWorkspace({
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [turns.length, busy]);
 
+  // 根据输入内容真实高度自适应伸缩，单行时彻底隐藏滚动条杜绝系统上下箭头与裁切
+  useLayoutEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = "0px";
+    const maxPx = 152;
+    const contentH = el.scrollHeight;
+    const nextH = Math.min(Math.max(24, contentH), maxPx);
+    el.style.height = `${nextH}px`;
+    el.style.overflowY = contentH > maxPx ? "auto" : "hidden";
+  }, [input]);
+
+  // 点击外部关闭模型快捷菜单
+  useEffect(() => {
+    if (!showModelQuickMenu) return;
+    const onDocClick = (e: MouseEvent) => {
+      if (quickMenuRef.current && !quickMenuRef.current.contains(e.target as Node)) {
+        setShowModelQuickMenu(false);
+      }
+    };
+    document.addEventListener("mousedown", onDocClick);
+    return () => document.removeEventListener("mousedown", onDocClick);
+  }, [showModelQuickMenu]);
+
   const sendPrompt = async (rawText?: string) => {
     const msg = (rawText ?? input).trim();
     if (!msg || busy) return;
-    if (!rawText) setInput("");
+    if (rawText === undefined) setInput("");
+    setShowModelQuickMenu(false);
 
     const userTurn: RichTurn = { id: Date.now(), role: "user", content: msg };
     const historyPayload: ChatTurn[] = turns.map((t) => ({ role: t.role, content: t.content }));
@@ -115,8 +154,21 @@ export function AgentWorkspace({
     }
   };
 
+  const activeMeta = useMemo(() => {
+    const { presetId, modelName } = parseActiveAgentMeta(savedToml);
+    const presetObj = MODEL_PRESETS.find((p) => p.id === presetId);
+    const presetLabel = presetObj?.name ?? presetId;
+    const secretSlot = presetId === "ollama" ? null : `llm_${presetId}`;
+    const keylessOk = presetId === "ollama" || presetId === "ollama_remote" || presetId === "custom";
+    const hasSecret = secretSlot ? secrets.some((s) => s.key === secretSlot && s.configured) : true;
+    const ready = keylessOk || hasSecret;
+    return { presetId, presetLabel, modelName, ready, secretSlot };
+  }, [savedToml, secrets]);
+
+  const featuredPresets = useMemo(() => MODEL_PRESETS.filter((p) => p.featured), []);
   const configuredSecretCount = secrets.filter((s) => s.configured).length;
   const tomlDirty = draftToml !== savedToml;
+  const canSend = !busy && input.trim().length > 0;
 
   return (
     <section className="agent-workspace">
@@ -202,54 +254,83 @@ export function AgentWorkspace({
             </div>
           ) : (
             <div className="agent-turns">
-              {turns.map((t, idx) => (
-                <div key={t.id} className={`agent-turn ${t.role}`}>
-                  <div className="agent-bubble">
-                    <div className="agent-text">{t.content}</div>
-
-                    {t.changes && t.changes.length > 0 && (
-                      <div className="applied-changes">
-                        {t.changes.map((ch, i) => (
-                          <span key={i} className="change-pill">
-                            <IconCheck size={12} />
-                            <span>{ch}</span>
-                          </span>
-                        ))}
+              {turns.map((t, idx) => {
+                const isLast = idx === turns.length - 1;
+                return (
+                  <div key={t.id} className={`agent-turn ${t.role}`}>
+                    {t.role === "assistant" && (
+                      <div className="agent-turn-avatar" aria-hidden="true">
+                        <IconSparkles size={14} />
                       </div>
                     )}
 
-                    {t.secretPrompts && t.secretPrompts.length > 0 && (
-                      <div className="secret-cards-stack">
-                        {t.secretPrompts.map((sp) => (
-                          <InlineSecretVaultCard
-                            key={sp.key}
-                            prompt={sp}
-                            onSaved={(nextSecrets, msg) => {
-                              setSecrets(nextSecrets);
-                              notify(msg);
-                              onDataChanged();
-                            }}
-                            onError={(err) => notify(err, true)}
-                          />
-                        ))}
-                      </div>
-                    )}
+                    <div className="agent-turn-col">
+                      <div className="agent-bubble">
+                        {t.role === "assistant" ? (
+                          <MarkdownText content={t.content} />
+                        ) : (
+                          <div className="agent-user-text">{t.content}</div>
+                        )}
 
-                    {idx === turns.length - 1 && t.suggestions && t.suggestions.length > 0 && (
-                      <div className="followup-pills">
-                        {t.suggestions.map((sug) => (
-                          <button key={sug} type="button" className="followup-btn" onClick={() => sendPrompt(sug)}>
-                            {sug}
-                          </button>
-                        ))}
+                        {t.changes && t.changes.length > 0 && (
+                          <div className="applied-changes">
+                            {t.changes.map((ch, i) => (
+                              <span key={i} className="change-pill">
+                                <IconCheck size={12} />
+                                <span>{ch}</span>
+                              </span>
+                            ))}
+                          </div>
+                        )}
+
+                        {t.secretPrompts && t.secretPrompts.length > 0 && (
+                          <div className="secret-cards-stack">
+                            {t.secretPrompts.map((sp) => (
+                              <InlineSecretVaultCard
+                                key={sp.key}
+                                prompt={sp}
+                                onSaved={(nextSecrets, msg) => {
+                                  setSecrets(nextSecrets);
+                                  loadBundle();
+                                  notify(msg);
+                                  onDataChanged();
+                                }}
+                                onError={(err) => notify(err, true)}
+                              />
+                            ))}
+                          </div>
+                        )}
                       </div>
-                    )}
+
+                      {isLast && t.suggestions && t.suggestions.length > 0 && (
+                        <div className="followup-pills">
+                          {t.suggestions.map((sug) => (
+                            <button key={sug} type="button" className="followup-btn" onClick={() => sendPrompt(sug)}>
+                              {sug}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
+
               {busy && (
                 <div className="agent-turn assistant">
-                  <div className="agent-bubble thinking-bubble">正在规划声明式配置…</div>
+                  <div className="agent-turn-avatar" aria-hidden="true">
+                    <IconSparkles size={14} />
+                  </div>
+                  <div className="agent-turn-col">
+                    <div className="agent-bubble thinking-bubble">
+                      <span className="thinking-dots">
+                        <i />
+                        <i />
+                        <i />
+                      </span>
+                      <span>正在思考与编排配置…</span>
+                    </div>
+                  </div>
                 </div>
               )}
               <div ref={bottomRef} />
@@ -258,29 +339,132 @@ export function AgentWorkspace({
         </div>
 
         <footer className="agent-composer-wrap">
-          <div className="agent-composer">
-            <textarea
-              ref={inputRef}
-              value={input}
-              placeholder="输入配置指令，如：使用 DeepSeek 官网 / 切换为 OpenCode Go / 切换为 Ollama 远程订阅 / 绑定 xxx@qq.com…"
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
-                  e.preventDefault();
-                  sendPrompt();
-                }
-              }}
-              rows={Math.min(5, Math.max(1, input.split("\n").length))}
-            />
-            <button
-              type="button"
-              className="primary-btn send-circle"
-              onClick={() => sendPrompt()}
-              disabled={busy || !input.trim()}
-              title="发送指令"
-            >
-              <IconSend size={15} />
-            </button>
+          <div
+            className={`agent-composer-card ${busy ? "is-busy" : ""}`}
+            onMouseDown={(e) => {
+              const tag = (e.target as HTMLElement).tagName;
+              if (tag !== "BUTTON" && tag !== "TEXTAREA" && !(e.target as HTMLElement).closest("button")) {
+                requestAnimationFrame(() => inputRef.current?.focus());
+              }
+            }}
+          >
+            <div className="agent-composer-input-row">
+              <textarea
+                ref={inputRef}
+                rows={1}
+                value={input}
+                placeholder="输入对话或配置指令，如：你好 / 切换 OpenCode Go / 绑定 xxx@qq.com…"
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+                    e.preventDefault();
+                    sendPrompt();
+                  }
+                }}
+              />
+            </div>
+
+            <div className="agent-composer-footer">
+              <div className="agent-composer-tools">
+                <div className="composer-model-wrap" ref={quickMenuRef}>
+                  <button
+                    type="button"
+                    className={`composer-model-pill ${activeMeta.ready ? "ready" : "unconfigured"}`}
+                    onClick={() => setShowModelQuickMenu((v) => !v)}
+                    title="点击快速切换首选模型服务或录入 API Key"
+                  >
+                    <span className={`status-dot ${activeMeta.ready ? "ok" : "warn"}`} />
+                    <span className="composer-model-name">{activeMeta.presetLabel}</span>
+                    <span className="composer-model-sep">·</span>
+                    <span className="composer-model-id">{activeMeta.modelName}</span>
+                    {!activeMeta.ready && <span className="composer-model-tag">未配密钥</span>}
+                  </button>
+
+                  {showModelQuickMenu && (
+                    <div className="composer-model-menu">
+                      <div className="composer-menu-header">首选推荐接入（默认 deepseek-v4.1-flash）</div>
+                      {featuredPresets.map((fp) => {
+                        const slot = `llm_${fp.id}`;
+                        const configured = secrets.some((s) => s.key === slot && s.configured);
+                        const isActive = activeMeta.presetId === fp.id;
+                        return (
+                          <button
+                            key={fp.id}
+                            type="button"
+                            className={`composer-menu-item ${isActive ? "active" : ""}`}
+                            onClick={() => {
+                              setShowModelQuickMenu(false);
+                              if (fp.id === "deepseek") {
+                                sendPrompt("使用 DeepSeek 官网配置");
+                              } else if (fp.id === "opencode_go") {
+                                sendPrompt("切换为 OpenCode Go 订阅");
+                              } else if (fp.id === "ollama_cloud") {
+                                sendPrompt("切换为 Ollama 远程订阅");
+                              }
+                            }}
+                          >
+                            <div className="composer-menu-item-main">
+                              <span className="composer-menu-item-title">{fp.name}</span>
+                              <span className="composer-menu-badge">{fp.badge}</span>
+                            </div>
+                            <span className={`composer-menu-state ${configured ? "ok" : ""}`}>
+                              {configured ? "密钥已就绪" : "待录入 Key"}
+                            </span>
+                          </button>
+                        );
+                      })}
+                      <div className="composer-menu-divider" />
+                      <button
+                        type="button"
+                        className="composer-menu-action"
+                        onClick={() => {
+                          setShowModelQuickMenu(false);
+                          sendPrompt("配置 API Key");
+                        }}
+                      >
+                        <IconKey size={13} />
+                        <span>录入 / 更新当前服务 API Key</span>
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                {!activeMeta.ready && (
+                  <button
+                    type="button"
+                    className="composer-quick-chip accent"
+                    onClick={() => sendPrompt("配置 API Key")}
+                  >
+                    <IconKey size={12} />
+                    <span>录入密钥</span>
+                  </button>
+                )}
+
+                {turns.length > 0 && (
+                  <button
+                    type="button"
+                    className="composer-quick-chip"
+                    onClick={() => setTurns([])}
+                    disabled={busy}
+                  >
+                    <span>清空对话</span>
+                  </button>
+                )}
+              </div>
+
+              <div className="agent-composer-right">
+                <span className="composer-shortcut-hint">Enter 发送 · Shift+Enter 换行</span>
+                <button
+                  type="button"
+                  className={`composer-send-btn ${canSend ? "ready" : ""}`}
+                  onClick={() => sendPrompt()}
+                  disabled={!canSend}
+                  title="发送 (Enter)"
+                >
+                  <IconSend size={15} />
+                </button>
+              </div>
+            </div>
           </div>
         </footer>
       </div>

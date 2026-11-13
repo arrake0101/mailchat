@@ -287,10 +287,11 @@ async fn chat_with_agent(
 ) -> CmdResult<AgentChatResponse> {
     let cfg = config::hydrated_agent(&state.db, &state.vault).map_err(err)?;
     let spec = config::build_spec(&state.db).map_err(err)?;
+    let stats = state.db.stats().unwrap_or_default();
     let current_toml = config::export_toml(&state.db).map_err(err)?;
     let statuses = state.vault.statuses();
 
-    let mut plan = agent::chat_config_agent(&cfg, &spec, &current_toml, &statuses, &history, &message).await;
+    let mut plan = agent::chat_config_agent(&cfg, &spec, &stats, &current_toml, &statuses, &history, &message).await;
 
     if let Some((sk, raw_val)) = &plan.intercepted_secret {
         state.vault.set(sk, raw_val).map_err(err)?;

@@ -2,7 +2,7 @@
 //! 支持切换：OpenAI 兼容接口（DeepSeek / OpenAI / 通义千问 / Kimi / 硅基流动 / 本地 Ollama 等）、Anthropic Claude、Google Gemini。
 
 use crate::config::{mail_domain_defaults, model_preset_defaults, DeclarativeConfig, GroupSpec};
-use crate::db::{AgentConfig, GroupMember, HistoryItem, Rule};
+use crate::db::{AgentConfig, GroupMember, HistoryItem, MailboxStats, Rule};
 use crate::vault::{llm_secret_key, SecretStatus};
 use anyhow::{anyhow, bail, Result};
 use regex::Regex;
@@ -304,6 +304,23 @@ fn is_keyless_allowed(cfg: &AgentConfig) -> bool {
         || base.contains(":11434")
 }
 
+fn preset_display_label(preset: &str) -> &'static str {
+    match preset.trim().to_lowercase().as_str() {
+        "deepseek" => "DeepSeek 官网",
+        "opencode_go" => "OpenCode Go 订阅",
+        "ollama_cloud" => "Ollama 远程订阅",
+        "ollama_remote" => "Ollama 自建远程算力",
+        "ollama" => "本地 Ollama",
+        "qwen" => "通义千问 Qwen",
+        "openai" => "OpenAI",
+        "anthropic" => "Anthropic Claude",
+        "gemini" => "Google Gemini",
+        "kimi" => "Moonshot Kimi",
+        "siliconflow" => "硅基流动 SiliconFlow",
+        _ => "自定义兼容接口",
+    }
+}
+
 fn can_call_llm(cfg: &AgentConfig) -> bool {
     if cfg.model.trim().is_empty() {
         return false;
@@ -316,10 +333,117 @@ fn can_call_llm(cfg: &AgentConfig) -> bool {
     is_keyless_allowed(cfg) || !cfg.api_key.trim().is_empty()
 }
 
-/// 声明式配置管家 Agent：优先做隐私凭据本地拦截；已配置大模型时走大模型声明式规划，否则无缝使用本地确定性解析引擎
+/// 宽容解析大模型输出：
+/// 1. 兼容 JSON 中 `changes: null` / `request_secrets: null` 等 null 值或字符串值；
+/// 2. 防止空字符串或无效 `updated_toml` 覆盖原有配置；
+/// 3. 若模型对闲聊/问答直接输出了自然语言 Markdown（未包裹 JSON），直接保留其回复而不丢弃。
+fn parse_config_plan(raw: &str, current_toml: &str) -> Result<ConfigAgentPlan> {
+    let cleaned = strip_think_blocks(raw);
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        bail!("模型返回内容为空");
+    }
+
+    let extract_str_list = |val: &Value| -> Vec<String> {
+        match val {
+            Value::Array(arr) => arr
+                .iter()
+                .filter_map(|x| x.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            Value::String(s) => {
+                let st = s.trim();
+                if st.is_empty() || st.eq_ignore_ascii_case("null") || st.eq_ignore_ascii_case("none") {
+                    vec![]
+                } else {
+                    vec![st.to_string()]
+                }
+            }
+            _ => vec![],
+        }
+    };
+
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
+        if start < end {
+            if let Ok(v) = serde_json::from_str::<Value>(&trimmed[start..=end]) {
+                if v.is_object() {
+                    let reply = v["reply"]
+                        .as_str()
+                        .or_else(|| v["message"].as_str())
+                        .or_else(|| v["answer"].as_str())
+                        .or_else(|| v["content"].as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+
+                    let updated_toml = v["updated_toml"]
+                        .as_str()
+                        .map(|s| s.trim())
+                        .filter(|s| {
+                            !s.is_empty()
+                                && !s.eq_ignore_ascii_case("null")
+                                && !s.eq_ignore_ascii_case("none")
+                                && s.contains('[')
+                                && *s != current_toml.trim()
+                        })
+                        .map(|s| s.to_string());
+
+                    let changes = extract_str_list(&v["changes"]);
+                    let request_secrets = extract_str_list(&v["request_secrets"]);
+                    let operations = extract_str_list(&v["operations"]);
+                    let suggestions = extract_str_list(&v["suggestions"]);
+
+                    let final_reply = if !reply.is_empty() {
+                        reply
+                    } else if !changes.is_empty() {
+                        format!("已完成配置更新：{}", changes.join("；"))
+                    } else {
+                        "已处理你的请求。".to_string()
+                    };
+
+                    return Ok(ConfigAgentPlan {
+                        reply: final_reply,
+                        updated_toml,
+                        changes,
+                        request_secrets,
+                        operations,
+                        suggestions,
+                        intercepted_secret: None,
+                    });
+                }
+            }
+        }
+    }
+
+    // 模型直接以自然语言文本作答（例如打招呼、解答问题），剥离可能包裹的代码围栏后直接作为回复展示
+    let plain = trimmed
+        .strip_prefix("```markdown")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .and_then(|s| s.strip_suffix("```"))
+        .unwrap_or(trimmed)
+        .trim()
+        .to_string();
+
+    Ok(ConfigAgentPlan {
+        reply: plain,
+        updated_toml: None,
+        changes: vec![],
+        request_secrets: vec![],
+        operations: vec![],
+        suggestions: vec![],
+        intercepted_secret: None,
+    })
+}
+
+/// 声明式配置管家 Agent：
+/// 1. 隐私凭据本地前置拦截；
+/// 2. 已配 Key 时走大模型自由对话与声明式规划（若接口报错则明确反馈原因并尝试本地兜底，绝不静默吞错）；
+/// 3. 未配 Key 时走本地确定性配置与状态问答引擎。
 pub async fn chat_config_agent(
     cfg: &AgentConfig,
     spec: &DeclarativeConfig,
+    stats: &MailboxStats,
     current_toml: &str,
     secret_statuses: &[SecretStatus],
     history: &[ChatTurn],
@@ -344,7 +468,7 @@ pub async fn chat_config_agent(
         let updated_toml = toml::to_string_pretty(&next).ok();
         return ConfigAgentPlan {
             reply: format!(
-                "检测到你直接输入了密钥凭据。为保障隐私安全，我已在本地直接拦截并采用系统级 DPAPI 加密存入「隐私凭据保险箱」（`{secret_key}`），未向任何外部服务器发送该明文，同时已自动开启 AI 分拣。"
+                "检测到你直接输入了密钥凭据。为保障隐私安全，我已在本地直接拦截并采用系统级 DPAPI 加密存入 **隐私凭据保险箱**（`{secret_key}`），未向任何外部服务器发送该明文，同时已自动开启 AI 分拣。"
             ),
             updated_toml,
             changes: vec![
@@ -356,25 +480,74 @@ pub async fn chat_config_agent(
             suggestions: vec![
                 "对现有邮件执行一次 AI 分拣".into(),
                 "绑定我的邮箱账号".into(),
-                "查看当前声明式配置".into(),
+                "查看当前配置状态".into(),
             ],
             intercepted_secret: Some((secret_key, raw_val)),
         };
     }
 
-    // 2. 若大模型可用，让大模型基于当前脱敏后的 config.toml 与凭据状态生成声明式变更
+    // 2. 若大模型可用，让大模型基于当前脱敏后的 config.toml 与凭据状态进行自由对话或声明式变更
     if can_call_llm(cfg) {
-        if let Ok(plan) = llm_config_planner(cfg, current_toml, secret_statuses, history, trimmed).await {
-            return plan;
+        match llm_config_planner(cfg, stats, current_toml, secret_statuses, history, trimmed).await {
+            Ok(plan) => return plan,
+            Err(llm_err) => {
+                let err_msg = format!("{llm_err:#}");
+                let err_lower = err_msg.to_lowercase();
+                let label = preset_display_label(&cfg.preset);
+
+                // 若用户说的本身就是明确的本地确定性指令（如切换模型、增删规则、载入演示），先执行指令并附带接口报错说明
+                if let Some(mut local_plan) = try_actionable_local_intent(spec, stats, secret_statuses, trimmed) {
+                    local_plan.reply.push_str(&format!(
+                        "\n\n> **接口提示**：当前调用 **{label}**（`{}`）未成功（{}），本次操作已由本地引擎直接完成。",
+                        cfg.model, err_msg
+                    ));
+                    return local_plan;
+                }
+
+                // 否则明确告知用户远端模型调用报错原因，绝不静默返回固定欢迎模板
+                let looks_auth_err = err_lower.contains("401")
+                    || err_lower.contains("403")
+                    || err_lower.contains("unauthorized")
+                    || err_lower.contains("invalid")
+                    || err_lower.contains("authentication")
+                    || err_lower.contains("api key")
+                    || err_lower.contains("apikey");
+
+                let mut req_secrets = Vec::new();
+                if looks_auth_err {
+                    if let Some(sk) = llm_secret_key(&cfg.preset) {
+                        req_secrets.push(sk.to_string());
+                    }
+                }
+
+                return ConfigAgentPlan {
+                    reply: format!(
+                        "调用 **{label}**（模型 `{}`）时未能正常响应：\n\n> {}\n\n你可以检查或重新录入 API Key，也可以直接切换至其他首选接入服务：",
+                        cfg.model, err_msg
+                    ),
+                    updated_toml: None,
+                    changes: vec![],
+                    request_secrets: req_secrets,
+                    operations: vec![],
+                    suggestions: vec![
+                        "配置 API Key".into(),
+                        "使用 DeepSeek 官网配置".into(),
+                        "切换为 OpenCode Go 订阅".into(),
+                        "切换为 Ollama 远程订阅".into(),
+                    ],
+                    intercepted_secret: None,
+                };
+            }
         }
     }
 
-    // 3. 离线 / 未配 Key 时：本地确定性配置解析器，零依赖完成账号、模型切换、分流规则、群聊与沙盒操作
-    local_config_intent(spec, secret_statuses, trimmed)
+    // 3. 离线 / 未配 Key 时：本地确定性配置解析与状态问答引擎
+    local_config_intent(spec, stats, secret_statuses, trimmed)
 }
 
 async fn llm_config_planner(
     cfg: &AgentConfig,
+    stats: &MailboxStats,
     current_toml: &str,
     secret_statuses: &[SecretStatus],
     history: &[ChatTurn],
@@ -393,46 +566,62 @@ async fn llm_config_planner(
         .collect();
 
     let mut recent = String::new();
-    for t in history.iter().rev().take(6).rev() {
+    for t in history.iter().rev().take(8).rev() {
         recent.push_str(&format!("[{}]: {}\n", t.role, t.content));
     }
 
-    let system = r#"你是 MailChat 的「声明式配置与邮箱管家 Agent」。
-MailChat 采用「声明式配置 (config.toml) + 独立本地隐私保险箱 (Vault)」架构：
-1. 所有非隐私设置（邮箱服务器 `[account]`、模型与偏好 `[agent]`、白名单/屏蔽/归档规则 `[triage]`、群聊 `[[groups]]`）均通过修改声明式 TOML 完成。
-2. 严禁在 TOML 或对话中索要明文密码或 API Key！涉及到邮箱授权码（`mail_password`）或模型密钥（优先推荐：`llm_deepseek`、`llm_opencode_go`、`llm_ollama_cloud`；其他兼容：`llm_ollama_remote`、`llm_qwen`、`llm_openai`、`llm_anthropic`、`llm_gemini`、`llm_kimi`、`llm_siliconflow`、`llm_custom`），只需在 JSON 的 `request_secrets` 数组里填入对应键名，客户端会自动弹出本地加密输入卡片。
+    let system = r#"你是 MailChat 的「智能配置与邮箱管家 Agent」。
+MailChat 是一款把标准 IMAP/SMTP 邮件体验重塑为现代即时通讯（单聊 + 全员群聊）的桌面客户端，采用「声明式配置 (config.toml) + 独立本地隐私保险箱 (Vault)」架构。
 
-常见预设参考（优先推荐前 3 项，均默认使用 `deepseek-v4.1-flash`）：
+你的双重职责：
+1. **自然对话与答疑**：当用户向你问候（如“你好”）、询问当前配置或邮件状态、咨询邮箱授权码怎么开启、讨论如何管理收件箱或普通交流时，请像专业贴心的私人管家一样**直接自然回应用户的问题**（可使用清晰的 Markdown 加粗、列表或行内代码），**绝不要机械重复自我介绍模板**！此时 `"updated_toml"` 设为 `null`，`"changes"` 设为 `[]`。
+2. **声明式配置编排**：当用户希望修改邮箱账号 `[account]`、切换模型或修改分拣指令 `[agent]`、增删白名单/屏蔽/通知折叠规则 `[triage]`、创建或管理邮件群聊 `[[groups]]` 时，输出完整且合法的 `"updated_toml"` 并在 `"changes"` 中列出每一项变更。
+3. **隐私安全铁律**：严禁在 TOML 或对话中索要明文密码或 API Key！涉及邮箱授权码（`mail_password`）或模型密钥（优先推荐：`llm_deepseek`、`llm_opencode_go`、`llm_ollama_cloud`；其他兼容：`llm_ollama_remote`、`llm_qwen`、`llm_openai`、`llm_anthropic`、`llm_gemini`、`llm_kimi`、`llm_siliconflow`、`llm_custom`）时，只需在 `"request_secrets"` 数组中填入对应键名，客户端会在气泡内自动弹出本地 DPAPI 加密输入卡片。
+
+常见预设参考（优先推荐前 3 项，默认均搭载 `deepseek-v4.1-flash`）：
 - 首选模型 preset：
-  1. `deepseek`（DeepSeek 官网配置，openai 兼容，`https://api.deepseek.com/v1`，默认模型 `deepseek-v4.1-flash`，密钥 `llm_deepseek`）
-  2. `opencode_go`（OpenCode Go 订阅，openai 兼容，`https://opencode.ai/zen/go/v1`，默认模型 `deepseek-v4.1-flash`，密钥 `llm_opencode_go`；亦可选 glm-5.3-flash / kimi-k3.1-pro 等）
+  1. `deepseek`（DeepSeek 官网，openai 兼容，`https://api.deepseek.com/v1`，默认模型 `deepseek-v4.1-flash`，密钥 `llm_deepseek`）
+  2. `opencode_go`（OpenCode Go 订阅，openai 兼容，`https://opencode.ai/zen/go/v1`，默认模型 `deepseek-v4.1-flash`，密钥 `llm_opencode_go`）
   3. `ollama_cloud`（Ollama 远程订阅 / Cloud，openai 兼容，`https://ollama.com/v1`，默认模型 `deepseek-v4.1-flash`，密钥 `llm_ollama_cloud`）
 - 其他兼容 preset：
-  - `ollama_remote`（自建局域网/远程算力机 Ollama，如 `http://192.168.1.100:11434/v1`，免 Key 直连，可选网关密钥 `llm_ollama_remote`）
+  - `ollama_remote`（自建局域网/算力机 Ollama，如 `http://192.168.1.100:11434/v1`，免 Key 直连，可选网关密钥 `llm_ollama_remote`）
   - `ollama`（本机离线 `http://localhost:11434/v1`，默认 `qwen2.5:7b`，免 Key）
   - `qwen` (`https://dashscope.aliyuncs.com/compatible-mode/v1`, `qwen-plus`)、`openai` (`https://api.openai.com/v1`, `gpt-4o-mini`)、`anthropic`、`gemini`、`kimi`、`siliconflow`。
 - 邮箱域名：`qq.com`/`foxmail.com` (imap.qq.com:993, smtp.qq.com:465), `163.com` (imap.163.com:993, smtp.163.com:465), `126.com`, `gmail.com` (imap.gmail.com:993, smtp.gmail.com:465), `outlook.com` (outlook.office365.com:993, smtp.office365.com:587), `icloud.com`, `aliyun.com`。
 
-请严格只输出一个 JSON 对象：
+请严格输出一个 JSON 对象（不要输出多余前缀）：
 {
-  "reply": "自然简洁的中文答复，告诉用户做了哪些声明式变更或操作",
-  "updated_toml": "若需修改配置，输出完整且合法的新 TOML 字符串（保留未改动的原有段落，`password_ref` 与 `api_key_ref` 保持 `secret:...` 引用）；若无需改动配置则填 null",
-  "changes": ["简短列出每一项变更，如：新增屏蔽关键词『退订』"],
-  "request_secrets": ["若相关凭据处于未配置状态或用户要求修改密码/Key，填入键名如 mail_password、llm_deepseek、llm_opencode_go 或 llm_ollama_cloud；注意 ollama 与无鉴权 ollama_remote 不要强索密钥"],
-  "operations": ["可选后台动作：apply_rules_now（规则变动后扫描现有邮件）、reclassify（让AI重分拣现有邮件）、sync_now（立即收信）、load_demo（载入演示数据）、clear_demo（清空演示数据）"],
-  "suggestions": ["2~3 条简短后续指令建议"]
-}"#;
+  "reply": "支持 Markdown 的自然中文回复（紧扣用户本轮输入作答）",
+  "updated_toml": null,
+  "changes": [],
+  "request_secrets": [],
+  "operations": [],
+  "suggestions": ["2~3 条贴合当前上下文的简短后续操作建议"]
+}
+字段说明：
+- `updated_toml`：仅当需要修改配置时填入完整合法的新 TOML 字符串（保留未改动的原有段落，`password_ref` 与 `api_key_ref` 保持 `secret:...` 引用）；无需修改配置时必须填 `null`。
+- `operations`：可选动作数组，支持 `apply_rules_now`（规则变动后扫描现有邮件）、`reclassify`（让 AI 重新分拣现有邮件）、`sync_now`（立即收信同步）、`load_demo`（载入演示数据）、`clear_demo`（清空演示数据）。"#;
+
+    let stats_line = format!(
+        "消息未读: {}，通知未读: {}，已拦截: {}，待分拣: {}，演示数据: {}",
+        stats.inbox_unread,
+        stats.archived_unread,
+        stats.blocked_count,
+        stats.pending_count,
+        if stats.has_demo { "已载入" } else { "无" }
+    );
 
     let user = format!(
-        "<current_toml>\n{current_toml}\n</current_toml>\n\n\
+        "<mailbox_stats>\n{stats_line}\n</mailbox_stats>\n\n\
+         <current_toml>\n{current_toml}\n</current_toml>\n\n\
          <vault_status>\n{}\n</vault_status>\n\n\
          <recent_turns>\n{recent}</recent_turns>\n\n\
-         用户最新指令：{user_input}",
+         用户最新输入：{user_input}",
         vault_summary.join("\n")
     );
 
     let raw = complete(cfg, system, &user, true, 2048).await?;
-    parse_json_object::<ConfigAgentPlan>(&raw)
+    parse_config_plan(&raw, current_toml)
 }
 
 fn extract_endpoint_url(input: &str) -> Option<String> {
@@ -455,11 +644,69 @@ fn extract_endpoint_url(input: &str) -> Option<String> {
     None
 }
 
-fn local_config_intent(
+fn build_status_markdown(
     spec: &DeclarativeConfig,
+    stats: &MailboxStats,
+    secret_statuses: &[SecretStatus],
+) -> String {
+    let is_configured = |key: &str| secret_statuses.iter().any(|s| s.key == key && s.configured);
+    let mail_str = if spec.account.email.trim().is_empty() {
+        "未绑定（可输入 `绑定 name@qq.com` 快速配置）".to_string()
+    } else {
+        let pwd_ok = is_configured("mail_password");
+        format!(
+            "`{}`（{}，IMAP `{}:{}`）",
+            spec.account.email,
+            if pwd_ok { "授权码已加密就绪" } else { "待录入授权码" },
+            spec.account.imap_host,
+            spec.account.imap_port
+        )
+    };
+
+    let preset_label = preset_display_label(&spec.agent.preset);
+    let key_optional = matches!(spec.agent.preset.as_str(), "ollama" | "ollama_remote" | "custom");
+    let active_sk = llm_secret_key(&spec.agent.preset);
+    let key_state = if key_optional {
+        "免密直连就绪"
+    } else if active_sk.map(is_configured).unwrap_or(false) {
+        "API Key 已加密就绪"
+    } else {
+        "尚未录入 API Key（离线规则模式）"
+    };
+
+    let rule_total = spec.triage.allow_senders.len()
+        + spec.triage.block_senders.len()
+        + spec.triage.block_domains.len()
+        + spec.triage.block_keywords.len()
+        + spec.triage.archive_senders.len()
+        + spec.triage.archive_keywords.len();
+
+    format!(
+        "当前 MailChat 声明式运行状态如下：\n\
+         - **邮箱账号**：{mail_str}\n\
+         - **模型服务**：**{preset_label}** · 模型 `{}`（{key_state}，自动分拣：{}）\n\
+         - **收件与群聊**：消息未读 **{}** 封 · 通知未读 **{}** 封 · 已拦截 **{}** 封 · 群聊 **{}** 个\n\
+         - **确定性规则**：共 **{}** 条（白名单 {} / 屏蔽词 {} / 通知折叠词 {}）",
+        spec.agent.model,
+        if spec.agent.enabled { "开启" } else { "暂停" },
+        stats.inbox_unread,
+        stats.archived_unread,
+        stats.blocked_count,
+        spec.groups.len(),
+        rule_total,
+        spec.triage.allow_senders.len(),
+        spec.triage.block_keywords.len() + spec.triage.block_domains.len() + spec.triage.block_senders.len(),
+        spec.triage.archive_keywords.len() + spec.triage.archive_senders.len(),
+    )
+}
+
+/// 尝试匹配明确的确定性配置变更或后台动作；若未命中任何明确指令则返回 `None`
+fn try_actionable_local_intent(
+    spec: &DeclarativeConfig,
+    stats: &MailboxStats,
     secret_statuses: &[SecretStatus],
     input: &str,
-) -> ConfigAgentPlan {
+) -> Option<ConfigAgentPlan> {
     let lower = input.to_lowercase();
     let mut next = spec.clone();
     let mut changes: Vec<String> = Vec::new();
@@ -467,40 +714,58 @@ fn local_config_intent(
     let mut operations: Vec<String> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
 
-    let is_configured = |key: &str| {
-        secret_statuses
-            .iter()
-            .any(|s| s.key == key && s.configured)
-    };
+    let is_configured = |key: &str| secret_statuses.iter().any(|s| s.key == key && s.configured);
 
-    // 1. 演示数据与同步操作
+    // 1. 演示数据与同步/扫描操作
     if (lower.contains("演示") || lower.contains("demo"))
-        && (lower.contains("载入") || lower.contains("加载") || lower.contains("注入") || lower.contains("开启") || lower.contains("体验"))
-    {
-        operations.push("load_demo".into());
-        notes.push("已为你载入演示会话（包含 4 人产品研发群聊、工作单聊、验证码/账单通知及拦截样本）。".into());
-    } else if (lower.contains("演示") || lower.contains("demo"))
         && (lower.contains("清空") || lower.contains("删除") || lower.contains("移除") || lower.contains("关闭"))
     {
         operations.push("clear_demo".into());
         notes.push("已为你清理所有沙盒演示会话。".into());
+    } else if lower.contains("演示") || lower.contains("demo") {
+        operations.push("load_demo".into());
+        notes.push("已为你载入演示会话（包含 **4 人产品研发群聊**、工作单聊、验证码/账单通知及营销拦截样本），切回左侧「消息」即可体验。".into());
     }
 
-    if lower.contains("同步") || lower.contains("收信") || lower.contains("拉取邮件") {
+    if lower.contains("同步") || lower.contains("收信") || lower.contains("拉取邮件") || lower.contains("刷新邮件") {
         operations.push("sync_now".into());
         notes.push("已触发后台 IMAP 邮件同步。".into());
     }
 
-    if lower.contains("重分拣") || lower.contains("重新分拣") || lower.contains("重新分类") {
-        operations.push("reclassify".into());
-        notes.push("已触发对现有来信的 AI 智能分拣。".into());
+    if lower.contains("扫描现有") || lower.contains("应用规则") || lower.contains("执行规则") {
+        operations.push("apply_rules_now".into());
+        notes.push("已按当前 `[triage]` 确定性规则重新扫描并归整现有邮件。".into());
     }
 
-    // 2. 识别模型切换意图（优先推荐：DeepSeek 官网、OpenCode Go、Ollama 远程订阅；同时兼容自建远程/本地 Ollama 与其他厂商）
+    if lower.contains("重分拣") || lower.contains("重新分拣") || lower.contains("重新分类") || lower.contains("ai 分拣") || lower.contains("ai分拣") {
+        let active_sk = llm_secret_key(&spec.agent.preset);
+        let key_optional = matches!(spec.agent.preset.as_str(), "ollama" | "ollama_remote" | "custom");
+        if !key_optional && active_sk.map(|k| !is_configured(k)).unwrap_or(false) {
+            if let Some(sk) = active_sk {
+                request_secrets.push(sk.into());
+            }
+            notes.push(format!(
+                "执行 AI 智能分拣需要先录入 **{}** 的 API Key（默认搭载 `{}`）。请在下方本地加密卡片中填入密钥：",
+                preset_display_label(&spec.agent.preset),
+                spec.agent.model
+            ));
+        } else {
+            operations.push("reclassify".into());
+            notes.push("已触发对现有邮件的 AI 智能重分拣。".into());
+        }
+    }
+
+    // 2. 识别模型切换意图（优先推荐：DeepSeek 官网、OpenCode Go、Ollama 远程订阅）
     let custom_url = extract_endpoint_url(input);
     let is_remote_url = custom_url
         .as_deref()
-        .map(|u| !u.contains("localhost") && !u.contains("127.0.0.1") && !u.contains("ollama.com") && !u.contains("opencode.ai") && !u.contains("deepseek.com"))
+        .map(|u| {
+            !u.contains("localhost")
+                && !u.contains("127.0.0.1")
+                && !u.contains("ollama.com")
+                && !u.contains("opencode.ai")
+                && !u.contains("deepseek.com")
+        })
         .unwrap_or(false);
 
     let wants_self_hosted_ollama = lower.contains("局域网")
@@ -512,7 +777,9 @@ fn local_config_intent(
     let detected_preset = if lower.contains("opencode") || lower.contains("open code") {
         Some(("opencode_go", "OpenCode Go 订阅"))
     } else if (lower.contains("ollama") && wants_self_hosted_ollama)
-        || (!lower.contains("邮箱") && custom_url.as_deref().map(|u| u.contains(":11434")).unwrap_or(false) && is_remote_url)
+        || (!lower.contains("邮箱")
+            && custom_url.as_deref().map(|u| u.contains(":11434")).unwrap_or(false)
+            && is_remote_url)
     {
         Some(("ollama_remote", "Ollama 自建远程算力"))
     } else if lower.contains("ollama")
@@ -526,7 +793,12 @@ fn local_config_intent(
     {
         Some(("ollama_cloud", "Ollama 远程订阅"))
     } else if (lower.contains("deepseek") || lower.contains("深度求索"))
-        && !(lower.contains("4.1") && !lower.contains("官网") && !lower.contains("官方") && !lower.contains("切换") && (next.agent.preset == "opencode_go" || next.agent.preset == "ollama_cloud"))
+        && !(lower.contains("4.1")
+            && !lower.contains("官网")
+            && !lower.contains("官方")
+            && !lower.contains("切换")
+            && !lower.contains("使用")
+            && (next.agent.preset == "opencode_go" || next.agent.preset == "ollama_cloud"))
     {
         Some(("deepseek", "DeepSeek 官网"))
     } else if lower.contains("qwen") || lower.contains("千问") || lower.contains("通义") || lower.contains("百炼") {
@@ -568,10 +840,14 @@ fn local_config_intent(
         } else {
             next.agent.api_key_ref = "none (local)".into();
         }
-        changes.push(format!("声明 `[agent]` 切换至 {label}（默认模型 `{def_model}`）"));
+        changes.push(format!("切换至 {label}（默认模型 `{def_model}`）"));
         if preset_id == "ollama_remote" && custom_url.is_none() {
             notes.push(format!(
-                "已将声明式配置切换为 **{label}**（默认地址 `{final_base}`，模型 `{def_model}`）。你可以直接告诉我算力机地址（例如 `连接内网 Ollama 192.168.31.88:11434`），或在配置页一键拉取远端模型列表。"
+                "已将声明式配置切换为 **{label}**（默认地址 `{final_base}`，模型 `{def_model}`）。你可以直接发我算力机地址（例如 `连接内网 Ollama 192.168.31.88:11434`），或在配置页拉取远端模型列表。"
+            ));
+        } else if !request_secrets.is_empty() {
+            notes.push(format!(
+                "已将声明式配置切换为 **{label}**（接口 `{final_base}`，默认模型 `{def_model}`）。请在下方本地加密卡片录入 API Key，保存后即可直接与大模型自由对话："
             ));
         } else {
             notes.push(format!(
@@ -583,14 +859,13 @@ fn local_config_intent(
         changes.push("设置 `agent.model = \"deepseek-v4.1-flash\"`".into());
         notes.push("已将当前调用模型设为 `deepseek-v4.1-flash`。".into());
     } else if let Some(u) = &custom_url {
-        // 单独修改当前模型的接口地址
         let normalized = normalize_openai_base(u, &next.agent.preset);
         next.agent.base_url = normalized.clone();
         changes.push(format!("更新 `agent.base_url = \"{normalized}\"`"));
         notes.push(format!("已将当前模型接口地址更新为 `{normalized}`。"));
     }
 
-    // 3. 识别邮箱绑定意图（注意区分“屏蔽 xxx@xx.com”与“绑定 xxx@xx.com”）
+    // 3. 识别邮箱绑定意图
     static RE_EMAIL: OnceLock<Regex> = OnceLock::new();
     let email_re = RE_EMAIL.get_or_init(|| Regex::new(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}").unwrap());
     let all_emails: Vec<String> = email_re
@@ -601,15 +876,25 @@ fn local_config_intent(
     let is_rule_cmd = lower.contains("屏蔽")
         || lower.contains("拉黑")
         || lower.contains("拦截")
+        || lower.contains("不看")
         || lower.contains("折叠")
         || lower.contains("归档")
         || lower.contains("进通知")
+        || lower.contains("放通知")
         || lower.contains("白名单")
         || lower.contains("信任")
         || lower.contains("建群")
         || lower.contains("创建群");
 
-    if !is_rule_cmd && !all_emails.is_empty() && (lower.contains("绑定") || lower.contains("连接") || lower.contains("邮箱") || lower.contains("账号") || lower.contains("登录") || all_emails.len() == 1) {
+    if !is_rule_cmd
+        && !all_emails.is_empty()
+        && (lower.contains("绑定")
+            || lower.contains("连接")
+            || lower.contains("邮箱")
+            || lower.contains("账号")
+            || lower.contains("登录")
+            || all_emails.len() == 1)
+    {
         let em = &all_emails[0];
         next.account.email = em.clone();
         next.account.username = em.clone();
@@ -621,29 +906,38 @@ fn local_config_intent(
         }
         changes.push(format!("声明 `[account]` 绑定邮箱 `{em}`"));
         notes.push(format!(
-            "已在声明式配置中填入账号 `{em}` 及对应 IMAP/SMTP 服务器参数。请在下方本地安全卡片中输入邮箱授权码完成验证。"
+            "已在声明式配置中填入账号 `{em}` 及对应 IMAP/SMTP 服务器参数（`{}:{}`）。请在下方本地安全卡片中输入 **邮箱授权码** 完成连接验证：",
+            next.account.imap_host, next.account.imap_port
         ));
         request_secrets.push("mail_password".into());
     }
 
     // 4. 单独请求修改密码或 API Key
     if (lower.contains("授权码") || lower.contains("邮箱密码") || lower.contains("改密码"))
+        && !lower.contains("怎么")
+        && !lower.contains("如何")
         && !request_secrets.contains(&"mail_password".to_string())
     {
         request_secrets.push("mail_password".into());
-        notes.push("已为你唤起本地加密的「邮箱授权码」安全输入卡片，输入后将直接存入系统 DPAPI 保险箱。".into());
+        notes.push("已为你唤起本地加密的 **邮箱授权码** 安全输入卡片，输入后将直接存入系统 DPAPI 保险箱：".into());
     }
-    if (lower.contains("apikey") || lower.contains("api key") || lower.contains("密钥") || lower.contains("配置key") || lower.contains("填key"))
+    if (lower.contains("apikey")
+        || lower.contains("api key")
+        || lower.contains("密钥")
+        || lower.contains("配置key")
+        || lower.contains("填key")
+        || lower.contains("更新当前 api key"))
         && request_secrets.is_empty()
     {
         let sk = llm_secret_key(&next.agent.preset).unwrap_or("llm_deepseek");
         request_secrets.push(sk.into());
         notes.push(format!(
-            "已为你唤起 `{sk}` 本地隐私输入卡片。密钥仅保存在本机加密保险箱中，不会写入 `config.toml` 或上传给第三方。"
+            "已为你唤起 **{}**（`{sk}`）本地隐私输入卡片。密钥仅加密保存在本机保险箱中，绝不写入 `config.toml` 或上传给第三方：",
+            preset_display_label(&next.agent.preset)
         ));
     }
 
-    // 5. 识别规则变更（屏蔽 / 折叠进通知 / 白名单）
+    // 5. 识别规则变更（白名单 / 屏蔽 / 折叠进通知）
     if lower.contains("白名单") || lower.contains("信任") {
         for em in &all_emails {
             if !next.triage.allow_senders.contains(em) {
@@ -655,14 +949,13 @@ fn local_config_intent(
             operations.push("apply_rules_now".into());
             notes.push("已将指定发件人写入 `[triage].allow_senders` 白名单。".into());
         }
-    } else if lower.contains("屏蔽") || lower.contains("拉黑") || lower.contains("拦截") {
+    } else if lower.contains("屏蔽") || lower.contains("拉黑") || lower.contains("拦截") || lower.contains("不看") {
         for em in &all_emails {
             if !next.triage.block_senders.contains(em) {
                 next.triage.block_senders.push(em.clone());
                 changes.push(format!("新增屏蔽发件人：`{em}`"));
             }
         }
-        // 提取 @domain.com 形式域名
         static RE_DOM: OnceLock<Regex> = OnceLock::new();
         let dom_re = RE_DOM.get_or_init(|| Regex::new(r"(?:^|[\s,，])@([A-Za-z0-9.-]+\.[A-Za-z]{2,})").unwrap());
         for cap in dom_re.captures_iter(input) {
@@ -672,8 +965,7 @@ fn local_config_intent(
                 changes.push(format!("新增屏蔽域名：`{d}`"));
             }
         }
-        // 提取引号或关键词列表
-        for kw in extract_keywords(input, &["屏蔽关键词", "拦截关键词", "包含", "含有", "屏蔽", "拦截", "拉黑"]) {
+        for kw in extract_keywords(input, &["屏蔽关键词", "拦截关键词", "包含", "含有", "不看", "屏蔽", "拦截", "拉黑"]) {
             if !kw.contains('@') && !next.triage.block_keywords.contains(&kw) {
                 next.triage.block_keywords.push(kw.clone());
                 changes.push(format!("新增屏蔽关键词：`{kw}`"));
@@ -683,14 +975,14 @@ fn local_config_intent(
             operations.push("apply_rules_now".into());
             notes.push("已更新 `[triage]` 屏蔽规则并立即扫描现有邮件。".into());
         }
-    } else if lower.contains("折叠") || lower.contains("归档") || lower.contains("进通知") || lower.contains("归入通知") {
+    } else if lower.contains("折叠") || lower.contains("归档") || lower.contains("进通知") || lower.contains("归入通知") || lower.contains("放通知") {
         for em in &all_emails {
             if !next.triage.archive_senders.contains(em) {
                 next.triage.archive_senders.push(em.clone());
                 changes.push(format!("新增通知折叠发件人：`{em}`"));
             }
         }
-        for kw in extract_keywords(input, &["折叠关键词", "把", "将", "包含", "含有", "折叠", "归入通知", "进通知"]) {
+        for kw in extract_keywords(input, &["折叠关键词", "把", "将", "包含", "含有", "折叠", "归入通知", "进通知", "放通知"]) {
             if !kw.contains('@') && !next.triage.archive_keywords.contains(&kw) {
                 next.triage.archive_keywords.push(kw.clone());
                 changes.push(format!("新增通知折叠关键词：`{kw}`"));
@@ -702,7 +994,7 @@ fn local_config_intent(
         }
     }
 
-    // 6. 开关与自然语言偏好
+    // 6. 开关与偏好
     if lower.contains("开启自动起草") || lower.contains("打开自动起草") {
         next.agent.auto_draft = true;
         changes.push("设置 `agent.auto_draft = true`".into());
@@ -741,38 +1033,152 @@ fn local_config_intent(
             members,
         });
         changes.push(format!("声明新建群聊「{gname}」（{} 位成员）", all_emails.len()));
-        notes.push(format!("已在声明式配置中创建群聊「{gname}」，切回左侧「消息」即可直接全员发信。"));
-    } else if lower.contains("群免打扰") {
+        notes.push(format!("已在声明式配置中创建群聊 **「{gname}」**，切回左侧「消息」即可直接全员发信。"));
+    } else if lower.contains("群免打扰") || lower.contains("免打扰") {
         let mute_on = !lower.contains("关闭") && !lower.contains("取消");
-        for g in &mut next.groups {
-            g.muted = mute_on;
-        }
         if !next.groups.is_empty() {
+            for g in &mut next.groups {
+                g.muted = mute_on;
+            }
             changes.push(format!("设置群聊 `muted = {mute_on}`"));
             notes.push(if mute_on {
-                "已为群聊开启免打扰（折叠进通知，被 @ 时仍穿透提醒）。".into()
+                "已为全部群聊开启免打扰（日常折叠进「通知」，被 `@` 时仍穿透提醒）。".into()
             } else {
-                "已关闭群聊免打扰，恢复至消息列表。".into()
+                "已关闭群聊免打扰，恢复显示在「消息」列表。".into()
             });
+        } else {
+            notes.push("当前尚未创建任何邮件群聊。你可以先「载入演示会话体验」或在左侧消息栏点击加号发起群聊。".into());
         }
     }
 
-    if changes.is_empty() && operations.is_empty() && request_secrets.is_empty() {
-        let active_sk = llm_secret_key(&spec.agent.preset);
-        let key_optional = matches!(spec.agent.preset.as_str(), "ollama" | "ollama_remote" | "custom");
-        let need_key = !key_optional && active_sk.map(|k| !is_configured(k)).unwrap_or(false);
-        let hint_extra = if need_key {
-            "\n\n提示：当前默认搭载 `deepseek-v4.1-flash`，尚未录入 API Key；你可以优先配置 **DeepSeek 官网**、**OpenCode Go** 或 **Ollama 远程订阅** 的密钥来启用云端智能编排。"
+    // 8. 状态查询 / 绑定引导 / 授权码帮助（离线也可精确答复）
+    if changes.is_empty() && operations.is_empty() && request_secrets.is_empty() && notes.is_empty() {
+        if lower.contains("查看") && (lower.contains("配置") || lower.contains("toml"))
+            || lower.contains("当前配置")
+            || lower.contains("当前状态")
+            || lower.contains("现在什么配置")
+            || lower == "状态"
+            || lower == "配置"
+            || lower.contains("多少封")
+            || lower.contains("收件箱情况")
+        {
+            return Some(ConfigAgentPlan {
+                reply: build_status_markdown(spec, stats, secret_statuses),
+                updated_toml: None,
+                changes: vec![],
+                request_secrets: vec![],
+                operations: vec![],
+                suggestions: vec![
+                    "配置 API Key".into(),
+                    "绑定我的邮箱账号".into(),
+                    "扫描现有邮件应用规则".into(),
+                ],
+                intercepted_secret: None,
+            });
+        }
+
+        if (lower.contains("绑定") || lower.contains("连接") || lower.contains("登录"))
+            && (lower.contains("邮箱") || lower.contains("账号"))
+            && all_emails.is_empty()
+        {
+            return Some(ConfigAgentPlan {
+                reply: "请直接发送你要绑定的邮箱地址，我会自动填入对应 IMAP / SMTP 服务器参数并弹出本地加密授权码卡片，例如：\n- `帮我绑定 name@qq.com`\n- `帮我绑定 name@163.com`\n- `帮我绑定 name@gmail.com`".into(),
+                updated_toml: None,
+                changes: vec![],
+                request_secrets: vec![],
+                operations: vec![],
+                suggestions: vec![
+                    "怎么获取邮箱授权码？".into(),
+                    "查看当前配置状态".into(),
+                ],
+                intercepted_secret: None,
+            });
+        }
+
+        if (lower.contains("怎么") || lower.contains("如何") || lower.contains("哪里"))
+            && (lower.contains("授权码") || lower.contains("imap") || lower.contains("qq邮箱") || lower.contains("163"))
+        {
+            return Some(ConfigAgentPlan {
+                reply: "常见邮箱开启 IMAP 与获取 **客户端授权码** 步骤：\n\
+                        1. **QQ / Foxmail 邮箱**：网页版登录 → 顶部「设置」→「账号」→ 往下找到 `POP3/IMAP/SMTP` 服务 → 开启 **IMAP/SMTP 服务** → 点击「生成授权码」复制 16 位字符串。\n\
+                        2. **网易 163 / 126 邮箱**：网页版「设置」→ `POP3/SMTP/IMAP` → 开启 **IMAP/SMTP 服务** → 新增授权密码。\n\
+                        3. **Gmail**：开启两步验证后，前往 Google 账号「安全性 → 应用专用密码（App Passwords）」生成 16 位专用密码。\n\n\
+                        准备好后直接发我 `绑定 你的邮箱@qq.com` 即可。".into(),
+                updated_toml: None,
+                changes: vec![],
+                request_secrets: vec![],
+                operations: vec![],
+                suggestions: vec![
+                    "绑定我的邮箱账号".into(),
+                    "配置 API Key".into(),
+                ],
+                intercepted_secret: None,
+            });
+        }
+
+        return None;
+    }
+
+    let updated_toml = if !changes.is_empty() {
+        toml::to_string_pretty(&next).ok()
+    } else {
+        None
+    };
+
+    Some(ConfigAgentPlan {
+        reply: notes.join("\n\n"),
+        updated_toml,
+        changes,
+        request_secrets,
+        operations,
+        suggestions: vec![
+            "查看当前配置状态".into(),
+            "扫描现有邮件应用规则".into(),
+            "绑定我的邮箱账号".into(),
+        ],
+        intercepted_secret: None,
+    })
+}
+
+fn local_config_intent(
+    spec: &DeclarativeConfig,
+    stats: &MailboxStats,
+    secret_statuses: &[SecretStatus],
+    input: &str,
+) -> ConfigAgentPlan {
+    if let Some(plan) = try_actionable_local_intent(spec, stats, secret_statuses, input) {
+        return plan;
+    }
+
+    let lower = input.trim().to_lowercase();
+    let is_configured = |key: &str| secret_statuses.iter().any(|s| s.key == key && s.configured);
+    let active_sk = llm_secret_key(&spec.agent.preset);
+    let key_optional = matches!(spec.agent.preset.as_str(), "ollama" | "ollama_remote" | "custom");
+    let need_key = !key_optional && active_sk.map(|k| !is_configured(k)).unwrap_or(false);
+    let preset_label = preset_display_label(&spec.agent.preset);
+
+    let is_greeting = matches!(
+        lower.trim_matches(&['!', '！', '。', '.', '?', '？', '~', '～'][..]),
+        "你好" | "您好" | "hi" | "hello" | "hey" | "嗨" | "在吗" | "你是谁" | "能做什么" | "帮助" | "help" | ""
+    );
+
+    if is_greeting {
+        let state_note = if need_key {
+            format!(
+                "当前默认已配置 **{preset_label}**（模型 `{}`），但**尚未录入 API Key**，目前运行在本地离线指令模式。录入密钥后即可开启自由对话与 AI 自动分拣：",
+                spec.agent.model
+            )
         } else {
-            ""
+            format!(
+                "当前 **{preset_label}**（`{}`）已就绪。你可以直接用自然语言让我管理邮箱配置：",
+                spec.agent.model
+            )
         };
         return ConfigAgentPlan {
             reply: format!(
-                "我是你的 MailChat 配置与自动化管家。你可以直接用自然语言让我修改声明式配置（`config.toml`），例如：\n\
-                 - **首选模型接入**：「使用 DeepSeek 官网配置」「切换为 OpenCode Go 订阅」「切换为 Ollama 远程订阅」（默认均采用 `deepseek-v4.1-flash`）\n\
-                 - **绑定邮箱账号**：「帮我绑定 `name@qq.com` 邮箱」\n\
-                 - **过滤与归档**：「屏蔽所有包含『退订』『优惠券』的邮件」「把含『账单』『验证码』的邮件自动折叠进通知」\n\
-                 - **群聊与隐私**：「配置 API Key」「开启群免打扰」{hint_extra}"
+                "你好！我是 MailChat 的智能配置管家。{state_note}\n\
+                 - **首选模型切换**：「使用 DeepSeek 官网配置」「切换为 OpenCode Go 订阅」「切换为 Ollama 远程订阅」\n\
+                 - **邮箱与规则**：「绑定 `name@qq.com`」「屏蔽包含『退订』的邮件」「把含『账单』的邮件折叠进通知」"
             ),
             updated_toml: None,
             changes: vec![],
@@ -783,31 +1189,45 @@ fn local_config_intent(
             },
             operations: vec![],
             suggestions: vec![
-                "使用 DeepSeek 官网配置".into(),
                 "切换为 OpenCode Go 订阅".into(),
                 "切换为 Ollama 远程订阅".into(),
+                "查看当前配置状态".into(),
                 "载入演示会话体验".into(),
             ],
             intercepted_secret: None,
         };
     }
 
-    let updated_toml = if !changes.is_empty() {
-        toml::to_string_pretty(&next).ok()
+    // 用户输入了任意自由语句，但当前未配置大模型 API Key：明确解释离线模式限制并唤起加密录入卡，而非机械重复固定欢迎语
+    let snippet: String = input.trim().chars().take(36).collect();
+    let reply = if need_key {
+        format!(
+            "收到你的指令：「**{snippet}**」\n\n\
+             当前尚未配置 **{preset_label}** 的 API Key（默认搭载 `{}`），离线规则引擎暂无法理解自由语义对话。\n\n\
+             > 在下方安全卡片录入 API Key（或切换至 **OpenCode Go** / **Ollama 远程订阅**）后，即可直接与我自由对话；离线状态下你仍可使用明确的规则指令（如 `绑定 name@qq.com`、`屏蔽包含「退订」的邮件`）。",
+            spec.agent.model
+        )
     } else {
-        None
+        format!(
+            "我暂时没在离线规则中匹配到「**{snippet}**」对应的配置项。你可以查看当前状态，或尝试更明确的描述（如 `屏蔽包含「优惠券」的邮件`、`查看当前配置状态`）。"
+        )
     };
 
     ConfigAgentPlan {
-        reply: notes.join("\n"),
-        updated_toml,
-        changes,
-        request_secrets,
-        operations,
+        reply,
+        updated_toml: None,
+        changes: vec![],
+        request_secrets: if need_key {
+            active_sk.into_iter().map(String::from).collect()
+        } else {
+            vec![]
+        },
+        operations: vec![],
         suggestions: vec![
-            "查看右侧最新生成的 config.toml".into(),
-            "扫描现有邮件应用规则".into(),
-            "绑定邮箱账号".into(),
+            "查看当前配置状态".into(),
+            "切换为 OpenCode Go 订阅".into(),
+            "切换为 Ollama 远程订阅".into(),
+            "载入演示会话体验".into(),
         ],
         intercepted_secret: None,
     }
@@ -1011,6 +1431,35 @@ pub fn resolve_wire_model(base: &str, raw_model: &str) -> String {
     }
 }
 
+/// 生成网关候选模型名列表（首选参数在前；若远端因模型别名差异报 `model_not_found` 时自动顺延尝试兼容别名）
+fn candidate_wire_models(base: &str, raw_model: &str) -> Vec<String> {
+    let primary = resolve_wire_model(base, raw_model);
+    let mut list = vec![primary.clone()];
+    let p_lower = primary.to_lowercase();
+    let base_lower = base.to_lowercase();
+
+    let is_ds_flash = p_lower == "deepseek-v4.1-flash"
+        || p_lower == "deepseek-flash"
+        || p_lower == "opencode/deepseek-v4.1-flash";
+
+    let extras: &[&str] = if is_ds_flash && base_lower.contains("api.deepseek.com") {
+        &["deepseek-v4.1-flash", "deepseek-chat"]
+    } else if is_ds_flash && base_lower.contains("opencode.ai") {
+        &["opencode/deepseek-v4.1-flash", "deepseek-flash", "deepseek-chat"]
+    } else if is_ds_flash && base_lower.contains("ollama.com") {
+        &["deepseek-v4.1-flash:cloud", "deepseek-v3.1:671b-cloud"]
+    } else {
+        &[]
+    };
+
+    for &m in extras {
+        if !list.iter().any(|x| x.eq_ignore_ascii_case(m)) {
+            list.push(m.to_string());
+        }
+    }
+    list
+}
+
 /// OpenAI 兼容接口：DeepSeek 官网、OpenCode Go、Ollama 远程订阅 / 自建算力 / 本地，以及各兼容厂商
 async fn openai_compatible(cfg: &AgentConfig, system: &str, user: &str, want_json: bool, max_tokens: u32) -> Result<String> {
     let normalized_base = normalize_openai_base(&cfg.base_url, &cfg.preset);
@@ -1027,49 +1476,77 @@ async fn openai_compatible(cfg: &AgentConfig, system: &str, user: &str, want_jso
         format!("{base}/chat/completions")
     };
 
-    let wire_model = resolve_wire_model(base, &cfg.model);
-    let model_lower = wire_model.to_lowercase();
-    let skip_json_mode = model_lower.contains("reasoner") || model_lower.contains("r1") || model_lower.contains("qwq");
+    let candidates = candidate_wire_models(base, &cfg.model);
+    let mut last_status = reqwest::StatusCode::BAD_REQUEST;
+    let mut last_msg = String::new();
 
-    let send_once = |use_json_format: bool| {
-        let mut body = json!({
-            "model": wire_model,
-            "max_tokens": max_tokens,
-            "messages": [
-                { "role": "system", "content": system },
-                { "role": "user", "content": user }
-            ],
-        });
-        if use_json_format {
-            body["response_format"] = json!({ "type": "json_object" });
+    for (idx, wire_model) in candidates.iter().enumerate() {
+        let model_lower = wire_model.to_lowercase();
+        let skip_json_mode = model_lower.contains("reasoner") || model_lower.contains("r1") || model_lower.contains("qwq");
+
+        let send_once = |use_json_format: bool| {
+            let mut body = json!({
+                "model": wire_model,
+                "max_tokens": max_tokens,
+                "messages": [
+                    { "role": "system", "content": system },
+                    { "role": "user", "content": user }
+                ],
+            });
+            if use_json_format {
+                body["response_format"] = json!({ "type": "json_object" });
+            }
+            let mut req = http().post(&endpoint).json(&body);
+            if !cfg.api_key.trim().is_empty() {
+                req = req.bearer_auth(cfg.api_key.trim());
+            }
+            req
+        };
+
+        let try_json = want_json && !skip_json_mode;
+        let mut resp = send_once(try_json).send().await?;
+        // 部分兼容接口或本地模型不支持 response_format=json_object 会报 400，自动降级重试一次
+        if try_json && resp.status() == reqwest::StatusCode::BAD_REQUEST {
+            resp = send_once(false).send().await?;
         }
-        let mut req = http().post(&endpoint).json(&body);
-        if !cfg.api_key.trim().is_empty() {
-            req = req.bearer_auth(cfg.api_key.trim());
+
+        let status = resp.status();
+        let v: Value = resp.json().await.unwrap_or_else(|_| json!({}));
+        if status.is_success() {
+            return v["choices"][0]["message"]["content"]
+                .as_str()
+                .map(|s| s.to_string())
+                .ok_or_else(|| anyhow!("模型返回格式异常: {v}"));
         }
-        req
-    };
 
-    let try_json = want_json && !skip_json_mode;
-    let mut resp = send_once(try_json).send().await?;
-    // 部分兼容接口或本地模型不支持 response_format=json_object 会报 400，自动降级重试一次
-    if try_json && resp.status() == reqwest::StatusCode::BAD_REQUEST {
-        resp = send_once(false).send().await?;
-    }
-
-    let status = resp.status();
-    let v: Value = resp.json().await.unwrap_or_else(|_| json!({}));
-    if !status.is_success() {
         let msg = v["error"]["message"]
             .as_str()
+            .or_else(|| v["message"].as_str())
+            .or_else(|| v["detail"].as_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| v.to_string());
-        bail!("模型接口错误 ({status}): {msg}");
+
+        let msg_lower = msg.to_lowercase();
+        let is_model_err = matches!(
+            status,
+            reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+        ) && (msg_lower.contains("model")
+            || msg_lower.contains("not exist")
+            || msg_lower.contains("not_found")
+            || msg_lower.contains("not found")
+            || msg_lower.contains("does not exist")
+            || msg_lower.contains("unsupported")
+            || msg_lower.contains("invalid"));
+
+        last_status = status;
+        last_msg = msg;
+
+        if !(is_model_err && idx + 1 < candidates.len()) {
+            break;
+        }
     }
-    v["choices"][0]["message"]["content"]
-        .as_str()
-        .map(|s| s.to_string())
-        .ok_or_else(|| anyhow!("模型返回格式异常: {v}"))
+
+    bail!("模型接口错误 ({last_status}): {last_msg}")
 }
 
 /// 从远端或局域网服务动态拉取可用模型列表（兼容 OpenAI `/v1/models` 与 Ollama 原生 `/api/tags`）
@@ -1253,28 +1730,42 @@ mod tests {
     #[test]
     fn local_intent_supports_opencode_go_and_remote_ollama() {
         let spec = DeclarativeConfig::default();
+        let stats = MailboxStats::default();
         assert_eq!(spec.agent.preset, "deepseek");
         assert_eq!(spec.agent.model, "deepseek-v4.1-flash");
 
-        let p1 = local_config_intent(&spec, &[], "切换为 OpenCode Go 订阅");
+        let p1 = local_config_intent(&spec, &stats, &[], "切换为 OpenCode Go 订阅");
         let t1 = p1.updated_toml.unwrap();
         assert!(t1.contains("opencode_go"));
         assert!(t1.contains("https://opencode.ai/zen/go/v1"));
         assert!(t1.contains("deepseek-v4.1-flash"));
         assert_eq!(p1.request_secrets, vec!["llm_opencode_go"]);
 
-        let p2 = local_config_intent(&spec, &[], "连接内网 Ollama 服务器 192.168.31.88:11434");
+        let p2 = local_config_intent(&spec, &stats, &[], "连接内网 Ollama 服务器 192.168.31.88:11434");
         let t2 = p2.updated_toml.unwrap();
         assert!(t2.contains("ollama_remote"));
         assert!(t2.contains("http://192.168.31.88:11434/v1"));
         assert!(p2.request_secrets.is_empty());
 
-        let p3 = local_config_intent(&spec, &[], "切换为 Ollama 远程订阅");
+        let p3 = local_config_intent(&spec, &stats, &[], "切换为 Ollama 远程订阅");
         let t3 = p3.updated_toml.unwrap();
         assert!(t3.contains("ollama_cloud"));
         assert!(t3.contains("https://ollama.com/v1"));
         assert!(t3.contains("deepseek-v4.1-flash"));
         assert_eq!(p3.request_secrets, vec!["llm_ollama_cloud"]);
+
+        // 校验 JSON null 字段容错与纯文本自然回复容错
+        let parsed_null = parse_config_plan(
+            r#"{"reply":"你好！有什么可以帮你？","updated_toml":null,"changes":null,"request_secrets":null,"operations":null,"suggestions":null}"#,
+            "[agent]\npreset = \"deepseek\"",
+        )
+        .unwrap();
+        assert_eq!(parsed_null.reply, "你好！有什么可以帮你？");
+        assert!(parsed_null.updated_toml.is_none());
+        assert!(parsed_null.changes.is_empty());
+
+        let parsed_plain = parse_config_plan("直接以自然语言回答你的问题", "[agent]").unwrap();
+        assert_eq!(parsed_plain.reply, "直接以自然语言回答你的问题");
 
         assert_eq!(
             resolve_wire_model("https://api.deepseek.com/v1", "deepseek-v4.1-flash"),
