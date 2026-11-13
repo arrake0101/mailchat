@@ -1,0 +1,8 @@
+# 仅对本项目生效：
+# 1. 全局配置里的 rsproxy git 索引已失效，改用 sparse 索引
+# 2. 强制使用 rustup 自带的 self-contained MSVCRT 链接器与 CRT，避免与外部 UCRT MinGW 混链导致 0xc0000139
+[source.rsproxy]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-self-contained=yes"]

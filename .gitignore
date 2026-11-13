@@ -1,0 +1,35 @@
+# Dependencies & frontend build
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Rust / Tauri build & generated schemas
+src-tauri/target/
+src-tauri/gen/
+src-tauri/WixTools/
+
+# Local runtime databases & encrypted secret vaults (never commit credentials or mail data)
+secrets.vault.json
+*.vault.json
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+/config.toml
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Logs & OS / IDE metadata
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/*
+!.vscode/extensions.json
