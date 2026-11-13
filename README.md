@@ -17,7 +17,7 @@
   - 收信按 `Chat-Group-ID` → 历史线程引用追踪 → 多收件人自动聚合三级路由，支持 `@提及`、群免打扰（`@我` 自动穿透提醒）与一键纪要总结
 - **默认搭载 `deepseek-v4.1-flash` 与三大首选接入**：
   - 默认模型采用 **`deepseek-v4.1-flash`**（连接 DeepSeek 官方 API 时底层自动映射官方参数 `deepseek-flash`，OpenCode Go 与 Ollama 远程订阅直传 `deepseek-v4.1-flash`）
-  - 首选推荐接入 **DeepSeek 官网**（`https://api.deepseek.com/v1`）、**OpenCode Go**（`https://opencode.ai/zen/go/v1`）与 **Ollama 远程订阅**（`https://ollama.com/v1`）；同时折叠收纳 **Ollama 内网远程算力**、**Ollama 本地**、通义千问、OpenAI、Claude、Gemini、Kimi、硅基流动与自定义网关
+  - 首选推荐接入 **DeepSeek 官网**（`https://api.deepseek.com/v1`）、**OpenCode Go**（`https://opencode.ai/inference/go/openai/v1`，内置 `x-opencode-session` 会话路由与多协议网关适配）与 **Ollama 远程订阅**（`https://ollama.com/v1`）；同时折叠收纳 **Ollama 内网远程算力**、**Ollama 本地**、通义千问、OpenAI、Claude、Gemini、Kimi、硅基流动与自定义网关
   - 支持一键实时探测并拉取远端 `/v1/models` 或 Ollama `/api/tags` 可用模型列表
 - **沉浸式无边框桌面视觉设计**：
   - 移除传统系统生硬标题横条，结合 Windows 11 DWM 原生圆角与阴影，将轻量窗口控制键与拖拽区自然融入卡片顶栏，统一细线条矢量图标与悬浮圆角分层画布

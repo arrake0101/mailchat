@@ -172,7 +172,7 @@ pub fn mail_domain_defaults(email: &str) -> Option<(&'static str, u16, &'static 
 pub fn model_preset_defaults(preset: &str) -> (&'static str, &'static str, &'static str) {
     match preset.trim().to_lowercase().as_str() {
         "deepseek" => ("openai", "https://api.deepseek.com/v1", "deepseek-v4.1-flash"),
-        "opencode_go" => ("openai", "https://opencode.ai/zen/go/v1", "deepseek-v4.1-flash"),
+        "opencode_go" => ("openai", "https://opencode.ai/inference/go/openai/v1", "deepseek-v4.1-flash"),
         "ollama_cloud" => ("openai", "https://ollama.com/v1", "deepseek-v4.1-flash"),
         "ollama_remote" => ("openai", "http://192.168.1.100:11434/v1", "qwen2.5:7b"),
         "ollama" => ("openai", "http://localhost:11434/v1", "qwen2.5:7b"),

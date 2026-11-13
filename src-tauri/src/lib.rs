@@ -243,25 +243,41 @@ async fn set_secret(
                 let _ = state.db.save_agent_config(&ag);
                 refresh_disk_toml(&state);
             }
-            let hydrated = config::hydrated_agent(&state.db, &state.vault).map_err(err)?;
-            if llm_secret_key(&hydrated.preset) == Some(clean_key.as_str()) {
-                let v = agent::classify(
-                    &hydrated,
-                    "promo@shop.example.com",
-                    "测试商城",
-                    "限时五折促销",
-                    "点击抢购，回复 TD 退订",
-                )
-                .await
-                .map_err(err)?;
-                verified = true;
-                message = format!(
-                    "{} 已加密保存且模型连通正常（测试样本判定：{} / {}）",
-                    secret_label(&clean_key),
-                    v.action,
-                    v.category
-                );
+            let mut test_cfg = config::hydrated_agent(&state.db, &state.vault).map_err(err)?;
+            if test_cfg.preset != target_preset && target_preset != "custom" {
+                let (prov, def_base, def_model) = config::model_preset_defaults(target_preset);
+                let prof = ag.profiles.get(target_preset);
+                test_cfg.preset = target_preset.to_string();
+                test_cfg.provider = prov.to_string();
+                test_cfg.base_url = prof
+                    .map(|p| p.base_url.trim())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(def_base)
+                    .to_string();
+                test_cfg.model = prof
+                    .map(|p| p.model.trim())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(def_model)
+                    .to_string();
             }
+            test_cfg.api_key = value.trim().to_string();
+
+            let v = agent::classify(
+                &test_cfg,
+                "promo@shop.example.com",
+                "测试商城",
+                "限时五折促销",
+                "点击抢购，回复 TD 退订",
+            )
+            .await
+            .map_err(err)?;
+            verified = true;
+            message = format!(
+                "{} 已加密保存且模型连通正常（测试样本判定：{} / {}）",
+                secret_label(&clean_key),
+                v.action,
+                v.category
+            );
         }
     }
 
@@ -946,13 +962,19 @@ pub fn run() {
             let cfg_file = dir.join("config.toml");
             if cfg_file.exists() {
                 if let Ok(mut raw) = std::fs::read_to_string(&cfg_file) {
-                    // 将早期未配置密钥的旧默认模型名平滑升级为 deepseek-v4.1-flash
+                    // 将早期未配置密钥的旧默认模型名平滑升级为 deepseek-v4.1-flash，并同步升级旧版 OpenCode Go 网关路径
                     if !raw.contains("deepseek-v4.1-flash")
                         && raw.contains("preset = \"deepseek\"")
                         && raw.contains("model = \"deepseek-chat\"")
                         && vault.get("llm_deepseek").is_none()
                     {
                         raw = raw.replace("model = \"deepseek-chat\"", "model = \"deepseek-v4.1-flash\"");
+                    }
+                    if raw.contains("https://opencode.ai/zen/go/v1") {
+                        raw = raw.replace(
+                            "https://opencode.ai/zen/go/v1",
+                            "https://opencode.ai/inference/go/openai/v1",
+                        );
                     }
                     let _ = config::apply_toml(&dir, &raw, &db, &vault);
                 }
