@@ -1,6 +1,7 @@
 mod agent;
 mod config;
 mod db;
+mod llm;
 mod mail;
 mod vault;
 
