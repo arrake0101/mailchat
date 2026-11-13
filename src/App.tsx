@@ -199,161 +199,163 @@ export default function App() {
   const mailMeta = MAIL_VIEWS.find((v) => v.key === view);
 
   return (
-    <div
-      className="app-shell"
-      onMouseDown={(e) => {
-        if (e.target === e.currentTarget) startWindowDrag(e);
-      }}
-    >
+    <div className="app-shell">
       <WindowControls />
 
-      <nav className="rail" onMouseDown={startWindowDrag} onDoubleClick={toggleWindowMaximize}>
-        <div className="rail-brand" title="MailChat（按住空白处可拖动窗口）">
-          <IconMail size={19} />
-        </div>
+      <div
+        className="app-body"
+        onMouseDown={(e) => {
+          if (e.target === e.currentTarget) startWindowDrag(e);
+        }}
+      >
+        <nav className="rail" onMouseDown={startWindowDrag} onDoubleClick={toggleWindowMaximize}>
+          <div className="rail-brand" title="MailChat（按住空白处可拖动窗口）">
+            <IconMail size={19} />
+          </div>
 
-        <div className="rail-group">
-          {MAIL_VIEWS.map((v) => {
-            const badge =
-              v.key === "inbox"
-                ? stats.inbox_unread
-                : v.key === "archived"
-                  ? stats.archived_unread
-                  : stats.blocked_count;
-            const Icon = v.key === "inbox" ? IconChat : v.key === "archived" ? IconBell : IconShield;
-            return (
-              <button
-                key={v.key}
-                type="button"
-                className={`rail-btn ${view === v.key ? "active" : ""}`}
-                onClick={() => switchNav(v.key)}
-                title={v.label}
-              >
-                <Icon size={19} />
-                <span className="rail-label">{v.label}</span>
-                {badge > 0 && (
-                  <span className={`rail-badge ${v.key !== "inbox" ? "muted" : ""}`}>
-                    {badge > 99 ? "99+" : badge}
-                  </span>
-                )}
-              </button>
-            );
-          })}
+          <div className="rail-group">
+            {MAIL_VIEWS.map((v) => {
+              const badge =
+                v.key === "inbox"
+                  ? stats.inbox_unread
+                  : v.key === "archived"
+                    ? stats.archived_unread
+                    : stats.blocked_count;
+              const Icon = v.key === "inbox" ? IconChat : v.key === "archived" ? IconBell : IconShield;
+              return (
+                <button
+                  key={v.key}
+                  type="button"
+                  className={`rail-btn ${view === v.key ? "active" : ""}`}
+                  onClick={() => switchNav(v.key)}
+                  title={v.label}
+                >
+                  <Icon size={19} />
+                  <span className="rail-label">{v.label}</span>
+                  {badge > 0 && (
+                    <span className={`rail-badge ${v.key !== "inbox" ? "muted" : ""}`}>
+                      {badge > 99 ? "99+" : badge}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
 
-          <button
-            type="button"
-            className={`rail-btn agent-rail-btn ${view === "assistant" ? "active" : ""}`}
-            onClick={() => switchNav("assistant")}
-            title="AI 助手（声明式配置与自动化管家）"
-          >
-            <IconSparkles size={19} />
-            <span className="rail-label">助手</span>
-          </button>
-        </div>
-
-        <div className="rail-bottom">
-          <button
-            type="button"
-            className={`rail-btn ${view === "settings" ? "active" : ""}`}
-            onClick={() => switchNav("settings")}
-            title="声明式配置与隐私凭据保险箱"
-          >
-            <IconSliders size={18} />
-            <span className="rail-label">配置</span>
-          </button>
-        </div>
-      </nav>
-
-      {view === "assistant" ? (
-        <AgentWorkspace
-          notify={notify}
-          onDataChanged={refresh}
-          onOpenManualSettings={() => openSettings("declarative")}
-        />
-      ) : view === "settings" ? (
-        <Settings
-          initialTab={settingsTab}
-          hasDemo={stats.has_demo}
-          notify={notify}
-          onAccountSaved={() => {
-            setView("inbox");
-            refresh();
-          }}
-          onDataChanged={refresh}
-          onGoToAgent={() => setView("assistant")}
-        />
-      ) : (
-        <>
-          <ConversationList
-            title={mailMeta?.label ?? "消息"}
-            items={convs}
-            selected={selected}
-            onSelect={select}
-            onNewChat={startNewChat}
-            onCreateGroup={createGroup}
-            onRefresh={syncNow}
-            onRunTriage={runAgentTriage}
-            syncing={syncing}
-            triaging={triaging}
-            emptyHint={mailMeta?.empty ?? ""}
-          />
-
-          {activeConv ? (
-            <ChatView
-              conv={activeConv}
-              status={view}
-              messages={messages}
-              onSent={(m) => {
-                setDraftConv(null);
-                const target = activeConv.is_group && activeConv.muted ? "archived" : "inbox";
-                if (view !== target) setView(target);
-                setMessages((ms) => [...ms, m]);
-                refresh();
-              }}
-              onChanged={refresh}
-              onGroupUpdated={(grp) => {
-                const target = grp.muted ? "archived" : "inbox";
-                if (view !== target) setView(target);
-                setSelected(grp.peer);
-                refresh();
-              }}
-              notify={notify}
-            />
-          ) : (
-            <section
-              className="chat-workspace placeholder"
-              onMouseDown={startWindowDrag}
-              onDoubleClick={toggleWindowMaximize}
+            <button
+              type="button"
+              className={`rail-btn agent-rail-btn ${view === "assistant" ? "active" : ""}`}
+              onClick={() => switchNav("assistant")}
+              title="AI 助手（声明式配置与自动化管家）"
             >
-              {!account && convs.length === 0 && !stats.has_demo ? (
-                <div className="welcome-card">
-                  <div className="welcome-emblem">
-                    <IconMail size={24} />
+              <IconSparkles size={19} />
+              <span className="rail-label">助手</span>
+            </button>
+          </div>
+
+          <div className="rail-bottom">
+            <button
+              type="button"
+              className={`rail-btn ${view === "settings" ? "active" : ""}`}
+              onClick={() => switchNav("settings")}
+              title="声明式配置与隐私凭据保险箱"
+            >
+              <IconSliders size={18} />
+              <span className="rail-label">配置</span>
+            </button>
+          </div>
+        </nav>
+
+        {view === "assistant" ? (
+          <AgentWorkspace
+            notify={notify}
+            onDataChanged={refresh}
+            onOpenManualSettings={() => openSettings("declarative")}
+          />
+        ) : view === "settings" ? (
+          <Settings
+            initialTab={settingsTab}
+            hasDemo={stats.has_demo}
+            notify={notify}
+            onAccountSaved={() => {
+              setView("inbox");
+              refresh();
+            }}
+            onDataChanged={refresh}
+            onGoToAgent={() => setView("assistant")}
+          />
+        ) : (
+          <>
+            <ConversationList
+              title={mailMeta?.label ?? "消息"}
+              items={convs}
+              selected={selected}
+              onSelect={select}
+              onNewChat={startNewChat}
+              onCreateGroup={createGroup}
+              onRefresh={syncNow}
+              onRunTriage={runAgentTriage}
+              syncing={syncing}
+              triaging={triaging}
+              emptyHint={mailMeta?.empty ?? ""}
+            />
+
+            {activeConv ? (
+              <ChatView
+                conv={activeConv}
+                status={view}
+                messages={messages}
+                onSent={(m) => {
+                  setDraftConv(null);
+                  const target = activeConv.is_group && activeConv.muted ? "archived" : "inbox";
+                  if (view !== target) setView(target);
+                  setMessages((ms) => [...ms, m]);
+                  refresh();
+                }}
+                onChanged={refresh}
+                onGroupUpdated={(grp) => {
+                  const target = grp.muted ? "archived" : "inbox";
+                  if (view !== target) setView(target);
+                  setSelected(grp.peer);
+                  refresh();
+                }}
+                notify={notify}
+              />
+            ) : (
+              <section
+                className="chat-workspace placeholder"
+                onMouseDown={startWindowDrag}
+                onDoubleClick={toggleWindowMaximize}
+              >
+                {!account && convs.length === 0 && !stats.has_demo ? (
+                  <div className="welcome-card">
+                    <div className="welcome-emblem">
+                      <IconMail size={24} />
+                    </div>
+                    <h2>像聊天一样收发与管理邮件</h2>
+                    <p>
+                      兼容任意标准 IMAP / SMTP 单聊与多人全员群聊。通过内置助手即可一句话完成声明式配置与过滤编排，密码与密钥全程本机独立加密隔离。
+                    </p>
+                    <div className="welcome-actions">
+                      <button type="button" className="primary-btn large" onClick={() => setView("assistant")}>
+                        <IconSparkles size={15} />
+                        <span>通过 AI 助手对话式配置</span>
+                      </button>
+                      <button type="button" className="soft-btn large" onClick={loadDemo}>
+                        载入演示会话与 4 人群聊
+                      </button>
+                      <button type="button" className="text-link" onClick={() => openSettings("declarative")}>
+                        查看 config.toml 声明式配置与隐私保险箱
+                      </button>
+                    </div>
                   </div>
-                  <h2>像聊天一样收发与管理邮件</h2>
-                  <p>
-                    兼容任意标准 IMAP / SMTP 单聊与多人全员群聊。通过内置助手即可一句话完成声明式配置与过滤编排，密码与密钥全程本机独立加密隔离。
-                  </p>
-                  <div className="welcome-actions">
-                    <button type="button" className="primary-btn large" onClick={() => setView("assistant")}>
-                      <IconSparkles size={15} />
-                      <span>通过 AI 助手对话式配置</span>
-                    </button>
-                    <button type="button" className="soft-btn large" onClick={loadDemo}>
-                      载入演示会话与 4 人群聊
-                    </button>
-                    <button type="button" className="text-link" onClick={() => openSettings("declarative")}>
-                      查看 config.toml 声明式配置与隐私保险箱
-                    </button>
-                  </div>
-                </div>
-              ) : (
-                <div className="empty-canvas-hint">选择左侧会话开始沟通，或通过「助手」用自然语言调整规则与配置</div>
-              )}
-            </section>
-          )}
-        </>
-      )}
+                ) : (
+                  <div className="empty-canvas-hint">选择左侧会话开始沟通，或通过「助手」用自然语言调整规则与配置</div>
+                )}
+              </section>
+            )}
+          </>
+        )}
+      </div>
 
       {toast && <div className={`toast ${toast.error ? "error" : ""}`}>{toast.text}</div>}
     </div>

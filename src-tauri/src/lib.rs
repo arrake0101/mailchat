@@ -509,6 +509,12 @@ fn window_action(window: tauri::WebviewWindow, action: String) -> CmdResult<bool
             let _ = window.start_dragging();
             Ok(window.is_maximized().unwrap_or(false))
         }
+        "toggle_pin" => {
+            let next = !window.is_always_on_top().unwrap_or(false);
+            window.set_always_on_top(next).map_err(err)?;
+            Ok(next)
+        }
+        "is_pinned" => window.is_always_on_top().map_err(err),
         "minimize" => {
             window.minimize().map_err(err)?;
             Ok(false)
@@ -938,7 +944,15 @@ pub fn run() {
             // 若磁盘已存在用户手工修改过的 config.toml 则加载对账，否则生成初始声明式配置文件
             let cfg_file = dir.join("config.toml");
             if cfg_file.exists() {
-                if let Ok(raw) = std::fs::read_to_string(&cfg_file) {
+                if let Ok(mut raw) = std::fs::read_to_string(&cfg_file) {
+                    // 将早期未配置密钥的旧默认模型名平滑升级为 deepseek-v4.1-flash
+                    if !raw.contains("deepseek-v4.1-flash")
+                        && raw.contains("preset = \"deepseek\"")
+                        && raw.contains("model = \"deepseek-chat\"")
+                        && vault.get("llm_deepseek").is_none()
+                    {
+                        raw = raw.replace("model = \"deepseek-chat\"", "model = \"deepseek-v4.1-flash\"");
+                    }
                     let _ = config::apply_toml(&dir, &raw, &db, &vault);
                 }
             } else {

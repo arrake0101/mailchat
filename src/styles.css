@@ -148,36 +148,37 @@ textarea:focus {
   box-shadow: 0 0 0 3px rgba(53, 99, 233, 0.1);
 }
 
-/* 整体悬浮式画布布局，告别生硬分割线与系统白色标题条 */
+/* 整体悬浮式画布布局：顶部微信式独立窗口栏 + 下方内容卡片区 */
 .app-shell {
   display: flex;
+  flex-direction: column;
   height: 100vh;
-  padding: 10px 10px 10px 6px;
-  gap: 10px;
   background: var(--canvas-outer);
 }
 
-/* 融入右上角卡片顶栏的无边框窗口控制簇（不额外占用顶部横条） */
-.win-controls {
-  position: fixed;
-  top: 26px;
-  right: 22px;
-  z-index: 45;
+.window-titlebar {
+  height: 32px;
+  flex-shrink: 0;
   display: flex;
-  align-items: center;
-  gap: 2px;
-  padding: 2px;
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.72);
-  backdrop-filter: blur(8px);
+  align-items: stretch;
+  justify-content: flex-end;
+  user-select: none;
+  background: var(--canvas-outer);
+}
+
+.win-controls {
+  display: flex;
+  align-items: stretch;
+  height: 100%;
 }
 
 .win-ctl {
-  width: 30px;
-  height: 26px;
+  width: 42px;
+  height: 100%;
   padding: 0;
-  border-radius: 8px;
-  color: var(--ink-muted);
+  border-radius: 0;
+  color: var(--ink-secondary);
+  transition: background 0.12s ease, color 0.12s ease;
 }
 
 .win-ctl:hover:not(:disabled) {
@@ -185,13 +186,31 @@ textarea:focus {
   color: var(--ink);
 }
 
+.win-ctl.pinned {
+  color: var(--accent);
+  background: rgba(53, 99, 233, 0.085);
+}
+
+.win-ctl.pinned:hover:not(:disabled) {
+  background: rgba(53, 99, 233, 0.14);
+  color: var(--accent-hover);
+}
+
+.win-ctl.close {
+  width: 44px;
+}
+
 .win-ctl.close:hover:not(:disabled) {
-  background: #ef4444;
+  background: #e81123;
   color: #ffffff;
 }
 
-.win-safe-right {
-  padding-right: 128px !important;
+.app-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  padding: 0 10px 10px 6px;
+  gap: 10px;
 }
 
 /* 左侧柔和导航栏 */
@@ -200,7 +219,7 @@ textarea:focus {
   display: flex;
   flex-direction: column;
   align-items: center;
-  padding: 8px 0 6px;
+  padding: 6px 0;
   user-select: none;
   flex-shrink: 0;
 }
@@ -1839,10 +1858,28 @@ textarea:focus {
   cursor: pointer;
 }
 
+.provider-tier-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink-secondary);
+}
+
 .provider-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
+}
+
+.featured-grid {
+  gap: 10px;
+}
+
+.secondary-grid {
+  padding-top: 2px;
 }
 
 .provider-card {
@@ -1855,9 +1892,33 @@ textarea:focus {
   text-align: left;
 }
 
+.provider-card.featured-card {
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: #f4f7fc;
+}
+
+.provider-card-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.provider-sub {
+  font-size: 11px;
+  color: var(--ink-muted);
+  font-family: "JetBrains Mono", "Cascadia Code", ui-monospace, Consolas, monospace;
+}
+
 .provider-card.selected {
   background: var(--accent-soft);
   color: var(--accent-ink);
+  box-shadow: inset 0 0 0 1.5px rgba(53, 99, 233, 0.25);
+}
+
+.provider-card.selected .provider-sub {
+  color: var(--accent);
 }
 
 .provider-name {
@@ -1871,6 +1932,13 @@ textarea:focus {
   background: rgba(255, 255, 255, 0.75);
   padding: 2px 6px;
   border-radius: 6px;
+  flex-shrink: 0;
+}
+
+.provider-badge.featured-badge {
+  color: var(--accent-ink);
+  background: rgba(255, 255, 255, 0.9);
+  font-weight: 500;
 }
 
 .preset-pills {

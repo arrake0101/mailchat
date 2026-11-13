@@ -39,16 +39,16 @@ pub struct Vault {
 
 pub const KNOWN_SECRETS: &[(&str, &str, &str)] = &[
     ("mail_password", "邮箱 IMAP/SMTP 授权码", "mail"),
-    ("llm_opencode_go", "OpenCode Go API Key", "llm"),
-    ("llm_deepseek", "DeepSeek API Key", "llm"),
-    ("llm_openai", "OpenAI API Key", "llm"),
+    ("llm_deepseek", "DeepSeek 官网 API Key（优先推荐）", "llm"),
+    ("llm_opencode_go", "OpenCode Go 订阅 API Key（优先推荐）", "llm"),
+    ("llm_ollama_cloud", "Ollama 远程订阅 API Key（优先推荐）", "llm"),
+    ("llm_ollama_remote", "Ollama 自建远程算力密钥（可选）", "llm"),
     ("llm_qwen", "通义千问 (百炼) API Key", "llm"),
+    ("llm_openai", "OpenAI API Key", "llm"),
     ("llm_anthropic", "Anthropic Claude API Key", "llm"),
     ("llm_gemini", "Google Gemini API Key", "llm"),
     ("llm_kimi", "Moonshot Kimi API Key", "llm"),
     ("llm_siliconflow", "硅基流动 API Key", "llm"),
-    ("llm_ollama_cloud", "Ollama Cloud API Key", "llm"),
-    ("llm_ollama_remote", "Ollama 远程服务密钥 (可选)", "llm"),
     ("llm_custom", "自定义网关 API Key", "llm"),
 ];
 

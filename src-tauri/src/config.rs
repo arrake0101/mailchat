@@ -168,19 +168,20 @@ pub fn mail_domain_defaults(email: &str) -> Option<(&'static str, u16, &'static 
 }
 
 /// 主流模型预设默认连接参数：(provider, base_url, default_model)
+/// 首选推荐接入：DeepSeek 官网、OpenCode Go、Ollama 远程订阅（均默认搭载 deepseek-v4.1-flash）
 pub fn model_preset_defaults(preset: &str) -> (&'static str, &'static str, &'static str) {
     match preset.trim().to_lowercase().as_str() {
-        "opencode_go" => ("openai", "https://opencode.ai/zen/go/v1", "glm-5.3-flash"),
-        "deepseek" => ("openai", "https://api.deepseek.com/v1", "deepseek-chat"),
-        "openai" => ("openai", "https://api.openai.com/v1", "gpt-4o-mini"),
+        "deepseek" => ("openai", "https://api.deepseek.com/v1", "deepseek-v4.1-flash"),
+        "opencode_go" => ("openai", "https://opencode.ai/zen/go/v1", "deepseek-v4.1-flash"),
+        "ollama_cloud" => ("openai", "https://ollama.com/v1", "deepseek-v4.1-flash"),
+        "ollama_remote" => ("openai", "http://192.168.1.100:11434/v1", "qwen2.5:7b"),
+        "ollama" => ("openai", "http://localhost:11434/v1", "qwen2.5:7b"),
         "qwen" => ("openai", "https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-plus"),
+        "openai" => ("openai", "https://api.openai.com/v1", "gpt-4o-mini"),
         "anthropic" => ("anthropic", "https://api.anthropic.com", "claude-sonnet-4-20250514"),
         "gemini" => ("gemini", "https://generativelanguage.googleapis.com/v1beta", "gemini-2.5-flash"),
         "kimi" => ("openai", "https://api.moonshot.cn/v1", "kimi-k2-0711-preview"),
         "siliconflow" => ("openai", "https://api.siliconflow.cn/v1", "Qwen/Qwen2.5-7B-Instruct"),
-        "ollama_remote" => ("openai", "http://192.168.1.100:11434/v1", "qwen2.5:7b"),
-        "ollama_cloud" => ("openai", "https://ollama.com/v1", "gpt-oss:20b"),
-        "ollama" => ("openai", "http://localhost:11434/v1", "qwen2.5:7b"),
         _ => ("openai", "", ""),
     }
 }

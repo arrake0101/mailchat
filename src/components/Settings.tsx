@@ -49,7 +49,7 @@ export function Settings({
   return (
     <section className="settings">
       <header
-        className="pane-header win-safe-right"
+        className="pane-header"
         onMouseDown={startWindowDrag}
         onDoubleClick={toggleWindowMaximize}
       >
@@ -346,6 +346,7 @@ function VisualTab({
   const [testVerdict, setTestVerdict] = useState<Verdict | null>(null);
   const [fetchedModels, setFetchedModels] = useState<string[]>([]);
   const [fetchingModels, setFetchingModels] = useState(false);
+  const [showMoreProviders, setShowMoreProviders] = useState(false);
 
   const reloadAll = () => {
     api.getAccount().then((acc) => acc && setA(acc));
@@ -473,7 +474,10 @@ function VisualTab({
     }
   };
 
+  const featuredPresets = MODEL_PRESETS.filter((p) => p.featured);
+  const secondaryPresets = MODEL_PRESETS.filter((p) => !p.featured);
   const currentPreset = MODEL_PRESETS.find((p) => p.id === c?.preset) ?? MODEL_PRESETS[0];
+  const isSecondaryActive = Boolean(c && !currentPreset.featured);
   const activeLlmSecret = secrets.find((s) => s.key === `llm_${c?.preset}`);
 
   return (
@@ -590,19 +594,53 @@ function VisualTab({
             </label>
           </div>
 
-          <div className="provider-grid">
-            {MODEL_PRESETS.map((p) => (
+          <div className="provider-tier-label">
+            <span>首选推荐接入（默认搭载 deepseek-v4.1-flash）</span>
+            <button
+              type="button"
+              className="text-link"
+              onClick={() => setShowMoreProviders((v) => !v)}
+            >
+              {showMoreProviders || isSecondaryActive
+                ? showMoreProviders
+                  ? "收起其他兼容服务"
+                  : `更多兼容服务 (${secondaryPresets.length})`
+                : `展开更多兼容服务与本地算力 (${secondaryPresets.length})`}
+            </button>
+          </div>
+
+          <div className="provider-grid featured-grid">
+            {featuredPresets.map((p) => (
               <button
                 key={p.id}
                 type="button"
-                className={`provider-card ${c.preset === p.id ? "selected" : ""}`}
+                className={`provider-card featured-card ${c.preset === p.id ? "selected" : ""}`}
                 onClick={() => selectPreset(p.id)}
               >
-                <span className="provider-name">{p.name}</span>
-                <span className="provider-badge">{p.badge}</span>
+                <div className="provider-card-main">
+                  <span className="provider-name">{p.name}</span>
+                  <span className="provider-sub">{p.defaultModel}</span>
+                </div>
+                <span className="provider-badge featured-badge">{p.badge}</span>
               </button>
             ))}
           </div>
+
+          {(showMoreProviders || isSecondaryActive) && (
+            <div className="provider-grid secondary-grid">
+              {secondaryPresets.map((p) => (
+                <button
+                  key={p.id}
+                  type="button"
+                  className={`provider-card ${c.preset === p.id ? "selected" : ""}`}
+                  onClick={() => selectPreset(p.id)}
+                >
+                  <span className="provider-name">{p.name}</span>
+                  <span className="provider-badge">{p.badge}</span>
+                </button>
+              ))}
+            </div>
+          )}
 
           {currentPreset.hint && <div className="preset-hint">{currentPreset.hint}</div>}
 

@@ -16,7 +16,14 @@ export type ProviderPresetId =
   | "ollama"
   | "custom";
 
-export type WindowAction = "drag" | "minimize" | "toggle_maximize" | "is_maximized" | "close";
+export type WindowAction =
+  | "drag"
+  | "toggle_pin"
+  | "is_pinned"
+  | "minimize"
+  | "toggle_maximize"
+  | "is_maximized"
+  | "close";
 
 export interface Account {
   email: string;

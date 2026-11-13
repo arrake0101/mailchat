@@ -226,7 +226,7 @@ export function ChatView({ conv, status, messages, onSent, onChanged, onGroupUpd
     <section className="chat-workspace">
       <div className="chat">
         <header
-          className={`chat-head ${!drawerOpen ? "win-safe-right" : ""}`}
+          className="chat-head"
           onMouseDown={startWindowDrag}
           onDoubleClick={toggleWindowMaximize}
         >
@@ -564,7 +564,7 @@ export function ChatView({ conv, status, messages, onSent, onChanged, onGroupUpd
       {drawerOpen && (
         <aside className="group-drawer">
           <div
-            className="drawer-head win-safe-right"
+            className="drawer-head"
             onMouseDown={startWindowDrag}
             onDoubleClick={toggleWindowMaximize}
           >

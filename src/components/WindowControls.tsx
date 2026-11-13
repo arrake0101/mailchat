@@ -23,9 +23,10 @@ export function toggleWindowMaximize(e: MouseEvent) {
     .catch(() => {});
 }
 
-/** 融入右上角卡片顶栏的轻量无边框窗口控制键（无独立标题横条） */
+/** 微信桌面端风格的外层顶部窗口栏（置顶 / 最小化 / 最大化 / 关闭独立于内容卡片之外） */
 export function WindowControls() {
   const [maximized, setMaximized] = useState(false);
+  const [pinned, setPinned] = useState(false);
 
   useEffect(() => {
     const sync = () => {
@@ -39,6 +40,10 @@ export function WindowControls() {
       if (typeof detail === "boolean") setMaximized(detail);
     };
     sync();
+    api
+      .windowAction("is_pinned")
+      .then(setPinned)
+      .catch(() => {});
     window.addEventListener("resize", sync);
     window.addEventListener("mailchat-win-max", onCustom);
     return () => {
@@ -48,52 +53,86 @@ export function WindowControls() {
   }, []);
 
   return (
-    <div className="win-controls no-drag" aria-label="窗口控制">
-      <button
-        type="button"
-        className="win-ctl"
-        onClick={() => api.windowAction("minimize")}
-        title="最小化"
-      >
-        <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.35">
-          <line x1="1.5" y1="6" x2="10.5" y2="6" strokeLinecap="round" />
-        </svg>
-      </button>
-
-      <button
-        type="button"
-        className="win-ctl"
-        onClick={async () => {
-          try {
-            setMaximized(await api.windowAction("toggle_maximize"));
-          } catch {
-            // ignore in plain browser preview
-          }
-        }}
-        title={maximized ? "向下还原" : "最大化"}
-      >
-        {maximized ? (
-          <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.25">
-            <rect x="1.8" y="3.4" width="6.8" height="6.8" rx="1.2" />
-            <path d="M3.8 3.4V2.5c0-.6.5-1 1-1h4.7c.6 0 1 .4 1 1v4.7c0 .5-.4 1-1 1H8.6" strokeLinecap="round" />
+    <header
+      className="window-titlebar"
+      onMouseDown={startWindowDrag}
+      onDoubleClick={toggleWindowMaximize}
+    >
+      <div className="win-controls no-drag" aria-label="窗口控制">
+        <button
+          type="button"
+          className={`win-ctl ${pinned ? "pinned" : ""}`}
+          onClick={async () => {
+            try {
+              setPinned(await api.windowAction("toggle_pin"));
+            } catch {
+              // ignore in plain browser preview
+            }
+          }}
+          title={pinned ? "取消置顶" : "置顶"}
+        >
+          <svg
+            width="13"
+            height="13"
+            viewBox="0 0 14 14"
+            fill={pinned ? "currentColor" : "none"}
+            stroke="currentColor"
+            strokeWidth="1.2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <path d="M4.3 2.2h5.4" fill="none" />
+            <path d="M5.2 2.2h3.6v3.1l1.6 1.6v.8H3.6v-.8l1.6-1.6V2.2Z" />
+            <path d="M7 7.7v4.1" fill="none" />
           </svg>
-        ) : (
-          <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.3">
-            <rect x="2" y="2" width="8" height="8" rx="1.5" />
-          </svg>
-        )}
-      </button>
+        </button>
 
-      <button
-        type="button"
-        className="win-ctl close"
-        onClick={() => api.windowAction("close")}
-        title="关闭"
-      >
-        <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.4">
-          <path d="M2.5 2.5l7 7M9.5 2.5l-7 7" strokeLinecap="round" />
-        </svg>
-      </button>
-    </div>
+        <button
+          type="button"
+          className="win-ctl"
+          onClick={() => api.windowAction("minimize").catch(() => {})}
+          title="最小化"
+        >
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.2">
+            <line x1="2" y1="6" x2="10" y2="6" />
+          </svg>
+        </button>
+
+        <button
+          type="button"
+          className="win-ctl"
+          onClick={async () => {
+            try {
+              setMaximized(await api.windowAction("toggle_maximize"));
+            } catch {
+              // ignore in plain browser preview
+            }
+          }}
+          title={maximized ? "向下还原" : "最大化"}
+        >
+          {maximized ? (
+            <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.15">
+              <rect x="1.8" y="3.5" width="6.7" height="6.7" rx="0.8" />
+              <path d="M3.6 3.5V2.4c0-.5.4-.9.9-.9h5.2c.5 0 .9.4.9.9v5.2c0 .5-.4.9-.9.9H8.5" />
+            </svg>
+          ) : (
+            <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.2">
+              <rect x="2.1" y="2.1" width="7.8" height="7.8" rx="0.9" />
+            </svg>
+          )}
+        </button>
+
+        <button
+          type="button"
+          className="win-ctl close"
+          onClick={() => api.windowAction("close").catch(() => {})}
+          title="关闭"
+        >
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.2">
+            <path d="M2.4 2.4l7.2 7.2M9.6 2.4l-7.2 7.2" strokeLinecap="round" />
+          </svg>
+        </button>
+      </div>
+    </header>
   );
 }

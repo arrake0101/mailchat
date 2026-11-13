@@ -115,6 +115,7 @@ export interface ModelPreset {
   id: ProviderPresetId;
   name: string;
   badge: string;
+  featured?: boolean;
   provider: ProviderProtocol;
   baseUrl: string;
   defaultModel: string;
@@ -125,20 +126,34 @@ export interface ModelPreset {
   hint: string;
 }
 
-/** 可一键切换的多家主流大模型与远端/局域网算力预设 */
+/** 可一键切换的模型预设：优先推荐 DeepSeek 官网、OpenCode Go 与 Ollama 远程订阅（均默认搭载 deepseek-v4.1-flash） */
 export const MODEL_PRESETS: ModelPreset[] = [
+  {
+    id: "deepseek",
+    name: "DeepSeek 官网",
+    badge: "官方首选",
+    featured: true,
+    provider: "openai",
+    baseUrl: "https://api.deepseek.com/v1",
+    defaultModel: "deepseek-v4.1-flash",
+    models: ["deepseek-v4.1-flash", "deepseek-flash", "deepseek-chat", "deepseek-reasoner"],
+    needsKey: true,
+    supportsModelFetch: true,
+    hint: "DeepSeek 官方开放平台直连（api.deepseek.com/v1），默认搭载 DeepSeek 4.1 Flash（底层自动适配官方 deepseek-flash 参数），极速低成本处理中文邮件分拣与摘要。",
+  },
   {
     id: "opencode_go",
     name: "OpenCode Go",
-    badge: "订阅畅享",
+    badge: "订阅优先",
+    featured: true,
     provider: "openai",
     baseUrl: "https://opencode.ai/zen/go/v1",
-    defaultModel: "glm-5.3-flash",
+    defaultModel: "deepseek-v4.1-flash",
     models: [
-      "glm-5.3-flash",
-      "glm-5.2",
       "deepseek-v4.1-flash",
       "deepseek-v4-pro",
+      "glm-5.3-flash",
+      "glm-5.2",
       "kimi-k3.1-pro",
       "kimi-k2.7-code",
       "minimax-m3.1-flash",
@@ -146,12 +161,32 @@ export const MODEL_PRESETS: ModelPreset[] = [
     ],
     needsKey: true,
     supportsModelFetch: true,
-    hint: "OpenCode Go 官方网关（opencode.ai/zen/go/v1），一站式畅享 GLM-5、DeepSeek、Kimi、MiniMax 等前沿模型，支持一键动态拉取最新模型列表。",
+    hint: "OpenCode Go 官方订阅网关（opencode.ai/zen/go/v1），默认使用 deepseek-v4.1-flash，同时支持切换 GLM-5、Kimi、MiniMax 等订阅模型。",
+  },
+  {
+    id: "ollama_cloud",
+    name: "Ollama 远程订阅",
+    badge: "云端订阅",
+    featured: true,
+    provider: "openai",
+    baseUrl: "https://ollama.com/v1",
+    defaultModel: "deepseek-v4.1-flash",
+    models: [
+      "deepseek-v4.1-flash",
+      "deepseek-v4.1-flash:1017",
+      "gpt-oss:120b-cloud",
+      "gpt-oss:20b",
+      "gemma4:31b",
+      "qwen3:32b",
+    ],
+    needsKey: true,
+    supportsModelFetch: true,
+    hint: "Ollama 官方远程云端订阅（ollama.com/v1），填入 ollama.com/settings 生成的订阅密钥即可免显卡调用满血版 deepseek-v4.1-flash。",
   },
   {
     id: "ollama_remote",
-    name: "Ollama 远程服务",
-    badge: "远程算力",
+    name: "Ollama 自建远程",
+    badge: "内网算力",
     provider: "openai",
     baseUrl: "http://192.168.1.100:11434/v1",
     defaultModel: "qwen2.5:7b",
@@ -159,19 +194,7 @@ export const MODEL_PRESETS: ModelPreset[] = [
     needsKey: false,
     optionalKey: true,
     supportsModelFetch: true,
-    hint: "接入局域网 GPU 算力机、Tailscale 或自建服务器上的远程 Ollama（自动兼容省略 /v1 的地址）；直连免 Key，若配置了反向代理鉴权可按需填写密钥。",
-  },
-  {
-    id: "ollama_cloud",
-    name: "Ollama Cloud",
-    badge: "官方云端",
-    provider: "openai",
-    baseUrl: "https://ollama.com/v1",
-    defaultModel: "gpt-oss:20b",
-    models: ["gpt-oss:20b", "gpt-oss:120b-cloud", "gemma4:31b", "qwen3:32b", "deepseek-r1:70b"],
-    needsKey: true,
-    supportsModelFetch: true,
-    hint: "Ollama 官方云端托管服务（ollama.com/v1），填入 ollama.com/settings 生成的 API Key 即可远程调用大参数开源模型。",
+    hint: "接入局域网 GPU 算力机、Tailscale 或自建服务器上的远程 Ollama（自动兼容省略 /v1 的地址）；直连免 Key，若配置了网关鉴权可按需填写密钥。",
   },
   {
     id: "ollama",
@@ -184,18 +207,6 @@ export const MODEL_PRESETS: ModelPreset[] = [
     needsKey: false,
     supportsModelFetch: true,
     hint: "邮件数据 100% 不出本机！需先在本机启动 Ollama，点击「拉取远端模型」可直接读取本机已安装的模型标签。",
-  },
-  {
-    id: "deepseek",
-    name: "DeepSeek",
-    badge: "高性价比",
-    provider: "openai",
-    baseUrl: "https://api.deepseek.com/v1",
-    defaultModel: "deepseek-chat",
-    models: ["deepseek-chat", "deepseek-reasoner"],
-    needsKey: true,
-    supportsModelFetch: true,
-    hint: "DeepSeek 官方开放平台接口，中文邮件分类与摘要速度快、成本极低。",
   },
   {
     id: "openai",

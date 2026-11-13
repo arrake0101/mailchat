@@ -68,7 +68,7 @@ impl Default for AgentConfig {
             provider: "openai".into(),
             base_url: "https://api.deepseek.com/v1".into(),
             api_key: String::new(),
-            model: "deepseek-chat".into(),
+            model: "deepseek-v4.1-flash".into(),
             instructions: "1. 屏蔽营销推广、电商促销、广告群发、钓鱼诈骗和垃圾邮件（block）。\n2. 系统通知、银行账单、登录验证码、物流动态、订阅周刊折叠进「通知」（archive）。\n3. 真人来信、同事/客户工作沟通、需要我回复的重要事项保留在「聊天」（inbox）。".into(),
             auto_draft: true,
             auto_block_sender: false,

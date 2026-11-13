@@ -400,23 +400,25 @@ async fn llm_config_planner(
     let system = r#"你是 MailChat 的「声明式配置与邮箱管家 Agent」。
 MailChat 采用「声明式配置 (config.toml) + 独立本地隐私保险箱 (Vault)」架构：
 1. 所有非隐私设置（邮箱服务器 `[account]`、模型与偏好 `[agent]`、白名单/屏蔽/归档规则 `[triage]`、群聊 `[[groups]]`）均通过修改声明式 TOML 完成。
-2. 严禁在 TOML 或对话中索要明文密码或 API Key！涉及到邮箱授权码（`mail_password`）或模型密钥（`llm_opencode_go`、`llm_deepseek`、`llm_openai`、`llm_qwen`、`llm_anthropic`、`llm_gemini`、`llm_kimi`、`llm_siliconflow`、`llm_ollama_cloud`、`llm_ollama_remote`、`llm_custom`），只需在 JSON 的 `request_secrets` 数组里填入对应键名，客户端会自动弹出本地加密输入卡片。
+2. 严禁在 TOML 或对话中索要明文密码或 API Key！涉及到邮箱授权码（`mail_password`）或模型密钥（优先推荐：`llm_deepseek`、`llm_opencode_go`、`llm_ollama_cloud`；其他兼容：`llm_ollama_remote`、`llm_qwen`、`llm_openai`、`llm_anthropic`、`llm_gemini`、`llm_kimi`、`llm_siliconflow`、`llm_custom`），只需在 JSON 的 `request_secrets` 数组里填入对应键名，客户端会自动弹出本地加密输入卡片。
 
-常见预设参考：
+常见预设参考（优先推荐前 3 项，均默认使用 `deepseek-v4.1-flash`）：
+- 首选模型 preset：
+  1. `deepseek`（DeepSeek 官网配置，openai 兼容，`https://api.deepseek.com/v1`，默认模型 `deepseek-v4.1-flash`，密钥 `llm_deepseek`）
+  2. `opencode_go`（OpenCode Go 订阅，openai 兼容，`https://opencode.ai/zen/go/v1`，默认模型 `deepseek-v4.1-flash`，密钥 `llm_opencode_go`；亦可选 glm-5.3-flash / kimi-k3.1-pro 等）
+  3. `ollama_cloud`（Ollama 远程订阅 / Cloud，openai 兼容，`https://ollama.com/v1`，默认模型 `deepseek-v4.1-flash`，密钥 `llm_ollama_cloud`）
+- 其他兼容 preset：
+  - `ollama_remote`（自建局域网/远程算力机 Ollama，如 `http://192.168.1.100:11434/v1`，免 Key 直连，可选网关密钥 `llm_ollama_remote`）
+  - `ollama`（本机离线 `http://localhost:11434/v1`，默认 `qwen2.5:7b`，免 Key）
+  - `qwen` (`https://dashscope.aliyuncs.com/compatible-mode/v1`, `qwen-plus`)、`openai` (`https://api.openai.com/v1`, `gpt-4o-mini`)、`anthropic`、`gemini`、`kimi`、`siliconflow`。
 - 邮箱域名：`qq.com`/`foxmail.com` (imap.qq.com:993, smtp.qq.com:465), `163.com` (imap.163.com:993, smtp.163.com:465), `126.com`, `gmail.com` (imap.gmail.com:993, smtp.gmail.com:465), `outlook.com` (outlook.office365.com:993, smtp.office365.com:587), `icloud.com`, `aliyun.com`。
-- 模型 preset：
-  - `opencode_go` (openai, https://opencode.ai/zen/go/v1, glm-5.3-flash，密钥 `llm_opencode_go`；支持 glm-5.3-flash / glm-5.2 / deepseek-v4.1-flash / kimi-k3.1-pro / minimax-m3.1-flash 等)
-  - `ollama_remote` (openai, http://192.168.1.100:11434/v1 或用户指定的远程算力机 IP/域名 + `/v1`，默认 qwen2.5:7b，免 Key 直连，若开启网关鉴权则可选密钥 `llm_ollama_remote`)
-  - `ollama_cloud` (openai, https://ollama.com/v1, gpt-oss:20b，Ollama 官方云端 API，密钥 `llm_ollama_cloud`)
-  - `ollama` (openai, http://localhost:11434/v1, qwen2.5:7b，本机离线免 Key)
-  - `deepseek` (openai, https://api.deepseek.com/v1, deepseek-chat), `openai` (openai, https://api.openai.com/v1, gpt-4o-mini), `qwen` (openai, https://dashscope.aliyuncs.com/compatible-mode/v1, qwen-plus), `anthropic` (anthropic, https://api.anthropic.com, claude-sonnet-4-20250514), `gemini` (gemini, https://generativelanguage.googleapis.com/v1beta, gemini-2.5-flash), `kimi` (openai, https://api.moonshot.cn/v1, kimi-k2-0711-preview), `siliconflow` (openai, https://api.siliconflow.cn/v1, Qwen/Qwen2.5-7B-Instruct)。
 
 请严格只输出一个 JSON 对象：
 {
   "reply": "自然简洁的中文答复，告诉用户做了哪些声明式变更或操作",
   "updated_toml": "若需修改配置，输出完整且合法的新 TOML 字符串（保留未改动的原有段落，`password_ref` 与 `api_key_ref` 保持 `secret:...` 引用）；若无需改动配置则填 null",
   "changes": ["简短列出每一项变更，如：新增屏蔽关键词『退订』"],
-  "request_secrets": ["若相关凭据处于未配置状态或用户要求修改密码/Key，填入键名如 mail_password 或 llm_opencode_go；注意 ollama 与无鉴权 ollama_remote 不要强索密钥"],
+  "request_secrets": ["若相关凭据处于未配置状态或用户要求修改密码/Key，填入键名如 mail_password、llm_deepseek、llm_opencode_go 或 llm_ollama_cloud；注意 ollama 与无鉴权 ollama_remote 不要强索密钥"],
   "operations": ["可选后台动作：apply_rules_now（规则变动后扫描现有邮件）、reclassify（让AI重分拣现有邮件）、sync_now（立即收信）、load_demo（载入演示数据）、clear_demo（清空演示数据）"],
   "suggestions": ["2~3 条简短后续指令建议"]
 }"#;
@@ -494,32 +496,39 @@ fn local_config_intent(
         notes.push("已触发对现有来信的 AI 智能分拣。".into());
     }
 
-    // 2. 识别模型切换意图（支持 OpenCode Go、远程/云端/本地 Ollama 及各主流厂商）
+    // 2. 识别模型切换意图（优先推荐：DeepSeek 官网、OpenCode Go、Ollama 远程订阅；同时兼容自建远程/本地 Ollama 与其他厂商）
     let custom_url = extract_endpoint_url(input);
     let is_remote_url = custom_url
         .as_deref()
-        .map(|u| !u.contains("localhost") && !u.contains("127.0.0.1") && !u.contains("ollama.com") && !u.contains("opencode.ai"))
+        .map(|u| !u.contains("localhost") && !u.contains("127.0.0.1") && !u.contains("ollama.com") && !u.contains("opencode.ai") && !u.contains("deepseek.com"))
         .unwrap_or(false);
 
+    let wants_self_hosted_ollama = lower.contains("局域网")
+        || lower.contains("内网")
+        || lower.contains("自建")
+        || lower.contains("算力机")
+        || is_remote_url;
+
     let detected_preset = if lower.contains("opencode") || lower.contains("open code") {
-        Some(("opencode_go", "OpenCode Go"))
-    } else if lower.contains("ollama")
-        && (lower.contains("cloud") || lower.contains("官方云") || lower.contains("云端") || lower.contains("ollama.com"))
-    {
-        Some(("ollama_cloud", "Ollama Cloud"))
-    } else if (lower.contains("ollama")
-        && (lower.contains("远程")
-            || lower.contains("remote")
-            || lower.contains("局域网")
-            || lower.contains("远端")
-            || lower.contains("服务器")
-            || lower.contains("算力")
-            || is_remote_url))
+        Some(("opencode_go", "OpenCode Go 订阅"))
+    } else if (lower.contains("ollama") && wants_self_hosted_ollama)
         || (!lower.contains("邮箱") && custom_url.as_deref().map(|u| u.contains(":11434")).unwrap_or(false) && is_remote_url)
     {
-        Some(("ollama_remote", "Ollama 远程服务"))
-    } else if lower.contains("deepseek") || lower.contains("深度求索") {
-        Some(("deepseek", "DeepSeek"))
+        Some(("ollama_remote", "Ollama 自建远程算力"))
+    } else if lower.contains("ollama")
+        && (lower.contains("订阅")
+            || lower.contains("远程")
+            || lower.contains("remote")
+            || lower.contains("cloud")
+            || lower.contains("官方云")
+            || lower.contains("云端")
+            || lower.contains("ollama.com"))
+    {
+        Some(("ollama_cloud", "Ollama 远程订阅"))
+    } else if (lower.contains("deepseek") || lower.contains("深度求索"))
+        && !(lower.contains("4.1") && !lower.contains("官网") && !lower.contains("官方") && !lower.contains("切换") && (next.agent.preset == "opencode_go" || next.agent.preset == "ollama_cloud"))
+    {
+        Some(("deepseek", "DeepSeek 官网"))
     } else if lower.contains("qwen") || lower.contains("千问") || lower.contains("通义") || lower.contains("百炼") {
         Some(("qwen", "通义千问 Qwen"))
     } else if lower.contains("claude") || lower.contains("anthropic") {
@@ -541,8 +550,8 @@ fn local_config_intent(
     if let Some((preset_id, label)) = detected_preset {
         let (prov, def_base, def_model) = model_preset_defaults(preset_id);
         let final_base = match &custom_url {
-            Some(u) => normalize_openai_base(u, preset_id),
-            None => def_base.to_string(),
+            Some(u) if is_remote_url => normalize_openai_base(u, preset_id),
+            _ => def_base.to_string(),
         };
         next.agent.preset = preset_id.into();
         next.agent.provider = prov.into();
@@ -559,16 +568,20 @@ fn local_config_intent(
         } else {
             next.agent.api_key_ref = "none (local)".into();
         }
-        changes.push(format!("声明 `[agent]` 切换至 {label}（`{final_base}`）"));
+        changes.push(format!("声明 `[agent]` 切换至 {label}（默认模型 `{def_model}`）"));
         if preset_id == "ollama_remote" && custom_url.is_none() {
             notes.push(format!(
-                "已将声明式配置切换为 **{label}**（默认地址 `{final_base}`，模型 `{def_model}`）。你可以直接告诉我你的算力机地址（例如 `连接远程 Ollama 192.168.31.88:11434`），或在右侧 `config.toml` / 配置页一键拉取远端模型列表。"
+                "已将声明式配置切换为 **{label}**（默认地址 `{final_base}`，模型 `{def_model}`）。你可以直接告诉我算力机地址（例如 `连接内网 Ollama 192.168.31.88:11434`），或在配置页一键拉取远端模型列表。"
             ));
         } else {
             notes.push(format!(
-                "已将声明式配置中的模型切换为 **{label}**（接口 `{final_base}`，模型 `{def_model}`）并开启自动分拣。"
+                "已将声明式配置切换为 **{label}**（接口 `{final_base}`，默认模型 `{def_model}`）并开启自动分拣。"
             ));
         }
+    } else if lower.contains("4.1") && lower.contains("flash") {
+        next.agent.model = "deepseek-v4.1-flash".into();
+        changes.push("设置 `agent.model = \"deepseek-v4.1-flash\"`".into());
+        notes.push("已将当前调用模型设为 `deepseek-v4.1-flash`。".into());
     } else if let Some(u) = &custom_url {
         // 单独修改当前模型的接口地址
         let normalized = normalize_openai_base(u, &next.agent.preset);
@@ -749,15 +762,15 @@ fn local_config_intent(
         let key_optional = matches!(spec.agent.preset.as_str(), "ollama" | "ollama_remote" | "custom");
         let need_key = !key_optional && active_sk.map(|k| !is_configured(k)).unwrap_or(false);
         let hint_extra = if need_key {
-            "\n\n提示：当前模型尚未配置 API Key，我目前运行在**离线指令解析模式**；配置好 API Key（或切换至 OpenCode Go / 本地或远程 Ollama）后即可解锁任意复杂自然语言的声明式编排。"
+            "\n\n提示：当前默认搭载 `deepseek-v4.1-flash`，尚未录入 API Key；你可以优先配置 **DeepSeek 官网**、**OpenCode Go** 或 **Ollama 远程订阅** 的密钥来启用云端智能编排。"
         } else {
             ""
         };
         return ConfigAgentPlan {
             reply: format!(
                 "我是你的 MailChat 配置与自动化管家。你可以直接用自然语言让我修改声明式配置（`config.toml`），例如：\n\
-                 - **绑定账号**：「帮我绑定 `name@qq.com` 邮箱」\n\
-                 - **切换模型**：「切换为 OpenCode Go」「连接远程 Ollama `192.168.1.100:11434`」「切换为 Ollama Cloud / DeepSeek / 通义千问」\n\
+                 - **首选模型接入**：「使用 DeepSeek 官网配置」「切换为 OpenCode Go 订阅」「切换为 Ollama 远程订阅」（默认均采用 `deepseek-v4.1-flash`）\n\
+                 - **绑定邮箱账号**：「帮我绑定 `name@qq.com` 邮箱」\n\
                  - **过滤与归档**：「屏蔽所有包含『退订』『优惠券』的邮件」「把含『账单』『验证码』的邮件自动折叠进通知」\n\
                  - **群聊与隐私**：「配置 API Key」「开启群免打扰」{hint_extra}"
             ),
@@ -770,9 +783,9 @@ fn local_config_intent(
             },
             operations: vec![],
             suggestions: vec![
-                "切换为 OpenCode Go 模型".into(),
-                "连接远程 Ollama 服务器".into(),
-                "屏蔽包含「退订」「限时优惠」的邮件".into(),
+                "使用 DeepSeek 官网配置".into(),
+                "切换为 OpenCode Go 订阅".into(),
+                "切换为 Ollama 远程订阅".into(),
                 "载入演示会话体验".into(),
             ],
             intercepted_secret: None,
@@ -974,7 +987,31 @@ async fn gemini(cfg: &AgentConfig, system: &str, user: &str, want_json: bool, ma
     Ok(text)
 }
 
-/// OpenAI 兼容接口：OpenCode Go、Ollama 本地/远程/Cloud、DeepSeek、OpenAI、通义千问、Moonshot、硅基流动等
+/// 适配不同网关对 DeepSeek 4.1 Flash 的实际模型参数名：
+/// - OpenCode Go / Ollama 远程订阅均直接使用 `deepseek-v4.1-flash`
+/// - DeepSeek 官网 API (`api.deepseek.com`) 官方参数名为 `deepseek-flash`（底层即 DeepSeek-V4.1-Flash）
+pub fn resolve_wire_model(base: &str, raw_model: &str) -> String {
+    let trimmed = raw_model.trim();
+    let compact: String = trimmed
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-' && *c != '_')
+        .collect::<String>()
+        .to_lowercase();
+
+    let canonical = if compact == "deepseek4.1flash" || compact == "deepseekv4.1flash" {
+        "deepseek-v4.1-flash"
+    } else {
+        trimmed
+    };
+
+    if base.to_lowercase().contains("api.deepseek.com") && canonical.eq_ignore_ascii_case("deepseek-v4.1-flash") {
+        "deepseek-flash".to_string()
+    } else {
+        canonical.to_string()
+    }
+}
+
+/// OpenAI 兼容接口：DeepSeek 官网、OpenCode Go、Ollama 远程订阅 / 自建算力 / 本地，以及各兼容厂商
 async fn openai_compatible(cfg: &AgentConfig, system: &str, user: &str, want_json: bool, max_tokens: u32) -> Result<String> {
     let normalized_base = normalize_openai_base(&cfg.base_url, &cfg.preset);
     let base = normalized_base.as_str();
@@ -982,7 +1019,7 @@ async fn openai_compatible(cfg: &AgentConfig, system: &str, user: &str, want_jso
         bail!("未配置模型接口 Base URL");
     }
     if cfg.api_key.trim().is_empty() && !is_keyless_allowed(cfg) {
-        bail!("请先在「助手」或「配置 → 隐私保险箱」中录入当前服务商的 API Key（或切换至本地/远程免密 Ollama）");
+        bail!("请先在「助手」或「配置 → 隐私保险箱」中录入 API Key（推荐优先使用 DeepSeek 官网、OpenCode Go 或 Ollama 远程订阅）");
     }
     let endpoint = if base.ends_with("/chat/completions") {
         base.to_string()
@@ -990,12 +1027,13 @@ async fn openai_compatible(cfg: &AgentConfig, system: &str, user: &str, want_jso
         format!("{base}/chat/completions")
     };
 
-    let model_lower = cfg.model.to_lowercase();
+    let wire_model = resolve_wire_model(base, &cfg.model);
+    let model_lower = wire_model.to_lowercase();
     let skip_json_mode = model_lower.contains("reasoner") || model_lower.contains("r1") || model_lower.contains("qwq");
 
     let send_once = |use_json_format: bool| {
         let mut body = json!({
-            "model": cfg.model.trim(),
+            "model": wire_model,
             "max_tokens": max_tokens,
             "messages": [
                 { "role": "system", "content": system },
@@ -1215,22 +1253,40 @@ mod tests {
     #[test]
     fn local_intent_supports_opencode_go_and_remote_ollama() {
         let spec = DeclarativeConfig::default();
-        let p1 = local_config_intent(&spec, &[], "切换为 OpenCode Go 模型");
+        assert_eq!(spec.agent.preset, "deepseek");
+        assert_eq!(spec.agent.model, "deepseek-v4.1-flash");
+
+        let p1 = local_config_intent(&spec, &[], "切换为 OpenCode Go 订阅");
         let t1 = p1.updated_toml.unwrap();
         assert!(t1.contains("opencode_go"));
         assert!(t1.contains("https://opencode.ai/zen/go/v1"));
+        assert!(t1.contains("deepseek-v4.1-flash"));
         assert_eq!(p1.request_secrets, vec!["llm_opencode_go"]);
 
-        let p2 = local_config_intent(&spec, &[], "连接远程 Ollama 服务器 192.168.31.88:11434");
+        let p2 = local_config_intent(&spec, &[], "连接内网 Ollama 服务器 192.168.31.88:11434");
         let t2 = p2.updated_toml.unwrap();
         assert!(t2.contains("ollama_remote"));
         assert!(t2.contains("http://192.168.31.88:11434/v1"));
         assert!(p2.request_secrets.is_empty());
 
-        let p3 = local_config_intent(&spec, &[], "切换到 Ollama Cloud");
+        let p3 = local_config_intent(&spec, &[], "切换为 Ollama 远程订阅");
         let t3 = p3.updated_toml.unwrap();
         assert!(t3.contains("ollama_cloud"));
         assert!(t3.contains("https://ollama.com/v1"));
+        assert!(t3.contains("deepseek-v4.1-flash"));
         assert_eq!(p3.request_secrets, vec!["llm_ollama_cloud"]);
+
+        assert_eq!(
+            resolve_wire_model("https://api.deepseek.com/v1", "deepseek-v4.1-flash"),
+            "deepseek-flash"
+        );
+        assert_eq!(
+            resolve_wire_model("https://opencode.ai/zen/go/v1", "deepseek4.1flash"),
+            "deepseek-v4.1-flash"
+        );
+        assert_eq!(
+            resolve_wire_model("https://ollama.com/v1", "deepseek-v4.1-flash"),
+            "deepseek-v4.1-flash"
+        );
     }
 }

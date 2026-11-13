@@ -14,11 +14,11 @@ interface RichTurn {
 }
 
 const STARTER_PROMPTS = [
+  { title: "DeepSeek 官网配置", desc: "官方首选 · 默认搭载 deepseek-v4.1-flash", text: "使用 DeepSeek 官网配置并开启自动分拣" },
+  { title: "接入 OpenCode Go", desc: "订阅优先 · 默认使用 deepseek-v4.1-flash", text: "切换为 OpenCode Go 订阅并开启自动分拣" },
+  { title: "接入 Ollama 远程订阅", desc: "云端订阅 · 免本地显卡运行 deepseek-v4.1-flash", text: "切换为 Ollama 远程订阅并开启自动分拣" },
   { title: "连接邮箱账号", desc: "自动匹配 IMAP / SMTP 并唤起本地加密授权码卡片", text: "帮我绑定邮箱 " },
-  { title: "接入 OpenCode Go", desc: "默认接入 opencode.ai/zen/go/v1 畅享多模型", text: "切换为 OpenCode Go 模型并开启自动分拣" },
-  { title: "连接远程 Ollama", desc: "接入局域网算力机、远程服务器或 Ollama Cloud", text: "连接远程 Ollama 服务器 " },
   { title: "拦截促销广告", desc: "声明式写入屏蔽词并立即扫描收件箱", text: "屏蔽所有包含「退订」「限时优惠」的邮件" },
-  { title: "折叠账单与验证码", desc: "自动归入通知栏，保持聊天清爽", text: "把包含「账单」「验证码」的邮件自动折叠进通知" },
   { title: "载入沙盒演示数据", desc: "免绑邮箱体验 4 人群聊与智能分流", text: "载入演示会话体验" },
 ];
 
@@ -122,7 +122,7 @@ export function AgentWorkspace({
     <section className="agent-workspace">
       <div className="agent-chat-pane">
         <header
-          className={`pane-header ${!showToml ? "win-safe-right" : ""}`}
+          className="pane-header"
           onMouseDown={startWindowDrag}
           onDoubleClick={toggleWindowMaximize}
         >
@@ -262,7 +262,7 @@ export function AgentWorkspace({
             <textarea
               ref={inputRef}
               value={input}
-              placeholder="输入配置指令，如：切换为 OpenCode Go / 连接远程 Ollama 192.168.1.100:11434 / 绑定 xxx@qq.com…"
+              placeholder="输入配置指令，如：使用 DeepSeek 官网 / 切换为 OpenCode Go / 切换为 Ollama 远程订阅 / 绑定 xxx@qq.com…"
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
@@ -288,7 +288,7 @@ export function AgentWorkspace({
       {showToml && (
         <aside className="toml-pane">
           <div
-            className="toml-head win-safe-right"
+            className="toml-head"
             onMouseDown={startWindowDrag}
             onDoubleClick={toggleWindowMaximize}
           >
