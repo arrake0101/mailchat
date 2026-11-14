@@ -27,7 +27,6 @@ import {
   IconArrowUp,
   IconAt,
   IconCheck,
-  IconChevron,
   IconClose,
   IconCopy,
   IconDraft,
@@ -39,7 +38,6 @@ import {
   IconOtp,
   IconPaperclip,
   IconReply,
-  IconScissors,
   IconSearch,
   IconSmile,
   IconSparkles,
@@ -63,10 +61,8 @@ interface Props {
   notify: (text: string, isError?: boolean) => void;
 }
 
-type SendShortcutMode = "enter" | "ctrl_enter";
-type ActivePopover = "none" | "emoji" | "draft" | "mention" | "send_mode";
+type ActivePopover = "none" | "emoji" | "draft" | "mention";
 
-const SEND_MODE_STORAGE_KEY = "mailchat.sendShortcutMode";
 const COMPOSER_HEIGHT_STORAGE_KEY = "mailchat.composerHeight";
 
 const COMMON_EMOJIS = [
@@ -132,14 +128,7 @@ export function ChatView({
   const [htmlOverrides, setHtmlOverrides] = useState<Map<number, boolean>>(new Map());
   const [dismissedSuggestMsgId, setDismissedSuggestMsgId] = useState<number | null>(null);
 
-  // 发送快捷键偏好与输入框拖拽高度（参考腾讯桌面端 IM 体验）
-  const [sendMode, setSendMode] = useState<SendShortcutMode>(() => {
-    try {
-      return localStorage.getItem(SEND_MODE_STORAGE_KEY) === "ctrl_enter" ? "ctrl_enter" : "enter";
-    } catch {
-      return "enter";
-    }
-  });
+  // 输入框拖拽高度记忆
   const [composerHeight, setComposerHeight] = useState<number>(() => {
     try {
       const saved = Number(localStorage.getItem(COMPOSER_HEIGHT_STORAGE_KEY));
@@ -324,16 +313,6 @@ export function ChatView({
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   };
 
-  const updateSendMode = (mode: SendShortcutMode) => {
-    setSendMode(mode);
-    setActivePopover("none");
-    try {
-      localStorage.setItem(SEND_MODE_STORAGE_KEY, mode);
-    } catch {
-      // ignore
-    }
-  };
-
   const startResizeComposer = (e: ReactMouseEvent<HTMLDivElement>) => {
     e.preventDefault();
     const startY = e.clientY;
@@ -442,16 +421,6 @@ export function ChatView({
     }
     setText((prev) => (prev.includes(`@${clean}`) ? prev : prev ? `${prev.trimEnd()} ${token}` : token));
     inputRef.current?.focus();
-  };
-
-  const triggerScreenSnip = async () => {
-    setActivePopover("none");
-    try {
-      await api.startScreenSnip();
-      notify("框选截图后按 Ctrl+V 即可直接粘贴发送");
-    } catch {
-      notify("请使用系统快捷键 Win+Shift+S 截图后按 Ctrl+V 粘贴");
-    }
   };
 
   const appendFiles = async (files: FileList | File[]) => {
@@ -756,9 +725,6 @@ export function ChatView({
 
   const groupDrawerOpen = conv.is_group && showGroupDrawer;
   const contactDrawerOpen = !conv.is_group && showDetailDrawer;
-
-  const sendShortcutHint =
-    sendMode === "enter" ? "Enter 发送 · Shift+Enter 换行" : "Ctrl+Enter 发送 · Enter 换行";
 
   return (
     <section className="chat-workspace">
@@ -1280,8 +1246,8 @@ export function ChatView({
               value={text}
               placeholder={
                 conv.is_group
-                  ? `全员回复 ${conv.members.length} 位群成员（可输入 @ 提及成员，支持粘贴截图或拖拽文件）`
-                  : "输入消息…（支持 Ctrl+V 粘贴截图/文件，拖拽发送附件）"
+                  ? `全员回复 ${conv.members.length} 位群成员（可输入 @ 提及成员，支持粘贴图片或拖拽文件）`
+                  : "输入消息…（支持 Ctrl+V 粘贴图片/文件，拖拽发送附件）"
               }
               onChange={(e) => {
                 const val = e.target.value;
@@ -1306,14 +1272,15 @@ export function ChatView({
                     return;
                   }
                 }
-                if (e.key === "Enter" && !e.nativeEvent.isComposing) {
-                  if (sendMode === "enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
-                    e.preventDefault();
-                    void send();
-                  } else if (sendMode === "ctrl_enter" && (e.ctrlKey || e.metaKey)) {
-                    e.preventDefault();
-                    void send();
-                  }
+                if (
+                  e.key === "Enter" &&
+                  !e.shiftKey &&
+                  !e.ctrlKey &&
+                  !e.metaKey &&
+                  !e.nativeEvent.isComposing
+                ) {
+                  e.preventDefault();
+                  void send();
                 }
               }}
             />
@@ -1358,15 +1325,6 @@ export function ChatView({
                   title="发送文件（支持拖拽添加或 Ctrl+V 粘贴）"
                 >
                   <IconFolder size={18} />
-                </button>
-
-                <button
-                  type="button"
-                  className="im-tool-btn"
-                  onClick={() => void triggerScreenSnip()}
-                  title="屏幕截图（截图后按 Ctrl+V 粘贴）"
-                >
-                  <IconScissors size={17} />
                 </button>
 
                 {conv.is_group && conv.members.length > 0 && (
@@ -1469,17 +1427,6 @@ export function ChatView({
                 >
                   <IconTag size={16} />
                 </button>
-
-                {messages.length > 0 && (
-                  <button
-                    type="button"
-                    className={`im-tool-btn ${showSearchBar ? "active" : ""}`}
-                    onClick={() => (showSearchBar ? closeSearchBar() : openSearchBar())}
-                    title="查找聊天记录 (Ctrl+F)"
-                  >
-                    <IconSearch size={16} />
-                  </button>
-                )}
               </div>
 
               <div className="im-composer-right" data-popover-zone="true">
@@ -1507,52 +1454,15 @@ export function ChatView({
                   </div>
                 )}
 
-                <div className={`im-send-group ${canSend ? "ready" : ""}`}>
-                  <button
-                    type="button"
-                    className="im-send-main"
-                    onClick={() => void send()}
-                    disabled={!canSend}
-                    title={sendShortcutHint}
-                  >
-                    {sending ? "发送中…" : "发送"}
-                  </button>
-                  <button
-                    type="button"
-                    className="im-send-caret"
-                    onClick={() => setActivePopover((p) => (p === "send_mode" ? "none" : "send_mode"))}
-                    title="切换发送快捷键"
-                  >
-                    <span className="caret-down-glyph">
-                      <IconChevron size={11} />
-                    </span>
-                  </button>
-
-                  {activePopover === "send_mode" && (
-                    <div className="im-popover send-mode-popover">
-                      <button
-                        type="button"
-                        className={`im-popover-item ${sendMode === "enter" ? "selected" : ""}`}
-                        onClick={() => updateSendMode("enter")}
-                      >
-                        <span className="im-popover-check">
-                          {sendMode === "enter" && <IconCheck size={12} />}
-                        </span>
-                        <span>按 Enter 键发送消息</span>
-                      </button>
-                      <button
-                        type="button"
-                        className={`im-popover-item ${sendMode === "ctrl_enter" ? "selected" : ""}`}
-                        onClick={() => updateSendMode("ctrl_enter")}
-                      >
-                        <span className="im-popover-check">
-                          {sendMode === "ctrl_enter" && <IconCheck size={12} />}
-                        </span>
-                        <span>按 Ctrl+Enter 键发送消息</span>
-                      </button>
-                    </div>
-                  )}
-                </div>
+                <button
+                  type="button"
+                  className={`im-send-btn ${canSend ? "ready" : ""}`}
+                  onClick={() => void send()}
+                  disabled={!canSend}
+                  title="发送 (Enter 发送，Shift+Enter 换行)"
+                >
+                  {sending ? "发送中…" : "发送"}
+                </button>
               </div>
             </footer>
             </div>

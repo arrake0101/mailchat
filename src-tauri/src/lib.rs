@@ -2273,26 +2273,6 @@ fn clear_demo_data(state: State<AppState>) -> CmdResult<usize> {
 }
 
 #[tauri::command]
-fn start_screen_snip() -> CmdResult<()> {
-    #[cfg(target_os = "windows")]
-    {
-        win_shell_open("ms-screenclip:")
-    }
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("screencapture")
-            .args(["-i", "-c"])
-            .spawn()
-            .map_err(err)?;
-        Ok(())
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        Err("当前系统暂不支持快捷截图唤起，请使用系统截图后按 Ctrl+V 粘贴".into())
-    }
-}
-
-#[tauri::command]
 fn open_external_url(url: String) -> CmdResult<()> {
     let trimmed = url.trim();
     let lower = trimmed.to_ascii_lowercase();
@@ -2520,7 +2500,6 @@ pub fn run() {
             summarize_conversation,
             load_demo_data,
             clear_demo_data,
-            start_screen_snip,
             open_external_url,
         ])
         .run(tauri::generate_context!())

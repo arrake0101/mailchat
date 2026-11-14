@@ -5319,11 +5319,6 @@ textarea:focus {
   background: var(--surface-subtle);
 }
 
-.im-popover-item.selected {
-  color: var(--accent-ink);
-  font-weight: 600;
-}
-
 .im-popover-item-main {
   font-weight: 500;
   white-space: nowrap;
@@ -5337,15 +5332,6 @@ textarea:focus {
   overflow: hidden;
   text-overflow: ellipsis;
   max-width: 135px;
-}
-
-.im-popover-check {
-  width: 14px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--accent);
-  flex-shrink: 0;
 }
 
 .emoji-popover {
@@ -5381,12 +5367,6 @@ textarea:focus {
   width: 244px;
   max-height: 240px;
   overflow-y: auto;
-}
-
-.send-mode-popover {
-  left: auto;
-  right: 0;
-  width: 196px;
 }
 
 .im-composer-right {
@@ -5442,71 +5422,31 @@ textarea:focus {
   color: var(--ink);
 }
 
-/* 腾讯风格「发送 | ▾」组合按钮 */
-.im-send-group {
-  position: relative;
-  display: inline-flex;
-  align-items: stretch;
+/* 纯净单按钮「发送」胶囊 */
+.im-send-btn {
   height: 30px;
+  padding: 0 18px;
   border-radius: 8px;
+  font-size: 13px;
+  font-weight: 500;
   background: #eaedf2;
-  transition: background 0.15s ease, box-shadow 0.15s ease;
+  color: #98a2b3;
+  transition: background 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
   flex-shrink: 0;
 }
 
-.im-send-group.ready {
-  background: var(--accent);
-  box-shadow: 0 2px 8px rgba(53, 99, 233, 0.24);
-}
-
-.im-send-main {
-  padding: 0 15px 0 17px;
-  height: 100%;
-  border-radius: 8px 0 0 8px;
-  font-size: 13px;
-  font-weight: 500;
-  color: #98a2b3;
-  background: transparent;
-}
-
-.im-send-main:disabled {
+.im-send-btn:disabled {
   opacity: 1;
 }
 
-.im-send-group.ready .im-send-main {
+.im-send-btn.ready {
+  background: var(--accent);
   color: #ffffff;
+  box-shadow: 0 2px 8px rgba(53, 99, 233, 0.24);
 }
 
-.im-send-group.ready .im-send-main:hover:not(:disabled) {
+.im-send-btn.ready:hover:not(:disabled) {
   background: var(--accent-hover);
-}
-
-.im-send-caret {
-  width: 23px;
-  height: 100%;
-  padding: 0;
-  border-radius: 0 8px 8px 0;
-  border-left: 1px solid rgba(15, 23, 42, 0.07);
-  color: #8b95a7;
-  background: transparent;
-}
-
-.im-send-group.ready .im-send-caret {
-  border-left-color: rgba(255, 255, 255, 0.22);
-  color: rgba(255, 255, 255, 0.92);
-}
-
-.im-send-caret:hover:not(:disabled) {
-  background: rgba(15, 23, 42, 0.05);
-}
-
-.im-send-group.ready .im-send-caret:hover:not(:disabled) {
-  background: var(--accent-hover);
-}
-
-.caret-down-glyph {
-  display: inline-flex;
-  transform: rotate(90deg);
 }
 
 /* 消息气泡右键菜单与转发弹窗 */

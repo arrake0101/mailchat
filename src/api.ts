@@ -125,7 +125,6 @@ export const api = {
     invoke<string>("summarize_conversation", { peer, title }),
   loadDemoData: () => invoke<number>("load_demo_data"),
   clearDemoData: () => invoke<number>("clear_demo_data"),
-  startScreenSnip: () => invoke<void>("start_screen_snip"),
   openExternalUrl: async (url: string) => {
     try {
       await invoke<void>("open_external_url", { url });
