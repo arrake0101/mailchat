@@ -1,21 +1,27 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   Account,
+  AccountEntry,
   AgentChatResponse,
   AgentConfig,
+  AgentSessionSummary,
+  AgentTurnRecord,
   ChatTurn,
+  ContactProfile,
   Conversation,
   DeclarativeBundle,
   GroupInfo,
   GroupMember,
   MailboxStats,
   Message,
+  ModelSwitchResult,
   ProviderPresetId,
   ProviderProtocol,
   Rule,
   RuleKind,
   SecretSaveResult,
   SecretStatus,
+  SendAttachmentInput,
   Status,
   SyncReport,
   Verdict,
@@ -29,10 +35,41 @@ export const api = {
   setSecret: (key: string, value: string, verify = true) =>
     invoke<SecretSaveResult>("set_secret", { key, value, verify }),
   deleteSecret: (key: string) => invoke<SecretStatus[]>("delete_secret", { key }),
-  chatWithAgent: (message: string, history: ChatTurn[]) =>
-    invoke<AgentChatResponse>("chat_with_agent", { message, history }),
+  chatWithAgent: (
+    message: string,
+    history: ChatTurn[],
+    sessionId?: string | null,
+    requestId?: string | null,
+  ) =>
+    invoke<AgentChatResponse>("chat_with_agent", {
+      message,
+      history,
+      sessionId: sessionId ?? null,
+      requestId: requestId ?? null,
+    }),
+  cancelAgentChat: (requestId?: string | null) =>
+    invoke<void>("cancel_agent_chat", { requestId: requestId ?? null }),
+  listAgentSessions: () => invoke<AgentSessionSummary[]>("list_agent_sessions"),
+  createAgentSession: (title?: string) =>
+    invoke<AgentSessionSummary>("create_agent_session", { title: title ?? null }),
+  getAgentSessionTurns: (sessionId: string) =>
+    invoke<AgentTurnRecord[]>("get_agent_session_turns", { sessionId }),
+  deleteAgentSession: (sessionId: string) =>
+    invoke<AgentSessionSummary[]>("delete_agent_session", { sessionId }),
+  clearAgentSessionTurns: (sessionId: string) =>
+    invoke<AgentSessionSummary[]>("clear_agent_session_turns", { sessionId }),
+  switchActiveModel: (preset: string, model?: string) =>
+    invoke<ModelSwitchResult>("switch_active_model", {
+      preset,
+      model: model?.trim() ? model.trim() : null,
+    }),
+  listAccounts: () => invoke<AccountEntry[]>("list_accounts"),
   getAccount: () => invoke<Account | null>("get_account"),
-  saveAccount: (account: Account) => invoke<void>("save_account", { account }),
+  saveAccount: (account: Account, setActive = true) =>
+    invoke<AccountEntry[]>("save_account", { account, setActive }),
+  switchAccount: (email: string) => invoke<AccountEntry[]>("switch_account", { email }),
+  removeAccount: (email: string, deleteLocalData = false) =>
+    invoke<AccountEntry[]>("remove_account", { email, deleteLocalData }),
   getAgentConfig: () => invoke<AgentConfig>("get_agent_config"),
   saveAgentConfig: (config: AgentConfig) => invoke<void>("save_agent_config", { config }),
   testAgent: (config: AgentConfig) => invoke<Verdict>("test_agent", { config }),
@@ -40,6 +77,7 @@ export const api = {
   windowAction: (action: WindowAction) => invoke<boolean>("window_action", { action }),
   reclassifyMessages: (all: boolean) => invoke<number>("reclassify_messages", { all }),
   syncNow: () => invoke<SyncReport>("sync_now"),
+  pokeMailSync: () => invoke<void>("poke_mail_sync").catch(() => {}),
   getStats: () => invoke<MailboxStats>("get_stats"),
   listConversations: (status: Status) => invoke<Conversation[]>("list_conversations", { status }),
   listMessages: (peer: string, status: Status) => invoke<Message[]>("list_messages", { peer, status }),
@@ -48,11 +86,26 @@ export const api = {
   getGroup: (peer: string) => invoke<GroupInfo | null>("get_group", { peer }),
   updateGroup: (peer: string, name: string, members: GroupMember[], muted: boolean) =>
     invoke<GroupInfo>("update_group", { peer, name, members, muted }),
-  sendMessage: (peer: string, body: string, customSubject?: string) =>
+  getContactProfile: (email: string) => invoke<ContactProfile>("get_contact_profile", { email }),
+  saveContactProfile: (profile: ContactProfile) =>
+    invoke<ContactProfile>("save_contact_profile", { profile }),
+  readAttachmentDataUrl: (relPath: string) =>
+    invoke<string>("read_attachment_data_url", { relPath }),
+  openAttachment: (relPath: string) => invoke<void>("open_attachment", { relPath }),
+  revealAttachment: (relPath: string) => invoke<void>("reveal_attachment", { relPath }),
+  sendMessage: (
+    peer: string,
+    body: string,
+    customSubject?: string,
+    attachments?: SendAttachmentInput[],
+    replyToId?: number | null,
+  ) =>
     invoke<Message>("send_message", {
       peer,
       body,
       customSubject: customSubject?.trim() ? customSubject.trim() : null,
+      attachments: attachments && attachments.length > 0 ? attachments : null,
+      replyToId: replyToId ?? null,
     }),
   setMessageStatus: (id: number, status: Status) => invoke<void>("set_message_status", { id, status }),
   moveConversation: (peer: string, status: Status) => invoke<void>("move_conversation", { peer, status }),
@@ -68,6 +121,13 @@ export const api = {
     invoke<string>("summarize_conversation", { peer, title }),
   loadDemoData: () => invoke<number>("load_demo_data"),
   clearDemoData: () => invoke<number>("clear_demo_data"),
+  openExternalUrl: async (url: string) => {
+    try {
+      await invoke<void>("open_external_url", { url });
+    } catch {
+      window.open(url, "_blank", "noopener,noreferrer");
+    }
+  },
 };
 
 /** 常见邮箱的服务器预设 */

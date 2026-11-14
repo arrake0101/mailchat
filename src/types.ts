@@ -36,6 +36,24 @@ export interface Account {
   password: string;
 }
 
+export interface AccountEntry {
+  email: string;
+  display_name: string;
+  imap_host: string;
+  imap_port: number;
+  smtp_host: string;
+  smtp_port: number;
+  username: string;
+  active: boolean;
+  has_password: boolean;
+  inbox_unread: number;
+}
+
+export function mailSecretKey(email?: string | null): string {
+  const norm = email?.trim().toLowerCase() ?? "";
+  return norm ? `mail_pwd:${norm}` : "mail_password";
+}
+
 export interface ProviderProfile {
   base_url: string;
   api_key: string;
@@ -75,9 +93,41 @@ export interface GroupInfo {
   muted: boolean;
 }
 
+export interface AttachmentMeta {
+  id: string;
+  filename: string;
+  mime: string;
+  size: number;
+  rel_path: string;
+  is_image: boolean;
+}
+
+export interface SendAttachmentInput {
+  filename: string;
+  mime: string;
+  data_base64: string;
+}
+
+export interface ReplyQuote {
+  id: number;
+  message_id: string;
+  sender: string;
+  snippet: string;
+}
+
+export interface ContactProfile {
+  email: string;
+  alias: string;
+  note: string;
+  tag: string;
+  muted: boolean;
+}
+
 export interface Conversation {
   peer: string;
   name: string;
+  raw_name?: string;
+  note?: string;
   preview: string;
   last_date: number;
   unread: number;
@@ -96,6 +146,7 @@ export interface Message {
   subject: string;
   body: string;
   body_full: string;
+  body_html: string;
   date: number;
   outgoing: boolean;
   status: string;
@@ -104,6 +155,8 @@ export interface Message {
   reason: string;
   extracted_code: string;
   suggested_reply: string;
+  attachments?: AttachmentMeta[];
+  reply_to?: ReplyQuote | null;
 }
 
 export type RuleKind =
@@ -167,11 +220,52 @@ export interface ChatTurn {
   content: string;
 }
 
+export interface AgentSessionSummary {
+  id: string;
+  title: string;
+  preview: string;
+  turn_count: number;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface AgentTurnRecord {
+  id: number;
+  session_id: string;
+  role: "user" | "assistant" | string;
+  content: string;
+  thinking: string;
+  thinking_ms: number;
+  tool_steps: string[];
+  changes: string[];
+  secret_prompts: SecretPrompt[];
+  suggestions: string[];
+  created_at: number;
+}
+
+export interface AgentStreamPayload {
+  request_id: string;
+  session_id: string;
+  kind: "thinking" | "content" | "tool" | "toml" | string;
+  delta: string;
+  thinking_ms: number;
+}
+
+export interface ModelSwitchResult {
+  agent_config: AgentConfig;
+  bundle: DeclarativeBundle;
+}
+
 export interface AgentChatResponse {
+  session_id: string;
   reply: string;
+  thinking: string;
+  thinking_ms: number;
+  tool_steps: string[];
   changes: string[];
   toml: string;
   secrets: SecretStatus[];
   secret_prompts: SecretPrompt[];
   suggestions: string[];
+  sessions: AgentSessionSummary[];
 }

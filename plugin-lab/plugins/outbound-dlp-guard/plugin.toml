@@ -1,0 +1,17 @@
+[plugin]
+id = "outbound-dlp-guard"
+name = "发信密钥防泄漏守卫"
+version = "1.0.0"
+description = "在 SMTP 发信前本地扫描草稿正文，自动阻断误粘贴的 API Key、私钥证书或数据库连接串，并支持追加轻量小尾巴"
+author = "mailchat-official"
+source = "prebuilt"
+priority = 15
+
+[permissions]
+hooks = ["onBeforeSend"]
+mail_access = "current"
+kv_storage = false
+
+[config]
+block_secrets = { default = true }
+append_signature = { default = "" }

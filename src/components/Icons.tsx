@@ -1,4 +1,4 @@
-/** 统一细线条单色矢量图标组件，摒弃生硬的 Emoji 堆砌 */
+/** MailChat 统一 1.5px 方端几何图标系统（C2 双折面主标 + 24 枚客户端专属矢量图标，融合项目清透蓝石板色系） */
 import type { SVGProps } from "react";
 
 type IconProps = SVGProps<SVGSVGElement> & { size?: number };
@@ -11,9 +11,9 @@ function Base({ size = 18, children, ...rest }: IconProps) {
       viewBox="0 0 24 24"
       fill="none"
       stroke="currentColor"
-      strokeWidth="1.75"
-      strokeLinecap="round"
-      strokeLinejoin="round"
+      strokeWidth="1.5"
+      strokeLinecap="square"
+      strokeLinejoin="miter"
       aria-hidden="true"
       {...rest}
     >
@@ -22,197 +22,469 @@ function Base({ size = 18, children, ...rest }: IconProps) {
   );
 }
 
+/** 01 · MARK — C2 中心对称 45° 双折面品牌主图标（适配项目 #FFFFFF + #0F172A + #3563E9 清透雾蓝色系） */
+export function BrandAppIcon({ size = 38, ...rest }: IconProps) {
+  const dotRadius = size <= 24 ? 11 : size <= 40 ? 9 : 7.8;
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 256 256"
+      fill="none"
+      aria-hidden="true"
+      {...rest}
+    >
+      <path
+        d="M128 16 C200 16 240 56 240 128 C240 200 200 240 128 240 C56 240 16 200 16 128 C16 56 56 16 128 16 Z"
+        fill="#FFFFFF"
+        stroke="#E2E8F0"
+        strokeWidth="2.2"
+      />
+      <path
+        d="M128 23 C195 23 233 61 233 128 C233 195 195 233 128 233 C61 233 23 195 23 128 C23 61 61 23 128 23 Z"
+        stroke="#F1F5F9"
+        strokeWidth="1.2"
+      />
+      <path d="M128 70 L70 128 L99 157 L128 128 Z" fill="#0F172A" />
+      <path d="M128 128 L157 99 L186 128 L128 186 Z" fill="#0F172A" />
+      <circle cx="178.5" cy="77.5" r={dotRadius} fill="#3563E9" />
+    </svg>
+  );
+}
+
+/** 01b · 单色缩微双折面徽标 */
+export function IconMail(p: IconProps) {
+  return (
+    <svg
+      width={p.size ?? 18}
+      height={p.size ?? 18}
+      viewBox="0 0 24 24"
+      fill="none"
+      aria-hidden="true"
+      {...p}
+    >
+      <path d="M12 4.5 4.5 12 8.25 15.75 12 12Z" fill="currentColor" />
+      <path d="M12 12 15.75 8.25 19.5 12 12 19.5Z" fill="currentColor" />
+      <circle cx="18.2" cy="5.8" r="1.8" fill="var(--accent, #3563e9)" />
+    </svg>
+  );
+}
+
+/** 02 · INBOX — 消息主槽（直角对话折框 + 单横尺） */
 export function IconChat(p: IconProps) {
   return (
     <Base {...p}>
-      <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z" />
+      <path d="M4 5.5H20V17H8.5L4 20.5V5.5Z" />
+      <path d="M8.5 10.5H15.5" />
     </Base>
   );
 }
 
+/** 03 · ARCHIVED — 折叠通知尺（左侧装订竖尺 + 三道递减横线） */
 export function IconBell(p: IconProps) {
   return (
     <Base {...p}>
-      <path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9" />
-      <path d="M10.3 21a1.94 1.94 0 0 0 3.4 0" />
+      <path d="M5 5V19" />
+      <path d="M9 7.5H19.5M9 12H16.5M9 16.5H13.5" />
     </Base>
   );
 }
 
+/** 04 · BLOCKED — 静默拦截光阑（正圆 + 45° 斜切封锁线） */
 export function IconShield(p: IconProps) {
   return (
     <Base {...p}>
-      <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
-      <path d="m9.5 9.5 5 5" />
-      <path d="m14.5 9.5-5 5" />
+      <circle cx="12" cy="12" r="7.5" />
+      <path d="M6.8 17.2 17.2 6.8" />
     </Base>
   );
 }
 
+/** 05 · AGENT — 声明式助手终端框（去除四芒星 ✦） */
 export function IconSparkles(p: IconProps) {
   return (
     <Base {...p}>
-      <path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z" />
-      <path d="M20 3v4" />
-      <path d="M22 5h-4" />
+      <rect x="4" y="4" width="16" height="16" />
+      <path d="M8 9.5 11 12 8 14.5M12.5 14.5H16" />
     </Base>
   );
 }
 
+/** 06 · CONFIG — 配置推子（双轨水平刻度线 + 矩形机械推子） */
 export function IconSliders(p: IconProps) {
   return (
     <Base {...p}>
-      <line x1="4" x2="4" y1="21" y2="14" />
-      <line x1="4" x2="4" y1="10" y2="3" />
-      <line x1="12" x2="12" y1="21" y2="12" />
-      <line x1="12" x2="12" y1="8" y2="3" />
-      <line x1="20" x2="20" y1="21" y2="16" />
-      <line x1="20" x2="20" y1="12" y2="3" />
-      <line x1="2" x2="6" y1="14" y2="14" />
-      <line x1="10" x2="14" y1="8" y2="8" />
-      <line x1="18" x2="22" y1="16" y2="16" />
+      <path d="M4 8.25H7.5M11.5 8.25H20M4 15.75H13M17 15.75H20" />
+      <rect x="7.5" y="5.75" width="4" height="5" />
+      <rect x="13" y="13.25" width="4" height="5" />
     </Base>
   );
 }
 
+/** 07 · DIRECT — 新建单聊（正交十字准星） */
 export function IconPlus(p: IconProps) {
   return (
     <Base {...p}>
-      <path d="M12 5v14" />
-      <path d="M5 12h14" />
+      <path d="M12 5V19M5 12H19" />
     </Base>
   );
 }
 
+/** 08 · GROUP — 跨服邮件群聊总线（三个方形节点经 Y 型总线互通） */
 export function IconUsers(p: IconProps) {
   return (
     <Base {...p}>
-      <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
-      <circle cx="9" cy="7" r="4" />
-      <path d="M22 21v-2a4 4 0 0 0-3-3.87" />
-      <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+      <rect x="10.25" y="3.75" width="3.5" height="3.5" />
+      <rect x="3.75" y="16.25" width="3.5" height="3.5" />
+      <rect x="16.75" y="16.25" width="3.5" height="3.5" />
+      <path d="M12 7.5V12.5M12 12.5 6.5 16.25M12 12.5 17.5 16.25" />
     </Base>
   );
 }
 
+/** 09 · TRIAGE — AI 智能重分拣（双路分流折线 + 分拣命中节点） */
+export function IconTriage(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M4 12H10L13.5 7H20M10 12 13.5 17H20" />
+      <rect x="18" y="5.5" width="2.5" height="2.5" fill="var(--accent, #3563e9)" stroke="none" />
+    </Base>
+  );
+}
+
+/** 10 · SYNC — IMAP 立即同步（上下双向直角回路箭头） */
 export function IconRefresh(p: IconProps) {
   return (
     <Base {...p}>
-      <path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8" />
-      <path d="M21 3v5h-5" />
+      <path d="M4.5 10V5.5H18.5M15.5 2.75 18.5 5.5 15.5 8.25" />
+      <path d="M19.5 14V18.5H5.5M8.5 15.75 5.5 18.5 8.5 21.25" />
     </Base>
   );
 }
 
-export function IconSend(p: IconProps) {
-  return (
-    <Base {...p}>
-      <path d="m22 2-7 20-4-9-9-4Z" />
-      <path d="M22 2 11 13" />
-    </Base>
-  );
-}
-
-export function IconLock(p: IconProps) {
-  return (
-    <Base {...p}>
-      <rect width="18" height="11" x="3" y="11" rx="2" ry="2" />
-      <path d="M7 11V7a5 5 0 0 1 10 0v4" />
-    </Base>
-  );
-}
-
-export function IconKey(p: IconProps) {
-  return (
-    <Base {...p}>
-      <circle cx="7.5" cy="15.5" r="5.5" />
-      <path d="m21 2-9.6 9.6" />
-      <path d="m15.5 7.5 3 3L22 7l-3-3" />
-    </Base>
-  );
-}
-
-export function IconCode(p: IconProps) {
-  return (
-    <Base {...p}>
-      <polyline points="16 18 22 12 16 6" />
-      <polyline points="8 6 2 12 8 18" />
-    </Base>
-  );
-}
-
-export function IconCheck(p: IconProps) {
-  return (
-    <Base {...p}>
-      <polyline points="20 6 9 17 4 12" />
-    </Base>
-  );
-}
-
-export function IconClose(p: IconProps) {
-  return (
-    <Base {...p}>
-      <path d="M18 6 6 18" />
-      <path d="m6 6 12 12" />
-    </Base>
-  );
-}
-
-export function IconMute(p: IconProps) {
-  return (
-    <Base {...p}>
-      <path d="M11 5 6 9H2v6h4l5 4V5Z" />
-      <line x1="22" x2="16" y1="9" y2="15" />
-      <line x1="16" x2="22" y1="9" y2="15" />
-    </Base>
-  );
-}
-
-export function IconCopy(p: IconProps) {
-  return (
-    <Base {...p}>
-      <rect width="14" height="14" x="8" y="8" rx="2" ry="2" />
-      <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" />
-    </Base>
-  );
-}
-
-export function IconNote(p: IconProps) {
-  return (
-    <Base {...p}>
-      <path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z" />
-      <polyline points="14 2 14 8 20 8" />
-      <line x1="8" x2="16" y1="13" y2="13" />
-      <line x1="8" x2="13" y1="17" y2="17" />
-    </Base>
-  );
-}
-
-export function IconTag(p: IconProps) {
-  return (
-    <Base {...p}>
-      <line x1="4" x2="20" y1="9" y2="9" />
-      <line x1="4" x2="20" y1="15" y2="15" />
-      <line x1="10" x2="8" y1="3" y2="21" />
-      <line x1="16" x2="14" y1="3" y2="21" />
-    </Base>
-  );
-}
-
+/** 11 · SEARCH — 检索刻度镜（正圆 + 45° 方端手柄） */
 export function IconSearch(p: IconProps) {
   return (
     <Base {...p}>
-      <circle cx="11" cy="11" r="8" />
-      <path d="m21 21-4.3-4.3" />
+      <circle cx="10.5" cy="10.5" r="6" />
+      <path d="m15.2 15.2 4.3 4.3" />
     </Base>
   );
 }
 
-export function IconMail(p: IconProps) {
+/** 12 · SUMMARY — 纪要提炼（页边竖尺 + 锚点 + 三行提要尺） */
+export function IconNote(p: IconProps) {
   return (
     <Base {...p}>
-      <rect width="20" height="16" x="2" y="4" rx="3" />
-      <path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7" />
+      <path d="M7.5 4.5V19.5" />
+      <rect x="3.75" y="7" width="2.2" height="2.2" fill="var(--accent, #3563e9)" stroke="none" />
+      <path d="M11 8H19.5M11 12.5H17.5M11 17H14.5" />
+    </Base>
+  );
+}
+
+/** 13 · DRAFT — 五档辅助起草（45° 机械制图笔尖 + 基准底线） */
+export function IconDraft(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M5 19H19M7 14.5 15.5 6 18 8.5 9.5 17H7V14.5Z" />
+    </Base>
+  );
+}
+
+/** 14 · SUBJECT — 邮件主题井字标尺 */
+export function IconTag(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M4.5 9.5H19.5M4.5 14.5H19.5M9.5 5 8 19M16 5 14.5 19" />
+    </Base>
+  );
+}
+
+/** 15 · SEND — 机械回车发送折线箭头 */
+export function IconSend(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M18.5 6V13.5H6.5M10.5 9.5 6.5 13.5 10.5 17.5" />
+    </Base>
+  );
+}
+
+/** 16 · MUTE — 群免打扰标识（直角扬声器切面 + 静音交叉切线） */
+export function IconMute(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M4.5 9.5H8L12.5 5.5V18.5L8 14.5H4.5V9.5Z" />
+      <path d="M16 9.5 20 14.5M20 9.5 16 14.5" />
+    </Base>
+  );
+}
+
+/** 17 · OTP — 验证码键帽（横向矩形键帽 + 三道数字刻线） */
+export function IconOtp(p: IconProps) {
+  return (
+    <Base {...p}>
+      <rect x="3.5" y="6.75" width="17" height="10.5" />
+      <path d="M8 10.25V13.75M12 10.25V13.75M16 10.25V13.75" />
+    </Base>
+  );
+}
+
+/** 17b · COPY — 双层直角复制框 */
+export function IconCopy(p: IconProps) {
+  return (
+    <Base {...p}>
+      <rect x="8.5" y="8.5" width="11.5" height="11.5" />
+      <path d="M5.5 15.5H4V4H15.5V5.5" />
+    </Base>
+  );
+}
+
+/** 18 · TOML — config.toml 声明式清单方折括号 */
+export function IconCode(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M8.5 7 4 12 8.5 17M15.5 7 20 12 15.5 17M13.2 6 10.8 18" />
+    </Base>
+  );
+}
+
+/** 19 · VAULT — Windows DPAPI 同心双环卡口锁 */
+export function IconLock(p: IconProps) {
+  return (
+    <Base {...p}>
+      <circle cx="12" cy="12" r="7.75" />
+      <circle cx="12" cy="12" r="3.25" />
+      <path d="M12 4.25V8.75" />
+      <circle cx="17.5" cy="6.5" r="1.5" fill="var(--accent, #3563e9)" stroke="none" />
+    </Base>
+  );
+}
+
+/** 20 · SECRET — secret:* 盲注入密钥柄 */
+export function IconKey(p: IconProps) {
+  return (
+    <Base {...p}>
+      <rect x="4" y="8.5" width="7" height="7" />
+      <path d="M11 12H20M17 12V15.5M19.5 12V14.5" />
+    </Base>
+  );
+}
+
+/** 21 · PLUGIN — 免编译双插针模块 */
+export function IconPlugin(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M5 7.5H19V19H5V7.5Z" />
+      <path d="M8.5 4.5V7.5M15.5 4.5V7.5" />
+      <rect x="10.75" y="11.75" width="2.5" height="2.5" fill="var(--accent, #3563e9)" stroke="none" />
+    </Base>
+  );
+}
+
+/** 22 · PIN — 窗口置顶（顶部水平基准线 + 向上锁定箭头） */
+export function IconPin(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M6 5H18M12 8.5V19M8.5 12 12 8.5 15.5 12" />
+    </Base>
+  );
+}
+
+/** 23a · WINBOX — 窗口最大化单线直角框 */
+export function IconWinMaximize(p: IconProps) {
+  return (
+    <Base {...p}>
+      <rect x="5.5" y="5.5" width="13" height="13" />
+    </Base>
+  );
+}
+
+/** 23b · WINBOX RESTORE — 窗口向下还原双层直角框 */
+export function IconWinRestore(p: IconProps) {
+  return (
+    <Base {...p}>
+      <rect x="4.5" y="7.5" width="12" height="12" />
+      <path d="M7.5 7.5V4.5H19.5V16.5H16.5" />
+    </Base>
+  );
+}
+
+/** 23c · WIN MINIMIZE — 窗口最小化水平基准线 */
+export function IconWinMinimize(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M5 12H19" />
+    </Base>
+  );
+}
+
+/** 24 · CLOSE — 对角正交关闭切线 */
+export function IconClose(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M6.5 6.5 17.5 17.5M17.5 6.5 6.5 17.5" />
+    </Base>
+  );
+}
+
+/** CHECK — 正交确认折线 */
+export function IconCheck(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="m5 12.5 4.5 4.5L19 7.5" />
+    </Base>
+  );
+}
+
+/** LINK — 邮件内联动作卡片正交链扣 */
+export function IconLink(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M9.5 7.5H4.5V16.5H9.5M14.5 7.5H19.5V16.5H14.5M8.5 12H15.5" />
+    </Base>
+  );
+}
+
+/** EXTERNAL LINK — 外链跳转直角框与 45° 出射轴 */
+export function IconExternalLink(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M10.5 5.5H5V19H18.5V13.5M14 5H19V10M19 5 11 13" />
+    </Base>
+  );
+}
+
+/** 25 · HISTORY — 历史会话时间轴与侧栏刻度 */
+export function IconHistory(p: IconProps) {
+  return (
+    <Base {...p}>
+      <circle cx="12" cy="12" r="7.5" />
+      <path d="M12 8V12.25L15 14" />
+    </Base>
+  );
+}
+
+/** 26 · TRASH — 几何删除框 */
+export function IconTrash(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M5 7H19M9.5 7V4.5H14.5V7M7.5 7V19.5H16.5V7M10.5 11V15.5M13.5 11V15.5" />
+    </Base>
+  );
+}
+
+/** 27 · STOP — 中断流式输出正方停止键 */
+export function IconStop(p: IconProps) {
+  return (
+    <Base {...p}>
+      <rect x="7" y="7" width="10" height="10" fill="currentColor" stroke="none" />
+    </Base>
+  );
+}
+
+/** 28 · CHEVRON — 几何直角折角箭头 */
+export function IconChevron(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="m9.5 6.5 5.5 5.5-5.5 5.5" />
+    </Base>
+  );
+}
+
+/** 29 · THINK — 推理思考逻辑脉冲折线 */
+export function IconThink(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M4 12H7.5L10 6.5L14 17.5L16.5 12H20" />
+    </Base>
+  );
+}
+
+/** 30 · MORE — 联系人/会话详情三点矩阵 */
+export function IconMore(p: IconProps) {
+  return (
+    <Base {...p}>
+      <rect x="4.5" y="10.75" width="2.5" height="2.5" fill="currentColor" stroke="none" />
+      <rect x="10.75" y="10.75" width="2.5" height="2.5" fill="currentColor" stroke="none" />
+      <rect x="17" y="10.75" width="2.5" height="2.5" fill="currentColor" stroke="none" />
+    </Base>
+  );
+}
+
+/** 31 · PAPERCLIP — 几何直角回形针附件标识 */
+export function IconPaperclip(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M15.5 7.5V16.5H8.5V6H17.5V18.5H6.5V8.5" />
+    </Base>
+  );
+}
+
+/** 32 · IMAGE — 发送图片/相册取景框 */
+export function IconImage(p: IconProps) {
+  return (
+    <Base {...p}>
+      <rect x="4" y="5" width="16" height="14" />
+      <circle cx="8.75" cy="9.5" r="1.5" />
+      <path d="m5.5 17 4.5-4.5 3 3 2.5-2.5 3 4" />
+    </Base>
+  );
+}
+
+/** 33 · FILE — 折角文件卡片标识 */
+export function IconFile(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M6 4.5H14L18.5 9V19.5H6V4.5Z" />
+      <path d="M13.5 4.5V9.5H18.5" />
+      <path d="M9 13H15M9 16H13.5" />
+    </Base>
+  );
+}
+
+/** 34 · FOLDER — 本地目录定位夹 */
+export function IconFolder(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M4 6.5H9.5L11.5 8.5H20V18.5H4V6.5Z" />
+    </Base>
+  );
+}
+
+/** 35 · REPLY — 引用回复消息折角左向箭头 */
+export function IconReply(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M9.5 7 4.5 11.5 9.5 16" />
+      <path d="M5 11.5H16.5V18" />
+    </Base>
+  );
+}
+
+/** 36 · ARROW UP — 搜索上一处匹配 */
+export function IconArrowUp(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M12 18.5V5.5M7 10.5 12 5.5 17 10.5" />
+    </Base>
+  );
+}
+
+/** 37 · ARROW DOWN — 搜索下一处匹配 */
+export function IconArrowDown(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M12 5.5V18.5M7 13.5 12 18.5 17 13.5" />
+    </Base>
+  );
+}
+
+/** 38 · EDIT — 备注编辑标尺笔 */
+export function IconEdit(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M14.5 5.5 18.5 9.5 9 19H5V15L14.5 5.5Z" />
     </Base>
   );
 }

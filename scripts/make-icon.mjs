@@ -1,41 +1,112 @@
-// 生成 1024x1024 应用图标源图（圆角蓝底 + 白色对话气泡 + 信封折线），然后运行 `npx tauri icon app-icon.png`
+// 生成 1024x1024 MailChat 应用主图标源图（C2 中心对称 45° 双折面 · 清透冷瓷白超椭圆 + #0F172A 深石板折面 + #3563E9 信号蓝圆点）
+// 生成后运行：`node scripts/run-tauri.mjs icon app-icon.png`
 import { writeFileSync } from "node:fs";
 import { deflateSync } from "node:zlib";
 
 const N = 1024;
 const px = Buffer.alloc(N * N * 4);
-const inRoundRect = (x, y, x0, y0, x1, y1, r) => {
-  if (x < x0 || x > x1 || y < y0 || y > y1) return false;
-  const cx = Math.min(Math.max(x, x0 + r), x1 - r);
-  const cy = Math.min(Math.max(y, y0 + r), y1 - r);
-  return (x - cx) ** 2 + (y - cy) ** 2 <= r * r;
-};
+
+// 将像素坐标映射到 256x256 几何制图空间
+// 连续曲率超椭圆（Squircle）：中心 (128, 128)，半轴 R，指数 p = 4.6
+function squircleSignedDist(ux, uy, radius) {
+  const dx = Math.abs(ux - 128) / radius;
+  const dy = Math.abs(uy - 128) / radius;
+  const p = 4.6;
+  const norm = Math.pow(Math.pow(dx, p) + Math.pow(dy, p), 1 / p);
+  return (norm - 1) * radius;
+}
+
+// C2 中心对称 45° 双折面（严格锁定于 [70..186] 4x29px 基准网格）
+function inLeftPlane(ux, uy) {
+  return ux <= 128 && ux + uy >= 198 && uy - ux <= 58 && ux + uy <= 256;
+}
+
+function inRightPlane(ux, uy) {
+  return ux >= 128 && ux + uy <= 314 && ux - uy <= 58 && ux + uy >= 256;
+}
+
+function sampleSubpixel(ux, uy) {
+  const dOuter = squircleSignedDist(ux, uy, 108);
+  if (dOuter > 0) return [0, 0, 0, 0];
+
+  // 清透冷瓷白主体：自上而下极轻微过渡 (#FFFFFF -> #F6F8FC)，对齐项目 --surface-main / --surface-list
+  const t = Math.min(1, Math.max(0, (uy - 20) / 216));
+  let r = 255 - t * 9;
+  let g = 255 - t * 7;
+  let b = 255 - t * 3;
+
+  // 外缘 1.5px 冷雾蓝细描边 (#DCE4F0)
+  if (dOuter > -1.5) {
+    r = 220;
+    g = 228;
+    b = 240;
+  } else {
+    // 内圈倒角微刻线 (R = 103, #EEF3FA)
+    const dRim = Math.abs(squircleSignedDist(ux, uy, 103));
+    if (dRim < 0.55) {
+      r = 238;
+      g = 243;
+      b = 250;
+    }
+  }
+
+  // 右上角项目主题蓝 (#3563E9) 信号圆点：中心 (178.5, 77.5)，半径 8.5
+  const dxDot = ux - 178.5;
+  const dyDot = uy - 77.5;
+  if (dxDot * dxDot + dyDot * dyDot <= 8.5 * 8.5) {
+    return [53, 99, 233, 255];
+  }
+
+  // C2 中心对称双折面：项目主墨色深石板蓝黑 (#0F172A)
+  if (inLeftPlane(ux, uy) || inRightPlane(ux, uy)) {
+    return [15, 23, 42, 255];
+  }
+
+  return [r, g, b, 255];
+}
+
+// 4x4 超采样抗锯齿 (16x SSAA)
+const OFFSETS = [-0.375, -0.125, 0.125, 0.375];
+const SCALE = 256 / N;
 
 for (let y = 0; y < N; y++) {
   for (let x = 0; x < N; x++) {
-    const i = (y * N + x) * 4;
-    if (!inRoundRect(x, y, 0, 0, N - 1, N - 1, 220)) continue;
-    let [r, g, b] = [42 + (y / N) * 20, 150 - (y / N) * 40, 238];
-    const bubble = inRoundRect(x, y, 200, 260, 824, 700, 90);
-    const tail = x > 280 && x < 420 && y >= 690 && y < 820 && x - 280 > (y - 690) * 0.9;
-    if (bubble || tail) [r, g, b] = [255, 255, 255];
-    // 信封的 V 形折线
-    if (bubble && y < 560) {
-      const v = y - 300 - (312 - Math.abs(x - 512)) * 0.62;
-      if (Math.abs(v) < 16) [r, g, b] = [42, 120, 238];
+    let sr = 0;
+    let sg = 0;
+    let sb = 0;
+    let sa = 0;
+
+    for (let oy = 0; oy < 4; oy++) {
+      const uy = (y + 0.5 + OFFSETS[oy]) * SCALE;
+      for (let ox = 0; ox < 4; ox++) {
+        const ux = (x + 0.5 + OFFSETS[ox]) * SCALE;
+        const [r, g, b, a] = sampleSubpixel(ux, uy);
+        if (a > 0) {
+          sr += r * a;
+          sg += g * a;
+          sb += b * a;
+          sa += a;
+        }
+      }
     }
-    px[i] = r;
-    px[i + 1] = g;
-    px[i + 2] = b;
-    px[i + 3] = 255;
+
+    const i = (y * N + x) * 4;
+    if (sa > 0) {
+      px[i] = Math.round(sr / sa);
+      px[i + 1] = Math.round(sg / sa);
+      px[i + 2] = Math.round(sb / sa);
+      px[i + 3] = Math.round(sa / 16);
+    }
   }
 }
 
 const stride = N * 4 + 1;
 const raw = Buffer.alloc(stride * N);
-for (let y = 0; y < N; y++) px.copy(raw, y * stride + 1, y * N * 4, (y + 1) * N * 4);
+for (let y = 0; y < N; y++) {
+  px.copy(raw, y * stride + 1, y * N * 4, (y + 1) * N * 4);
+}
 
-const crcTable = Array.from({ length: 256 }, (_, n) => {
+const crcTable = Array.from({ length: 256, }, (_, n) => {
   let c = n;
   for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
   return c >>> 0;

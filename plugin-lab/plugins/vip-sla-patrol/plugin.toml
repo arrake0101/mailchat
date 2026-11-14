@@ -1,0 +1,20 @@
+[plugin]
+id = "vip-sla-patrol"
+name = "重点客户优先路由与超时巡检"
+version = "1.0.0"
+description = "对重点客户域名的来信自动直通消息列表并打标，后台每小时巡检未读重点会话并推送超时跟进提醒"
+author = "mailchat-official"
+source = "prebuilt"
+priority = 20
+
+[permissions]
+hooks = ["onBeforeTriage", "onSchedule"]
+mail_access = "read_recent"
+kv_storage = false
+
+[config]
+vip_domains = { default = "vip-client.com,partner.org" }
+sla_minutes = { default = 120 }
+
+[schedule]
+interval_secs = 3600

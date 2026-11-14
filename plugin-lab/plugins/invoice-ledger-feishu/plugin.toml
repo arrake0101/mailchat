@@ -1,0 +1,24 @@
+[plugin]
+id = "invoice-ledger-feishu"
+name = "电子发票台账与飞书推送"
+version = "1.0.0"
+description = "自动从账单/发票邮件提取金额与票号记入本地加密命名空间台账，通过 DPAPI 盲注入推送至飞书群机器人，并支持每日汇总巡检"
+author = "mailchat-official"
+source = "prebuilt"
+priority = 30
+
+[permissions]
+hooks = ["onAfterTriage", "onSchedule"]
+network = ["open.feishu.cn"]
+mail_access = "current"
+kv_storage = true
+
+[secrets.feishu_token]
+label = "飞书自定义机器人 Webhook Token"
+hint = "填写 https://open.feishu.cn/open-apis/bot/v2/hook/<Token> 末尾的 Token 段；本机 DPAPI 加密存储，插件通过 {{secret:feishu_token}} 盲注入发送。"
+
+[config]
+min_notify_amount = { default = 0 }
+
+[schedule]
+daily_at = "18:00"

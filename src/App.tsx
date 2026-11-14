@@ -1,12 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { api } from "./api";
-import type { Account, Conversation, GroupMember, MailboxStats, Message, Status, SyncReport } from "./types";
+import type {
+  Account,
+  AccountEntry,
+  Conversation,
+  GroupMember,
+  MailboxStats,
+  Message,
+  Status,
+  SyncReport,
+} from "./types";
 import { AgentWorkspace } from "./components/AgentWorkspace";
 import { ChatView } from "./components/ChatView";
 import { ConversationList } from "./components/ConversationList";
-import { IconBell, IconChat, IconMail, IconShield, IconSliders, IconSparkles } from "./components/Icons";
-import { Settings, type SettingsTab } from "./components/Settings";
+import { BrandAppIcon, IconBell, IconChat, IconShield, IconSliders, IconSparkles } from "./components/Icons";
+import { Settings, type AccountFormIntent, type SettingsTab } from "./components/Settings";
 import { startWindowDrag, toggleWindowMaximize, WindowControls } from "./components/WindowControls";
 
 type View = Status | "assistant" | "settings";
@@ -28,6 +37,8 @@ const EMPTY_STATS: MailboxStats = {
 export default function App() {
   const [view, setView] = useState<View>("inbox");
   const [account, setAccount] = useState<Account | null>(null);
+  const [accounts, setAccounts] = useState<AccountEntry[]>([]);
+  const [switchingAccount, setSwitchingAccount] = useState(false);
   const [stats, setStats] = useState<MailboxStats>(EMPTY_STATS);
   const [convs, setConvs] = useState<Conversation[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
@@ -36,6 +47,10 @@ export default function App() {
   const [syncing, setSyncing] = useState(false);
   const [triaging, setTriaging] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("declarative");
+  const [accountIntent, setAccountIntent] = useState<AccountFormIntent>({
+    seq: 0,
+    mode: "manage",
+  });
   const [toast, setToast] = useState<{ text: string; error: boolean } | null>(null);
   const toastTimer = useRef<number>();
 
@@ -50,8 +65,13 @@ export default function App() {
 
   const refresh = useCallback(async () => {
     const { view, selected, draftConv } = cur.current;
-    const [acc, st] = await Promise.all([api.getAccount(), api.getStats()]);
+    const [acc, accList, st] = await Promise.all([
+      api.getAccount(),
+      api.listAccounts().catch(() => [] as AccountEntry[]),
+      api.getStats(),
+    ]);
     setAccount(acc);
+    setAccounts(accList);
     setStats(st);
 
     if (view === "settings" || view === "assistant") return;
@@ -60,7 +80,12 @@ export default function App() {
     if (selected && list.some((c) => c.peer === selected)) {
       setDraftConv(null);
       setMessages(await api.listMessages(selected, view));
-      setStats(await api.getStats());
+      const [freshSt, freshAccounts] = await Promise.all([
+        api.getStats(),
+        api.listAccounts().catch(() => accList),
+      ]);
+      setStats(freshSt);
+      setAccounts(freshAccounts);
     } else if (selected && draftConv && draftConv.peer === selected) {
       setMessages([]);
     } else if (selected) {
@@ -68,6 +93,30 @@ export default function App() {
       setMessages([]);
     }
   }, []);
+
+  const handleSwitchAccount = useCallback(
+    async (targetEmail: string) => {
+      const clean = targetEmail.trim().toLowerCase();
+      if (!clean || switchingAccount) return;
+      if (account?.email?.trim().toLowerCase() === clean) return;
+      setSwitchingAccount(true);
+      try {
+        const nextAccounts = await api.switchAccount(clean);
+        setAccounts(nextAccounts);
+        cur.current = { ...cur.current, selected: null, draftConv: null };
+        setSelected(null);
+        setDraftConv(null);
+        setMessages([]);
+        await refresh();
+        notify(`已切换至邮箱 ${clean}`);
+      } catch (e) {
+        notify(`切换邮箱失败：${e}`, true);
+      } finally {
+        setSwitchingAccount(false);
+      }
+    },
+    [account?.email, switchingAccount, refresh, notify],
+  );
 
   useEffect(() => {
     refresh();
@@ -82,6 +131,25 @@ export default function App() {
       un.then((f) => f());
     };
   }, [refresh, notify]);
+
+  useEffect(() => {
+    let lastPoke = 0;
+    const onWake = () => {
+      if (document.visibilityState === "hidden") return;
+      const now = Date.now();
+      if (now - lastPoke < 8000) return;
+      lastPoke = now;
+      api.pokeMailSync();
+    };
+    window.addEventListener("focus", onWake);
+    window.addEventListener("online", onWake);
+    document.addEventListener("visibilitychange", onWake);
+    return () => {
+      window.removeEventListener("focus", onWake);
+      window.removeEventListener("online", onWake);
+      document.removeEventListener("visibilitychange", onWake);
+    };
+  }, []);
 
   const select = async (peer: string) => {
     if (view === "settings" || view === "assistant") return;
@@ -184,6 +252,12 @@ export default function App() {
     setView("settings");
   };
 
+  const openAccountForm = (mode: "add" | "manage") => {
+    setSettingsTab("visual");
+    setAccountIntent((prev) => ({ seq: prev.seq + 1, mode }));
+    setView("settings");
+  };
+
   const switchNav = (target: View) => {
     setView(target);
     setDraftConv(null);
@@ -200,7 +274,18 @@ export default function App() {
 
   return (
     <div className="app-shell">
-      <WindowControls />
+      <WindowControls
+        accountEmail={account?.email}
+        accountName={account?.display_name}
+        accounts={accounts}
+        syncing={syncing}
+        switchingAccount={switchingAccount}
+        hasDemo={stats.has_demo}
+        onClickAccount={() => openAccountForm("manage")}
+        onSwitchAccount={handleSwitchAccount}
+        onAddAccount={() => openAccountForm("add")}
+        onManageAccounts={() => openAccountForm("manage")}
+      />
 
       <div
         className="app-body"
@@ -210,7 +295,7 @@ export default function App() {
       >
         <nav className="rail" onMouseDown={startWindowDrag} onDoubleClick={toggleWindowMaximize}>
           <div className="rail-brand" title="MailChat（按住空白处可拖动窗口）">
-            <IconMail size={19} />
+            <BrandAppIcon size={38} />
           </div>
 
           <div className="rail-group">
@@ -245,7 +330,7 @@ export default function App() {
               type="button"
               className={`rail-btn agent-rail-btn ${view === "assistant" ? "active" : ""}`}
               onClick={() => switchNav("assistant")}
-              title="AI 助手（声明式配置与自动化管家）"
+              title="配置助手（仅用于编排 config.toml 声明式配置文件，不读邮件正文、不代写发信）"
             >
               <IconSparkles size={19} />
               <span className="rail-label">助手</span>
@@ -267,19 +352,24 @@ export default function App() {
 
         {view === "assistant" ? (
           <AgentWorkspace
+            activeAccountEmail={account?.email}
             notify={notify}
             onDataChanged={refresh}
-            onOpenManualSettings={() => openSettings("declarative")}
+            onOpenSettings={(tab) => openSettings(tab)}
+            onGoToInbox={() => switchNav("inbox")}
           />
         ) : view === "settings" ? (
           <Settings
             initialTab={settingsTab}
+            accountIntent={accountIntent}
+            activeAccountEmail={account?.email}
             hasDemo={stats.has_demo}
             notify={notify}
             onAccountSaved={() => {
               setView("inbox");
               refresh();
             }}
+            onSwitchAccount={handleSwitchAccount}
             onDataChanged={refresh}
             onGoToAgent={() => setView("assistant")}
           />
@@ -301,6 +391,7 @@ export default function App() {
 
             {activeConv ? (
               <ChatView
+                key={`${account?.email || "__unbound__"}:${activeConv.peer}`}
                 conv={activeConv}
                 status={view}
                 messages={messages}
@@ -329,7 +420,7 @@ export default function App() {
                 {!account && convs.length === 0 && !stats.has_demo ? (
                   <div className="welcome-card">
                     <div className="welcome-emblem">
-                      <IconMail size={24} />
+                      <BrandAppIcon size={52} />
                     </div>
                     <h2>像聊天一样收发与管理邮件</h2>
                     <p>

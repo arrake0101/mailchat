@@ -2,7 +2,7 @@ import { useMemo, useState } from "react";
 import { api } from "../api";
 import type { Conversation, GroupMember } from "../types";
 import { Avatar, GroupAvatar, shortTime } from "../util";
-import { IconCheck, IconClose, IconMute, IconPlus, IconRefresh, IconSearch, IconSparkles, IconUsers } from "./Icons";
+import { IconCheck, IconClose, IconMute, IconPlus, IconRefresh, IconSearch, IconTriage, IconUsers } from "./Icons";
 import { startWindowDrag, toggleWindowMaximize } from "./WindowControls";
 
 interface Props {
@@ -50,6 +50,8 @@ export function ConversationList({
     return items.filter(
       (c) =>
         c.name.toLowerCase().includes(k) ||
+        (c.raw_name ?? "").toLowerCase().includes(k) ||
+        (c.note ?? "").toLowerCase().includes(k) ||
         c.peer.toLowerCase().includes(k) ||
         c.category.toLowerCase().includes(k) ||
         c.preview.toLowerCase().includes(k) ||
@@ -74,6 +76,17 @@ export function ConversationList({
 
   const submitNew = () => {
     if (!newEmail.trim()) return;
+    if (newName.trim()) {
+      void api
+        .saveContactProfile({
+          email: newEmail.trim().toLowerCase(),
+          alias: newName.trim(),
+          note: "",
+          tag: "",
+          muted: false,
+        })
+        .catch(() => {});
+    }
     onNewChat(newEmail, newName);
     setNewEmail("");
     setNewName("");
@@ -161,7 +174,7 @@ export function ConversationList({
             title="让 AI 重新分拣现有邮件"
           >
             <span className={triaging ? "spin" : ""}>
-              <IconSparkles size={16} />
+              <IconTriage size={16} />
             </span>
           </button>
           <button type="button" className="tool-btn" onClick={onRefresh} disabled={syncing} title="立即同步收信">

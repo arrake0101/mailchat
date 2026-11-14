@@ -3,7 +3,7 @@
 //! - 密码与 API Key 绝不落入 config.toml，仅通过 `secret:<key>` 引用本地 DPAPI 隐私保险箱。
 
 use crate::db::{Account, AgentConfig, Db, GroupMember, ProviderProfile};
-use crate::vault::{llm_secret_key, Vault};
+use crate::vault::{llm_secret_key, mail_secret_key, Vault};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -11,14 +11,59 @@ use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DeclarativeConfig {
-    #[serde(default)]
-    pub account: AccountSpec,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub active_account: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accounts: Vec<AccountSpec>,
+    /// 兼容旧版单账号 `[account]` 声明式段落，加载后自动升级为 `active_account` + `[[accounts]]`
+    #[serde(default, skip_serializing)]
+    pub account: Option<AccountSpec>,
     #[serde(default)]
     pub agent: AgentSpec,
     #[serde(default)]
     pub triage: TriageSpec,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<GroupSpec>,
+}
+
+impl DeclarativeConfig {
+    /// 合并 `[[accounts]]` 与旧版 `[account]`，返回去重后的有效账号声明列表
+    pub fn effective_accounts(&self) -> Vec<AccountSpec> {
+        let mut out: Vec<AccountSpec> = Vec::new();
+        for a in &self.accounts {
+            let em = a.email.trim().to_lowercase();
+            if em.is_empty() {
+                continue;
+            }
+            if let Some(existing) = out.iter_mut().find(|x| x.email.trim().eq_ignore_ascii_case(&em)) {
+                *existing = a.clone();
+            } else {
+                out.push(a.clone());
+            }
+        }
+        if let Some(legacy) = &self.account {
+            let em = legacy.email.trim().to_lowercase();
+            if !em.is_empty() && !out.iter().any(|x| x.email.trim().eq_ignore_ascii_case(&em)) {
+                out.push(legacy.clone());
+            }
+        }
+        out
+    }
+
+    /// 返回当前激活账号声明（若未指定则回退第一个账号）
+    pub fn primary_account(&self) -> Option<AccountSpec> {
+        let list = self.effective_accounts();
+        if list.is_empty() {
+            return None;
+        }
+        let target = self.active_account.trim().to_lowercase();
+        if !target.is_empty() {
+            if let Some(found) = list.iter().find(|a| a.email.trim().eq_ignore_ascii_case(&target)) {
+                return Some(found.clone());
+            }
+        }
+        list.into_iter().next()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -186,15 +231,39 @@ pub fn model_preset_defaults(preset: &str) -> (&'static str, &'static str, &'sta
     }
 }
 
-/// 启动时将旧版本可能存放在 SQLite 中的明文密码和 API Key 自动迁移至 DPAPI 保险箱并擦除明文
+/// 启动时将旧版本可能存放在 SQLite 中的明文密码、单账号 `mail_password` 凭据和 API Key 自动迁移至多账号 DPAPI 保险箱
 pub fn migrate_legacy_secrets(db: &Db, vault: &Vault) {
-    if let Ok(Some(mut acc)) = db.account() {
-        if !acc.password.trim().is_empty() {
-            let _ = vault.set("mail_password", &acc.password);
-            acc.password.clear();
-            let _ = db.save_account(&acc);
+    if let Ok(mut list) = db.list_accounts() {
+        let mut had_plaintext = false;
+        for acc in &mut list {
+            if !acc.password.trim().is_empty() {
+                let sk = mail_secret_key(&acc.email);
+                let _ = vault.set(&sk, &acc.password);
+                acc.password.clear();
+                had_plaintext = true;
+            }
+        }
+        if had_plaintext {
+            let active = db.active_account_email().unwrap_or_default();
+            let _ = db.replace_accounts(&list, &active);
+        }
+        if let Some(legacy_pw) = vault.get("mail_password") {
+            let active = db.active_account_email().unwrap_or_default();
+            let target_email = if !active.is_empty() {
+                active
+            } else {
+                list.first().map(|a| a.email.clone()).unwrap_or_default()
+            };
+            if !target_email.is_empty() {
+                let sk = mail_secret_key(&target_email);
+                if vault.get(&sk).is_none() {
+                    let _ = vault.set(&sk, &legacy_pw);
+                }
+                let _ = vault.delete("mail_password");
+            }
         }
     }
+
     if let Ok(mut cfg) = db.agent_config() {
         let mut dirty = false;
         if !cfg.api_key.trim().is_empty() {
@@ -219,16 +288,29 @@ pub fn migrate_legacy_secrets(db: &Db, vault: &Vault) {
     }
 }
 
-/// 组装供 IMAP / SMTP 实际连接使用的完整账号（从隐私保险箱注入密码）
-pub fn hydrated_account(db: &Db, vault: &Vault) -> Result<Option<Account>> {
-    let Some(mut acc) = db.account()? else {
+/// 组装指定邮箱账号的完整连接凭据（从独立 DPAPI 保险箱注入该账号专属密码）
+pub fn hydrated_account_for(db: &Db, vault: &Vault, email: &str) -> Result<Option<Account>> {
+    let Some(mut acc) = db.account_by_email(email)? else {
         return Ok(None);
     };
     if acc.email.trim().is_empty() {
         return Ok(None);
     }
-    acc.password = vault.get("mail_password").unwrap_or_default();
+    let sk = mail_secret_key(&acc.email);
+    acc.password = vault.get(&sk).unwrap_or_default();
+    if acc.password.is_empty() && db.list_accounts().map(|l| l.len() <= 1).unwrap_or(false) {
+        acc.password = vault.get("mail_password").unwrap_or_default();
+    }
     Ok(Some(acc))
+}
+
+/// 组装当前激活邮箱供 IMAP / SMTP 实际连接使用的完整账号（从隐私保险箱注入对应密码）
+pub fn hydrated_account(db: &Db, vault: &Vault) -> Result<Option<Account>> {
+    let active = db.active_account_email()?;
+    if active.is_empty() {
+        return Ok(None);
+    }
+    hydrated_account_for(db, vault, &active)
 }
 
 /// 组装供大模型调用使用的完整 AgentConfig（从隐私保险箱注入对应服务商 API Key）
@@ -242,19 +324,24 @@ pub fn hydrated_agent(db: &Db, vault: &Vault) -> Result<AgentConfig> {
 
 /// 从当前数据库状态导出无敏感信息的声明式结构
 pub fn build_spec(db: &Db) -> Result<DeclarativeConfig> {
-    let account = match db.account()? {
-        Some(a) => AccountSpec {
-            email: a.email,
-            display_name: a.display_name,
-            username: a.username,
-            imap_host: a.imap_host,
-            imap_port: a.imap_port,
-            smtp_host: a.smtp_host,
-            smtp_port: a.smtp_port,
-            password_ref: default_mail_secret_ref(),
-        },
-        None => AccountSpec::default(),
-    };
+    let active_account = db.active_account_email()?;
+    let accounts: Vec<AccountSpec> = db
+        .list_accounts()?
+        .into_iter()
+        .map(|a| {
+            let sk = mail_secret_key(&a.email);
+            AccountSpec {
+                email: a.email,
+                display_name: a.display_name,
+                username: a.username,
+                imap_host: a.imap_host,
+                imap_port: a.imap_port,
+                smtp_host: a.smtp_host,
+                smtp_port: a.smtp_port,
+                password_ref: format!("secret:{sk}"),
+            }
+        })
+        .collect();
 
     let ag = db.agent_config()?;
     let api_key_ref = llm_secret_key(&ag.preset)
@@ -312,7 +399,9 @@ pub fn build_spec(db: &Db) -> Result<DeclarativeConfig> {
         .collect();
 
     Ok(DeclarativeConfig {
-        account,
+        active_account,
+        accounts,
+        account: None,
         agent,
         triage,
         groups,
@@ -336,58 +425,88 @@ pub fn sync_disk_toml(app_dir: &Path, db: &Db) -> Result<String> {
     Ok(text)
 }
 
-/// 解析、校验并原子应用声明式 TOML 配置；若检测到误填的明文凭据，自动收进隐私保险箱并脱敏
+/// 解析、校验并原子应用声明式 TOML 配置；兼容单账号 `[account]` 与多账号 `[[accounts]]`，自动收纳误填明文凭据
 pub fn apply_toml(app_dir: &Path, toml_str: &str, db: &Db, vault: &Vault) -> Result<String> {
     let spec: DeclarativeConfig =
         toml::from_str(toml_str).context("声明式 TOML 语法解析失败，请检查括号、引号或字段类型")?;
 
-    // 1. 邮箱账号声明
-    let email = spec.account.email.trim().to_lowercase();
-    if !email.is_empty() {
-        // 若用户误在 password_ref 直接填了明文密码，自动转存入 Vault 并擦除明文
-        let pw_ref = spec.account.password_ref.trim();
-        if !pw_ref.is_empty() && !pw_ref.starts_with("secret:") && !pw_ref.starts_with("none") {
-            vault.set("mail_password", pw_ref)?;
+    // 1. 多邮箱账号声明（无缝兼容旧版 [account]）
+    let raw_accounts = spec.effective_accounts();
+    let prev_active = db.active_account_email().unwrap_or_default();
+    let mut resolved_accounts: Vec<Account> = Vec::new();
+
+    for acc_spec in &raw_accounts {
+        let email = acc_spec.email.trim().to_lowercase();
+        if email.is_empty() {
+            continue;
         }
+        let sk = mail_secret_key(&email);
+        let pw_ref = acc_spec.password_ref.trim();
+        if !pw_ref.is_empty() && !pw_ref.starts_with("secret:") && !pw_ref.starts_with("none") {
+            // 若用户误在 password_ref 直接填了明文密码，自动转存入该账号独立 DPAPI Vault 槽位并擦除明文
+            vault.set(&sk, pw_ref)?;
+        } else if pw_ref == "secret:mail_password" && vault.get(&sk).is_none() {
+            if let Some(legacy_pw) = vault.get("mail_password") {
+                vault.set(&sk, &legacy_pw)?;
+                let _ = vault.delete("mail_password");
+            }
+        }
+
         let defaults = mail_domain_defaults(&email);
-        let imap_host = if !spec.account.imap_host.trim().is_empty() {
-            spec.account.imap_host.trim().to_string()
+        let imap_host = if !acc_spec.imap_host.trim().is_empty() {
+            acc_spec.imap_host.trim().to_string()
         } else {
             defaults.map(|d| d.0.to_string()).unwrap_or_default()
         };
-        let imap_port = if spec.account.imap_port > 0 {
-            spec.account.imap_port
+        let imap_port = if acc_spec.imap_port > 0 {
+            acc_spec.imap_port
         } else {
             defaults.map(|d| d.1).unwrap_or(993)
         };
-        let smtp_host = if !spec.account.smtp_host.trim().is_empty() {
-            spec.account.smtp_host.trim().to_string()
+        let smtp_host = if !acc_spec.smtp_host.trim().is_empty() {
+            acc_spec.smtp_host.trim().to_string()
         } else {
             defaults.map(|d| d.2.to_string()).unwrap_or_default()
         };
-        let smtp_port = if spec.account.smtp_port > 0 {
-            spec.account.smtp_port
+        let smtp_port = if acc_spec.smtp_port > 0 {
+            acc_spec.smtp_port
         } else {
             defaults.map(|d| d.3).unwrap_or(465)
         };
-        let username = if !spec.account.username.trim().is_empty() {
-            spec.account.username.trim().to_string()
+        let username = if !acc_spec.username.trim().is_empty() {
+            acc_spec.username.trim().to_string()
         } else {
             email.clone()
         };
-        db.save_account(&Account {
-            email: email.clone(),
-            display_name: spec.account.display_name.trim().to_string(),
+
+        resolved_accounts.push(Account {
+            email,
+            display_name: acc_spec.display_name.trim().to_string(),
             imap_host,
             imap_port,
             smtp_host,
             smtp_port,
             username,
-            password: String::new(), // 永不在数据库存明文密码
-        })?;
-    } else {
-        db.clear_account()?;
+            password: String::new(),
+        });
     }
+
+    if resolved_accounts.is_empty() {
+        db.clear_account()?;
+    } else {
+        let preferred_active = if !spec.active_account.trim().is_empty() {
+            spec.active_account.trim().to_lowercase()
+        } else if !prev_active.is_empty()
+            && resolved_accounts.iter().any(|a| a.email == prev_active)
+        {
+            prev_active
+        } else {
+            resolved_accounts[0].email.clone()
+        };
+        db.replace_accounts(&resolved_accounts, &preferred_active)?;
+    }
+
+    let active_email = db.active_account_email()?;
 
     // 2. Agent 模型与行为声明
     let preset = if spec.agent.preset.trim().is_empty() {
@@ -479,8 +598,12 @@ pub fn apply_toml(app_dir: &Path, toml_str: &str, db: &Db, vault: &Vault) -> Res
     }
     db.replace_rules(&flat_rules)?;
 
-    // 4. 群聊声明对账
-    let me = if email.is_empty() { "me@mailchat.local" } else { &email };
+    // 4. 当前激活账号的群聊声明对账
+    let me = if active_email.is_empty() {
+        "me@mailchat.local"
+    } else {
+        &active_email
+    };
     for g in &spec.groups {
         if g.members.is_empty() {
             continue;

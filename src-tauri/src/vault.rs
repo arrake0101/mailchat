@@ -69,12 +69,28 @@ pub fn llm_secret_key(preset: &str) -> Option<&'static str> {
     }
 }
 
+pub fn mail_secret_key(email: &str) -> String {
+    let clean = email.trim().to_lowercase();
+    if clean.is_empty() {
+        "mail_password".to_string()
+    } else {
+        format!("mail_pwd:{clean}")
+    }
+}
+
 pub fn secret_label(key: &str) -> String {
+    let clean = key.trim().trim_start_matches("secret:");
+    if let Some(email) = clean.strip_prefix("mail_pwd:") {
+        let em = email.trim();
+        if !em.is_empty() {
+            return format!("邮箱授权码 ({em})");
+        }
+    }
     KNOWN_SECRETS
         .iter()
-        .find(|(k, _, _)| *k == key)
+        .find(|(k, _, _)| *k == clean)
         .map(|(_, label, _)| (*label).to_string())
-        .unwrap_or_else(|| key.to_string())
+        .unwrap_or_else(|| clean.to_string())
 }
 
 fn mask_value(key: &str, val: &str) -> String {
@@ -82,7 +98,7 @@ fn mask_value(key: &str, val: &str) -> String {
     if chars.is_empty() {
         return String::new();
     }
-    if key == "mail_password" || chars.len() < 9 {
+    if key == "mail_password" || key.starts_with("mail_pwd:") || chars.len() < 9 {
         return format!("已加密 ({} 位)", chars.len());
     }
     let prefix: String = chars.iter().take(3).collect();
@@ -142,21 +158,69 @@ impl Vault {
         self.set(key, "")
     }
 
+    #[allow(dead_code)]
     pub fn statuses(&self) -> Vec<SecretStatus> {
+        self.statuses_for_accounts(&[])
+    }
+
+    pub fn statuses_for_accounts(&self, account_emails: &[String]) -> Vec<SecretStatus> {
         let guard = self.cache.lock().unwrap();
-        KNOWN_SECRETS
-            .iter()
-            .map(|(key, label, category)| {
-                let val = guard.get(*key).map(|s| s.as_str()).unwrap_or("");
-                SecretStatus {
-                    key: (*key).to_string(),
-                    label: (*label).to_string(),
-                    category: (*category).to_string(),
-                    configured: !val.is_empty(),
-                    masked: mask_value(key, val),
+        let mut out = Vec::new();
+
+        let mut seen_emails: Vec<String> = Vec::new();
+        for raw in account_emails {
+            let em = raw.trim().to_lowercase();
+            if !em.is_empty() && !seen_emails.contains(&em) {
+                seen_emails.push(em);
+            }
+        }
+        for k in guard.keys() {
+            if let Some(em) = k.strip_prefix("mail_pwd:") {
+                let clean = em.trim().to_lowercase();
+                if !clean.is_empty() && !seen_emails.contains(&clean) {
+                    seen_emails.push(clean);
                 }
-            })
-            .collect()
+            }
+        }
+
+        if seen_emails.is_empty() {
+            let val = guard.get("mail_password").map(|s| s.as_str()).unwrap_or("");
+            out.push(SecretStatus {
+                key: "mail_password".to_string(),
+                label: "邮箱 IMAP/SMTP 授权码".to_string(),
+                category: "mail".to_string(),
+                configured: !val.is_empty(),
+                masked: mask_value("mail_password", val),
+            });
+        } else {
+            for em in seen_emails {
+                let key = mail_secret_key(&em);
+                let val = guard.get(&key).map(|s| s.as_str()).unwrap_or("");
+                out.push(SecretStatus {
+                    label: secret_label(&key),
+                    configured: !val.is_empty(),
+                    masked: mask_value(&key, val),
+                    key,
+                    category: "mail".to_string(),
+                });
+            }
+        }
+
+        for (key, label, category) in KNOWN_SECRETS {
+            if *category == "mail" {
+                continue;
+            }
+            let val = guard.get(*key).map(|s| s.as_str()).unwrap_or("");
+            out.push(SecretStatus {
+                key: (*key).to_string(),
+                label: (*label).to_string(),
+                category: (*category).to_string(),
+                configured: !val.is_empty(),
+                masked: mask_value(key, val),
+            });
+        }
+
+        out
     }
 
     fn persist(&self) -> Result<()> {

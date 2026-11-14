@@ -1,0 +1,71 @@
+# MailChat 声明式配置文件预览（展示引入插件系统后的 config.toml 完整形态）
+# 注意：本文件位于 plugin-lab/ 仅供方案预览，未改动客户端实际运行配置。
+# 隐私隔离：邮箱授权码、模型 API Key 与各插件专属凭据全部加密存储在系统 DPAPI 保险箱（secrets.vault.json），此处仅保留 secret:* 引用。
+
+[account]
+email = "alex@example.com"
+display_name = "Alex"
+username = "alex@example.com"
+imap_host = "imap.qq.com"
+imap_port = 993
+smtp_host = "smtp.qq.com"
+smtp_port = 465
+password_ref = "secret:mail_password"
+
+[agent]
+enabled = true
+preset = "deepseek"
+provider = "openai"
+base_url = "https://api.deepseek.com/v1"
+model = "deepseek-v4.1-flash"
+api_key_ref = "secret:llm_deepseek"
+auto_draft = true
+auto_block_sender = false
+instructions = "工作沟通优先保留在消息列表；电子账单与通知自动归档。"
+
+[triage]
+allow_senders = ["boss@company.com"]
+block_senders = []
+block_domains = []
+block_keywords = ["退订", "限时优惠"]
+archive_senders = []
+archive_keywords = ["电子账单"]
+
+# ── 新增：插件编排声明（与 plugins/<id>/plugin.toml 双向同步，支持手动或通过 AI 助手开关调参） ──
+
+[[plugins]]
+id = "otp-fast-lane"
+enabled = true
+priority = 10
+source = "prebuilt"
+config = { auto_archive = true }
+
+[[plugins]]
+id = "outbound-dlp-guard"
+enabled = true
+priority = 15
+source = "prebuilt"
+config = { block_secrets = true, append_signature = "发自 MailChat" }
+
+[[plugins]]
+id = "vip-sla-patrol"
+enabled = true
+priority = 20
+source = "prebuilt"
+config = { vip_domains = "vip-client.com,partner.org", sla_minutes = 120 }
+
+[[plugins]]
+id = "invoice-ledger-feishu"
+enabled = true
+priority = 30
+source = "prebuilt"
+secret_refs = { feishu_token = "secret:plugin:invoice-ledger-feishu:feishu_token" }
+config = { min_notify_amount = 100 }
+
+[[plugins]]
+id = "agent-ops-alert-bridge"
+enabled = true
+priority = 35
+source = "agent"
+secret_refs = { webhook_token = "secret:plugin:agent-ops-alert-bridge:webhook_token" }
+config = { keywords = "告警,故障,CRITICAL,P0" }

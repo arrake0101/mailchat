@@ -8,13 +8,18 @@
 use crate::config::model_preset_defaults;
 use crate::db::AgentConfig;
 use anyhow::{anyhow, bail, Result};
+use futures::StreamExt;
 use genai::adapter::AdapterKind;
-use genai::chat::{ChatMessage, ChatOptions, ChatRequest, ChatResponse, ChatResponseFormat};
+use genai::chat::{
+    ChatMessage, ChatOptions, ChatRequest, ChatResponse, ChatResponseFormat, ChatStreamEvent,
+    StreamEnd, ToolCall,
+};
 use genai::resolver::{AuthData, Endpoint, ProviderConfig};
 use genai::{Client, Headers, ModelIden, ServiceTarget, WebConfig};
 use serde_json::Value;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const CLIENT_USER_AGENT: &str = "mailchat/0.2.0";
 
@@ -549,9 +554,18 @@ pub async fn complete(
     }
 
     let err_low = last_msg.to_lowercase();
-    let privacy_hint = if is_opencode_cfg(cfg)
+    let privacy_hint = build_privacy_hint(cfg, last_code, &err_low);
+
+    match last_code {
+        Some(code) => bail!("模型接口错误 (HTTP {code}): {last_msg}{privacy_hint}"),
+        None => bail!("模型调用失败: {last_msg}{privacy_hint}"),
+    }
+}
+
+fn build_privacy_hint(cfg: &AgentConfig, code: Option<u16>, err_low: &str) -> &'static str {
+    if is_opencode_cfg(cfg)
         && cfg.model.to_lowercase().contains("deepseek")
-        && (last_code == Some(403)
+        && (code == Some(403)
             || err_low.contains("privacy")
             || err_low.contains("region")
             || err_low.contains("global")
@@ -560,12 +574,432 @@ pub async fn complete(
         "（提示：OpenCode Go 在非中国区 IP/代理下调用 DeepSeek 需前往 OpenCode Console → Settings › Privacy 将 Regions 勾选为 Global；或直接在配置页切换免区域限制的 glm-5.3-flash / mimo-v2.6-flash）"
     } else {
         ""
-    };
+    }
+}
 
+/// 流式拆分 `<think>...</think>` 推理块的状态机：
+/// 兼容部分第三方网关将思考链直接拼入 `delta.content` 的情况，且对常规正文保持零缓冲吐字。
+#[derive(Default)]
+pub struct ThinkTagSplitter {
+    buf: String,
+    in_think: bool,
+    strip_leading_newline: bool,
+}
+
+fn longest_tag_prefix_at_end(s: &str, tag: &str) -> usize {
+    let max_len = s.len().min(tag.len().saturating_sub(1));
+    for len in (1..=max_len).rev() {
+        let start = s.len() - len;
+        if s.is_char_boundary(start) && s[start..].eq_ignore_ascii_case(&tag[..len]) {
+            return len;
+        }
+    }
+    0
+}
+
+fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    let nlen = needle.len();
+    for i in 0..=(haystack.len() - nlen) {
+        if haystack.is_char_boundary(i)
+            && haystack.is_char_boundary(i + nlen)
+            && haystack[i..i + nlen].eq_ignore_ascii_case(needle)
+        {
+            return Some(i);
+        }
+    }
+    None
+}
+
+impl ThinkTagSplitter {
+    /// 返回 `(is_reasoning, text_delta)` 序列
+    pub fn push(&mut self, delta: &str) -> Vec<(bool, String)> {
+        if delta.is_empty() {
+            return Vec::new();
+        }
+        self.buf.push_str(delta);
+        let mut out = Vec::new();
+
+        loop {
+            if self.strip_leading_newline {
+                if self.buf.starts_with("\r\n") {
+                    self.buf.drain(..2);
+                    self.strip_leading_newline = false;
+                } else if self.buf.starts_with('\n') {
+                    self.buf.drain(..1);
+                    self.strip_leading_newline = false;
+                } else if self.buf == "\r" {
+                    break;
+                } else if !self.buf.is_empty() {
+                    self.strip_leading_newline = false;
+                } else {
+                    break;
+                }
+            }
+
+            if self.in_think {
+                if let Some(pos) = find_ascii_case_insensitive(&self.buf, "</think>") {
+                    if pos > 0 {
+                        out.push((true, self.buf[..pos].to_string()));
+                    }
+                    self.buf.drain(..pos + "</think>".len());
+                    self.in_think = false;
+                    self.strip_leading_newline = true;
+                    continue;
+                }
+                let hold = longest_tag_prefix_at_end(&self.buf, "</think>");
+                let emit_end = self.buf.len() - hold;
+                if emit_end > 0 {
+                    out.push((true, self.buf[..emit_end].to_string()));
+                    self.buf.drain(..emit_end);
+                }
+                break;
+            } else {
+                if let Some(pos) = find_ascii_case_insensitive(&self.buf, "<think>") {
+                    if pos > 0 {
+                        out.push((false, self.buf[..pos].to_string()));
+                    }
+                    self.buf.drain(..pos + "<think>".len());
+                    self.in_think = true;
+                    self.strip_leading_newline = true;
+                    continue;
+                }
+                let hold = longest_tag_prefix_at_end(&self.buf, "<think>");
+                let emit_end = self.buf.len() - hold;
+                if emit_end > 0 {
+                    out.push((false, self.buf[..emit_end].to_string()));
+                    self.buf.drain(..emit_end);
+                }
+                break;
+            }
+        }
+
+        out
+    }
+
+    pub fn flush(&mut self) -> Option<(bool, String)> {
+        if self.buf.is_empty() {
+            None
+        } else {
+            let rest = std::mem::take(&mut self.buf);
+            Some((self.in_think, rest))
+        }
+    }
+}
+
+pub enum AgentStreamDelta<'a> {
+    Reasoning(&'a str),
+    Content(&'a str),
+}
+
+#[allow(dead_code)]
+pub struct StreamStepOutcome {
+    pub content: String,
+    pub reasoning: String,
+    pub thinking_ms: u64,
+    pub tool_calls: Vec<ToolCall>,
+    pub stream_end: Option<StreamEnd>,
+    pub cancelled: bool,
+    pub tools_supported: bool,
+}
+
+/// 原生流式 Agent 单步推理引擎（支持实时 ReasoningChunk / `<think>` 拆分、ToolCall 捕获、无工具自动降级与即时中断）
+pub async fn stream_agent_step<F>(
+    cfg: &AgentConfig,
+    req: &ChatRequest,
+    max_tokens: u32,
+    cancel_flag: &AtomicBool,
+    mut on_delta: F,
+) -> Result<StreamStepOutcome>
+where
+    F: FnMut(AgentStreamDelta<'_>),
+{
+    let plans = build_call_plans(cfg)?;
+    let client = genai_client();
+    let req_has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
+
+    let mut last_code: Option<u16> = None;
+    let mut last_msg = String::new();
+
+    for (idx, plan) in plans.iter().enumerate() {
+        let mut tool_modes = vec![req_has_tools];
+        if req_has_tools {
+            tool_modes.push(false);
+        }
+
+        let mut try_next_plan = false;
+
+        for (mode_idx, use_tools) in tool_modes.into_iter().enumerate() {
+            if cancel_flag.load(Ordering::Relaxed) {
+                return Ok(StreamStepOutcome {
+                    content: String::new(),
+                    reasoning: String::new(),
+                    thinking_ms: 0,
+                    tool_calls: Vec::new(),
+                    stream_end: None,
+                    cancelled: true,
+                    tools_supported: use_tools,
+                });
+            }
+
+            let target = ServiceTarget {
+                endpoint: Endpoint::from_owned(plan.endpoint_url.clone()),
+                auth: plan.auth.clone(),
+                model: ModelIden::new(plan.adapter, plan.model_name.clone()),
+            };
+
+            let mut opts = ChatOptions::default()
+                .with_max_tokens(max_tokens)
+                .with_stream_header_timeout(Duration::from_secs(18))
+                .with_stream_read_timeout(Duration::from_secs(45))
+                .with_normalize_reasoning_content(true)
+                .with_capture_content(true)
+                .with_capture_reasoning_content(true)
+                .with_capture_tool_calls(true);
+            if !plan.extra_headers.is_empty() {
+                opts = opts.with_extra_headers(Headers::from(plan.extra_headers.clone()));
+            }
+
+            let mut attempt_req = req.clone();
+            if !use_tools {
+                attempt_req.tools = None;
+            }
+
+            let stream_resp = match client
+                .exec_chat_stream(target, attempt_req, Some(&opts))
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let (code, msg) = unpack_genai_error(&e);
+                    last_code = code;
+                    last_msg = msg.clone();
+                    if mode_idx == 0 && req_has_tools && matches!(code, Some(400 | 422 | 501)) {
+                        continue;
+                    }
+                    try_next_plan = should_fallback_next_plan(cfg, idx, plans.len(), code, &msg);
+                    break;
+                }
+            };
+
+            let mut stream = stream_resp.stream;
+            let mut splitter = ThinkTagSplitter::default();
+            let mut content_buf = String::new();
+            let mut reasoning_buf = String::new();
+            let mut emitted_any = false;
+            let mut think_started_at: Option<Instant> = None;
+            let mut think_frozen_ms: Option<u64> = None;
+            let mut captured_end: Option<StreamEnd> = None;
+            let mut stream_err: Option<genai::Error> = None;
+
+            loop {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    let thinking_ms = think_frozen_ms.unwrap_or_else(|| {
+                        think_started_at
+                            .map(|t| t.elapsed().as_millis() as u64)
+                            .unwrap_or(0)
+                    });
+                    return Ok(StreamStepOutcome {
+                        content: content_buf,
+                        reasoning: reasoning_buf,
+                        thinking_ms,
+                        tool_calls: Vec::new(),
+                        stream_end: None,
+                        cancelled: true,
+                        tools_supported: use_tools,
+                    });
+                }
+
+                let next_ev = tokio::select! {
+                    ev = stream.next() => ev,
+                    _ = tokio::time::sleep(Duration::from_millis(80)) => {
+                        continue;
+                    }
+                };
+
+                let Some(item) = next_ev else {
+                    break;
+                };
+
+                match item {
+                    Ok(ChatStreamEvent::Start) | Ok(ChatStreamEvent::Heartbeat) | Ok(ChatStreamEvent::ThoughtSignatureChunk(_)) => {}
+                    Ok(ChatStreamEvent::ReasoningChunk(chunk)) => {
+                        if !chunk.content.is_empty() {
+                            if think_started_at.is_none() {
+                                think_started_at = Some(Instant::now());
+                            }
+                            emitted_any = true;
+                            reasoning_buf.push_str(&chunk.content);
+                            on_delta(AgentStreamDelta::Reasoning(&chunk.content));
+                        }
+                    }
+                    Ok(ChatStreamEvent::Chunk(chunk)) => {
+                        for (is_reasoning, part) in splitter.push(&chunk.content) {
+                            if part.is_empty() {
+                                continue;
+                            }
+                            emitted_any = true;
+                            if is_reasoning {
+                                if think_started_at.is_none() {
+                                    think_started_at = Some(Instant::now());
+                                }
+                                reasoning_buf.push_str(&part);
+                                on_delta(AgentStreamDelta::Reasoning(&part));
+                            } else {
+                                if think_frozen_ms.is_none() {
+                                    if let Some(st) = think_started_at {
+                                        think_frozen_ms = Some(st.elapsed().as_millis() as u64);
+                                    }
+                                }
+                                content_buf.push_str(&part);
+                                on_delta(AgentStreamDelta::Content(&part));
+                            }
+                        }
+                    }
+                    Ok(ChatStreamEvent::ToolCallChunk(_)) => {
+                        emitted_any = true;
+                        if think_frozen_ms.is_none() {
+                            if let Some(st) = think_started_at {
+                                think_frozen_ms = Some(st.elapsed().as_millis() as u64);
+                            }
+                        }
+                    }
+                    Ok(ChatStreamEvent::End(end)) => {
+                        captured_end = Some(end);
+                        break;
+                    }
+                    Err(e) => {
+                        stream_err = Some(e);
+                        break;
+                    }
+                }
+            }
+
+            if let Some(e) = stream_err {
+                let (code, msg) = unpack_genai_error(&e);
+                last_code = code;
+                last_msg = msg.clone();
+
+                if emitted_any {
+                    let err_low = msg.to_lowercase();
+                    let hint = build_privacy_hint(cfg, code, &err_low);
+                    match code {
+                        Some(c) => bail!("模型流式响应中断 (HTTP {c}): {msg}{hint}"),
+                        None => bail!("模型流式响应中断: {msg}{hint}"),
+                    }
+                }
+
+                // 未输出任何 token 前遇到网关不支持 tools 的 400/422/501 错误时，自动降级为纯文本流式重试
+                let msg_low = msg.to_lowercase();
+                let looks_tool_unsupported = matches!(code, Some(400 | 422 | 501))
+                    && (msg_low.contains("tool")
+                        || msg_low.contains("function")
+                        || msg_low.contains("unsupported")
+                        || msg_low.contains("not support")
+                        || msg_low.contains("schema")
+                        || plan.adapter == AdapterKind::DeepSeek);
+                if mode_idx == 0 && req_has_tools && looks_tool_unsupported {
+                    continue;
+                }
+
+                try_next_plan = should_fallback_next_plan(cfg, idx, plans.len(), code, &msg);
+                break;
+            }
+
+            if let Some((is_reasoning, rem)) = splitter.flush() {
+                if !rem.is_empty() {
+                    emitted_any = true;
+                    if is_reasoning {
+                        reasoning_buf.push_str(&rem);
+                        on_delta(AgentStreamDelta::Reasoning(&rem));
+                    } else {
+                        content_buf.push_str(&rem);
+                        on_delta(AgentStreamDelta::Content(&rem));
+                    }
+                }
+            }
+
+            let mut tool_calls: Vec<ToolCall> = Vec::new();
+            if let Some(ref end) = captured_end {
+                if let Some(calls) = end.captured_tool_calls() {
+                    tool_calls = calls.into_iter().cloned().collect();
+                }
+                if reasoning_buf.is_empty() {
+                    if let Some(rc) = end.captured_reasoning_content.as_deref() {
+                        if !rc.trim().is_empty() {
+                            reasoning_buf.push_str(rc);
+                            on_delta(AgentStreamDelta::Reasoning(rc));
+                        }
+                    }
+                }
+                if content_buf.is_empty() && tool_calls.is_empty() {
+                    if let Some(txt) = end.captured_first_text() {
+                        if !txt.trim().is_empty() {
+                            content_buf.push_str(txt);
+                            on_delta(AgentStreamDelta::Content(txt));
+                            emitted_any = true;
+                        }
+                    }
+                }
+            }
+
+            let thinking_ms = think_frozen_ms.unwrap_or_else(|| {
+                think_started_at
+                    .map(|t| t.elapsed().as_millis() as u64)
+                    .unwrap_or(0)
+            });
+
+            if content_buf.trim().is_empty() && tool_calls.is_empty() && !emitted_any {
+                last_code = None;
+                last_msg = "模型返回内容为空".into();
+                try_next_plan = idx + 1 < plans.len();
+                break;
+            }
+
+            return Ok(StreamStepOutcome {
+                content: content_buf,
+                reasoning: reasoning_buf,
+                thinking_ms,
+                tool_calls,
+                stream_end: captured_end,
+                cancelled: false,
+                tools_supported: use_tools,
+            });
+        }
+
+        if !try_next_plan {
+            break;
+        }
+    }
+
+    let err_low = last_msg.to_lowercase();
+    let privacy_hint = build_privacy_hint(cfg, last_code, &err_low);
     match last_code {
         Some(code) => bail!("模型接口错误 (HTTP {code}): {last_msg}{privacy_hint}"),
         None => bail!("模型调用失败: {last_msg}{privacy_hint}"),
     }
+}
+
+fn should_fallback_next_plan(
+    cfg: &AgentConfig,
+    idx: usize,
+    total_plans: usize,
+    code: Option<u16>,
+    msg: &str,
+) -> bool {
+    let msg_low = msg.to_lowercase();
+    idx + 1 < total_plans
+        && (matches!(code, Some(400 | 402 | 403 | 404 | 422)) || code.is_none())
+        && (is_opencode_cfg(cfg)
+            || cfg.preset.starts_with("ollama")
+            || msg_low.contains("model")
+            || msg_low.contains("not found")
+            || msg_low.contains("not_found")
+            || msg_low.contains("does not exist")
+            || msg_low.contains("subscription")
+            || msg_low.contains("unsupported"))
 }
 
 /// 动态拉取远端或本地服务可用模型列表（优先通过 `genai::Client::all_model_names` 获取，并对 OpenCode 注入会话路由头）

@@ -1,10 +1,35 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api, MODEL_PRESETS, PRESETS } from "../api";
-import type { Account, AgentConfig, ProviderPresetId, Rule, RuleKind, SecretStatus, Verdict } from "../types";
-import { IconCheck, IconCode, IconKey, IconLock, IconRefresh, IconSliders, IconSparkles } from "./Icons";
+import {
+  mailSecretKey,
+  type Account,
+  type AccountEntry,
+  type AgentConfig,
+  type ProviderPresetId,
+  type Rule,
+  type RuleKind,
+  type SecretStatus,
+  type Verdict,
+} from "../types";
+import {
+  IconCheck,
+  IconCode,
+  IconKey,
+  IconLock,
+  IconPlus,
+  IconRefresh,
+  IconSliders,
+  IconSparkles,
+  IconTrash,
+} from "./Icons";
 import { startWindowDrag, toggleWindowMaximize } from "./WindowControls";
 
 export type SettingsTab = "declarative" | "vault" | "visual";
+
+export interface AccountFormIntent {
+  seq: number;
+  mode: "add" | "manage";
+}
 
 const EMPTY_ACCOUNT: Account = {
   email: "",
@@ -28,23 +53,29 @@ const RULE_LABEL: Record<RuleKind, string> = {
 
 export function Settings({
   initialTab = "declarative",
+  accountIntent,
+  activeAccountEmail,
   hasDemo,
   notify,
   onAccountSaved,
+  onSwitchAccount,
   onDataChanged,
   onGoToAgent,
 }: {
   initialTab?: SettingsTab;
+  accountIntent?: AccountFormIntent;
+  activeAccountEmail?: string;
   hasDemo: boolean;
   notify: (t: string, isError?: boolean) => void;
   onAccountSaved: () => void;
+  onSwitchAccount?: (email: string) => Promise<void> | void;
   onDataChanged: () => void;
   onGoToAgent: () => void;
 }) {
   const [tab, setTab] = useState<SettingsTab>(initialTab);
   useEffect(() => {
     setTab(initialTab);
-  }, [initialTab]);
+  }, [initialTab, accountIntent?.seq]);
 
   return (
     <section className="settings">
@@ -55,7 +86,7 @@ export function Settings({
       >
         <div>
           <div className="pane-title">配置与隐私中心</div>
-          <div className="pane-subtitle">所有非敏感状态由声明式 config.toml 驱动，密钥与授权码独立加密存储</div>
+          <div className="pane-subtitle">所有非敏感状态由声明式 config.toml 驱动，多账号密码与密钥独立加密存储</div>
         </div>
         <div className="pane-header-actions">
           <div className="segmented">
@@ -93,13 +124,28 @@ export function Settings({
       </header>
 
       <div className="settings-body">
-        {tab === "declarative" && <DeclarativeTab notify={notify} onDataChanged={onDataChanged} />}
-        {tab === "vault" && <VaultTab notify={notify} onDataChanged={onDataChanged} />}
+        {tab === "declarative" && (
+          <DeclarativeTab
+            activeAccountEmail={activeAccountEmail}
+            notify={notify}
+            onDataChanged={onDataChanged}
+          />
+        )}
+        {tab === "vault" && (
+          <VaultTab
+            activeAccountEmail={activeAccountEmail}
+            notify={notify}
+            onDataChanged={onDataChanged}
+          />
+        )}
         {tab === "visual" && (
           <VisualTab
+            accountIntent={accountIntent}
+            activeAccountEmail={activeAccountEmail}
             hasDemo={hasDemo}
             notify={notify}
             onAccountSaved={onAccountSaved}
+            onSwitchAccount={onSwitchAccount}
             onDataChanged={onDataChanged}
           />
         )}
@@ -109,9 +155,11 @@ export function Settings({
 }
 
 function DeclarativeTab({
+  activeAccountEmail,
   notify,
   onDataChanged,
 }: {
+  activeAccountEmail?: string;
   notify: (t: string, e?: boolean) => void;
   onDataChanged: () => void;
 }) {
@@ -123,10 +171,12 @@ function DeclarativeTab({
   useEffect(() => {
     api.getDeclarativeConfig().then((b) => {
       setPath(b.path);
-      setSaved(b.toml);
-      setDraft(b.toml);
+      setSaved((prevSaved) => {
+        setDraft((prevDraft) => (prevDraft === prevSaved ? b.toml : prevDraft));
+        return b.toml;
+      });
     });
-  }, []);
+  }, [activeAccountEmail]);
 
   const dirty = draft !== saved;
 
@@ -179,9 +229,11 @@ function DeclarativeTab({
 }
 
 function VaultTab({
+  activeAccountEmail,
   notify,
   onDataChanged,
 }: {
+  activeAccountEmail?: string;
   notify: (t: string, e?: boolean) => void;
   onDataChanged: () => void;
 }) {
@@ -192,7 +244,11 @@ function VaultTab({
 
   useEffect(() => {
     api.listSecrets().then(setItems);
-  }, []);
+  }, [activeAccountEmail]);
+
+  const activeMailSecret = activeAccountEmail?.trim()
+    ? mailSecretKey(activeAccountEmail)
+    : null;
 
   const saveSecret = async (key: string, verify: boolean) => {
     if (!inputVal.trim() || saving) return;
@@ -245,7 +301,12 @@ function VaultTab({
                   <div className="vault-item-left">
                     <IconKey size={15} />
                     <div>
-                      <div className="vault-item-label">{item.label}</div>
+                      <div className="vault-item-label">
+                        {item.label}
+                        {activeMailSecret && item.key === activeMailSecret && (
+                          <span className="status-pill active-acc vault-inline-pill">当前邮箱</span>
+                        )}
+                      </div>
                       <div className="vault-item-ref">
                         引用标识：<code>secret:{item.key}</code>
                       </div>
@@ -325,16 +386,31 @@ function VaultTab({
 }
 
 function VisualTab({
+  accountIntent,
+  activeAccountEmail,
   hasDemo,
   notify,
   onAccountSaved,
+  onSwitchAccount,
   onDataChanged,
 }: {
+  accountIntent?: AccountFormIntent;
+  activeAccountEmail?: string;
   hasDemo: boolean;
   notify: (t: string, e?: boolean) => void;
   onAccountSaved: () => void;
+  onSwitchAccount?: (email: string) => Promise<void> | void;
   onDataChanged: () => void;
 }) {
+  const [accounts, setAccounts] = useState<AccountEntry[]>([]);
+  const [formMode, setFormMode] = useState<"edit" | "add">(
+    accountIntent?.mode === "add" ? "add" : "edit",
+  );
+  const [setActiveOnSave, setSetActiveOnSave] = useState(true);
+  const [switchingEmail, setSwitchingEmail] = useState<string | null>(null);
+  const [confirmRemoveEmail, setConfirmRemoveEmail] = useState<string | null>(null);
+  const [removingEmail, setRemovingEmail] = useState<string | null>(null);
+
   const [a, setA] = useState<Account>(EMPTY_ACCOUNT);
   const [c, setC] = useState<AgentConfig | null>(null);
   const [secrets, setSecrets] = useState<SecretStatus[]>([]);
@@ -347,19 +423,119 @@ function VisualTab({
   const [fetchedModels, setFetchedModels] = useState<string[]>([]);
   const [fetchingModels, setFetchingModels] = useState(false);
   const [showMoreProviders, setShowMoreProviders] = useState(false);
+  const emailInputRef = useRef<HTMLInputElement>(null);
 
-  const reloadAll = () => {
-    api.getAccount().then((acc) => acc && setA(acc));
-    api.getAgentConfig().then(setC);
-    api.listSecrets().then(setSecrets);
-    api.listRules().then(setRules);
+  const entryToAccount = (entry: AccountEntry): Account => ({
+    email: entry.email,
+    display_name: entry.display_name,
+    imap_host: entry.imap_host,
+    imap_port: entry.imap_port,
+    smtp_host: entry.smtp_host,
+    smtp_port: entry.smtp_port,
+    username: entry.username || entry.email,
+    password: "",
+  });
+
+  const reloadAll = async (preferAddMode = false) => {
+    const [accList, activeAcc, ag, secList, ruleList] = await Promise.all([
+      api.listAccounts().catch(() => [] as AccountEntry[]),
+      api.getAccount(),
+      api.getAgentConfig(),
+      api.listSecrets(),
+      api.listRules(),
+    ]);
+    setAccounts(accList);
+    setC(ag);
+    setSecrets(secList);
+    setRules(ruleList);
+
+    if (preferAddMode || accList.length === 0) {
+      setFormMode("add");
+      setA(EMPTY_ACCOUNT);
+      setSetActiveOnSave(true);
+      if (preferAddMode) {
+        requestAnimationFrame(() => emailInputRef.current?.focus());
+      }
+    } else if (activeAcc) {
+      setFormMode("edit");
+      setA({ ...activeAcc, password: "" });
+      setSetActiveOnSave(true);
+    } else if (accList[0]) {
+      setFormMode("edit");
+      setA(entryToAccount(accList[0]));
+      setSetActiveOnSave(accList[0].active);
+    }
   };
 
   useEffect(() => {
-    reloadAll();
-  }, []);
+    reloadAll(accountIntent?.mode === "add");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [accountIntent?.seq]);
 
-  const hasMailPassword = secrets.some((s) => s.key === "mail_password" && s.configured);
+  // 顶栏直接切换邮箱账号时，同步刷新账号列表与表单状态
+  useEffect(() => {
+    api
+      .listAccounts()
+      .then((list) => {
+        setAccounts(list);
+        if (formMode === "edit" && activeAccountEmail) {
+          const matched = list.find(
+            (item) => item.email.toLowerCase() === activeAccountEmail.toLowerCase(),
+          );
+          if (matched) {
+            setA(entryToAccount(matched));
+            setSetActiveOnSave(true);
+          }
+        }
+      })
+      .catch(() => {});
+    api.listSecrets().then(setSecrets).catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeAccountEmail]);
+
+  const targetMailSecretKey = mailSecretKey(a.email);
+  const hasMailPassword =
+    Boolean(a.email.trim()) &&
+    secrets.some((s) => s.key === targetMailSecretKey && s.configured);
+
+  const startAddAccount = () => {
+    setConfirmRemoveEmail(null);
+    setFormMode("add");
+    setA(EMPTY_ACCOUNT);
+    setSetActiveOnSave(true);
+    requestAnimationFrame(() => emailInputRef.current?.focus());
+  };
+
+  const startEditAccount = (entry: AccountEntry) => {
+    setConfirmRemoveEmail(null);
+    setFormMode("edit");
+    setA(entryToAccount(entry));
+    setSetActiveOnSave(entry.active);
+    requestAnimationFrame(() => emailInputRef.current?.focus());
+  };
+
+  const handleEmailChange = (rawEmail: string) => {
+    const trimmed = rawEmail.trim();
+    setA((prev) => {
+      const next: Account = {
+        ...prev,
+        email: trimmed,
+        username: !prev.username || prev.username === prev.email ? trimmed : prev.username,
+      };
+      const atIdx = trimmed.indexOf("@");
+      if (atIdx > 0) {
+        const domain = trimmed.slice(atIdx + 1).toLowerCase();
+        const preset = PRESETS[domain];
+        if (preset && (!prev.imap_host || !prev.smtp_host)) {
+          next.imap_host = preset.imap_host;
+          next.imap_port = preset.imap_port;
+          next.smtp_host = preset.smtp_host;
+          next.smtp_port = preset.smtp_port;
+        }
+      }
+      return next;
+    });
+  };
 
   const applyDomainPreset = (domain: string) => {
     const preset = PRESETS[domain];
@@ -382,15 +558,82 @@ function VisualTab({
   const saveAccount = async () => {
     setSavingAcc(true);
     try {
-      await api.saveAccount(a);
+      const shouldActivate = accounts.length === 0 ? true : setActiveOnSave;
+      const nextList = await api.saveAccount(a, shouldActivate);
+      setAccounts(nextList);
+      setFormMode("edit");
       setA((prev) => ({ ...prev, password: "" }));
       setSecrets(await api.listSecrets());
-      notify("邮箱连接验证通过，已同步声明式配置！");
-      onAccountSaved();
+      onDataChanged();
+      if (shouldActivate) {
+        notify(`邮箱 ${a.email} 验证通过，已切换为当前使用账号`);
+        onAccountSaved();
+      } else {
+        notify(`已保存邮箱账号 ${a.email}（保留当前主用账号不变）`);
+      }
     } catch (e) {
       notify(String(e), true);
     } finally {
       setSavingAcc(false);
+    }
+  };
+
+  const handleQuickSwitch = async (email: string) => {
+    if (switchingEmail) return;
+    setSwitchingEmail(email);
+    setConfirmRemoveEmail(null);
+    try {
+      if (onSwitchAccount) {
+        await onSwitchAccount(email);
+      } else {
+        const nextList = await api.switchAccount(email);
+        setAccounts(nextList);
+        onDataChanged();
+        notify(`已切换至邮箱 ${email}`);
+      }
+      const refreshed = await api.listAccounts();
+      setAccounts(refreshed);
+      const activeEntry = refreshed.find((x) => x.active);
+      if (activeEntry) {
+        setFormMode("edit");
+        setA(entryToAccount(activeEntry));
+        setSetActiveOnSave(true);
+      }
+    } catch (e) {
+      notify(`切换账号失败：${e}`, true);
+    } finally {
+      setSwitchingEmail(null);
+    }
+  };
+
+  const handleRemoveAccount = async (email: string, deleteLocalData: boolean) => {
+    if (removingEmail) return;
+    setRemovingEmail(email);
+    try {
+      const nextList = await api.removeAccount(email, deleteLocalData);
+      setAccounts(nextList);
+      setConfirmRemoveEmail(null);
+      setSecrets(await api.listSecrets());
+      if (nextList.length === 0) {
+        setFormMode("add");
+        setA(EMPTY_ACCOUNT);
+        setSetActiveOnSave(true);
+      } else {
+        const activeEntry = nextList.find((x) => x.active) ?? nextList[0];
+        setFormMode("edit");
+        setA(entryToAccount(activeEntry));
+        setSetActiveOnSave(activeEntry.active);
+      }
+      onDataChanged();
+      notify(
+        deleteLocalData
+          ? `已解绑 ${email} 并清理其本地邮件缓存`
+          : `已解绑 ${email}（本地历史邮件已保留）`,
+      );
+    } catch (e) {
+      notify(`解绑账号失败：${e}`, true);
+    } finally {
+      setRemovingEmail(null);
     }
   };
 
@@ -483,96 +726,296 @@ function VisualTab({
   return (
     <div className="settings-stack">
       <div className="surface-card">
-        <div className="section-title">邮箱服务器连接 (IMAP / SMTP)</div>
-        <div className="preset-pills">
-          {["qq.com", "163.com", "126.com", "gmail.com", "outlook.com", "icloud.com", "aliyun.com"].map((d) => (
-            <button key={d} type="button" className="pill-btn" onClick={() => applyDomainPreset(d)}>
-              {PRESETS[d].label}
-            </button>
-          ))}
-        </div>
-
-        <div className="field-grid">
-          <label>
-            <span>邮箱地址</span>
-            <input
-              value={a.email}
-              onChange={(e) => setA({ ...a, email: e.target.value.trim(), username: a.username || e.target.value.trim() })}
-              placeholder="name@example.com"
-            />
-          </label>
-          <label>
-            <span>发信显示昵称</span>
-            <input
-              value={a.display_name}
-              onChange={(e) => setA({ ...a, display_name: e.target.value })}
-              placeholder="选填"
-            />
-          </label>
-          <label>
-            <span>IMAP 服务器</span>
-            <input value={a.imap_host} onChange={(e) => setA({ ...a, imap_host: e.target.value.trim() })} />
-          </label>
-          <label>
-            <span>IMAP 端口</span>
-            <input type="number" value={a.imap_port} onChange={(e) => setA({ ...a, imap_port: Number(e.target.value) })} />
-          </label>
-          <label>
-            <span>SMTP 服务器</span>
-            <input value={a.smtp_host} onChange={(e) => setA({ ...a, smtp_host: e.target.value.trim() })} />
-          </label>
-          <label>
-            <span>SMTP 端口</span>
-            <input type="number" value={a.smtp_port} onChange={(e) => setA({ ...a, smtp_port: Number(e.target.value) })} />
-          </label>
-        </div>
-
-        <label>
-          <span>
-            授权码 / 专用密码{" "}
-            {hasMailPassword && <em className="inline-ok">（保险箱已加密保存，不修改可留空）</em>}
-          </span>
-          <input
-            type="password"
-            value={a.password}
-            onChange={(e) => setA({ ...a, password: e.target.value })}
-            placeholder={hasMailPassword ? "••••••••（已存入本地隐私保险箱）" : "输入后将自动转入本地 DPAPI 隐私保险箱"}
-          />
-        </label>
-
-        <div className="row">
-          <button
-            type="button"
-            className="primary-btn"
-            onClick={saveAccount}
-            disabled={savingAcc || !a.email || (!a.password && !hasMailPassword)}
-          >
-            {savingAcc ? "正在验证连接…" : "验证并保存账号"}
-          </button>
-          <button
-            type="button"
-            className="soft-btn"
-            onClick={async () => {
-              const n = await api.loadDemoData();
-              onDataChanged();
-              notify(n > 0 ? `已载入 ${n} 封演示邮件` : "演示数据已存在");
-            }}
-          >
-            载入沙盒演示数据
-          </button>
-          {hasDemo && (
+        <div className="card-head-row">
+          <div>
+            <div className="section-title">多邮箱账号与服务器连接 (IMAP / SMTP)</div>
+            <div className="section-desc">
+              支持同时接入多个个人或工作邮箱，各账号本地会话、IMAP 同步游标与 DPAPI 授权码完全隔离；亦可随时在窗口顶栏一键切换。
+            </div>
+          </div>
+          {accounts.length > 0 && (
             <button
               type="button"
-              className="ghost-btn danger-text"
-              onClick={async () => {
-                const n = await api.clearDemoData();
-                onDataChanged();
-                notify(`已移除 ${n} 封演示邮件`);
-              }}
+              className={formMode === "add" ? "soft-btn active-soft" : "primary-btn"}
+              onClick={startAddAccount}
             >
-              清空演示数据
+              <IconPlus size={13} />
+              <span>接入新邮箱账号</span>
             </button>
           )}
+        </div>
+
+        {accounts.length > 0 && (
+          <div className="account-list-grid">
+            {accounts.map((entry) => {
+              const isEditingThis =
+                formMode === "edit" &&
+                a.email.trim().toLowerCase() === entry.email.toLowerCase();
+              const isConfirming = confirmRemoveEmail === entry.email;
+              const initial = (entry.display_name?.trim() || entry.email)[0]?.toUpperCase() || "@";
+              return (
+                <div
+                  key={entry.email}
+                  className={`account-card-row ${entry.active ? "is-active" : ""} ${isEditingThis ? "is-editing" : ""}`}
+                >
+                  <div className="account-card-main">
+                    <div className="account-card-left">
+                      <div className={`account-avatar-badge ${entry.active ? "active" : ""}`}>
+                        {initial}
+                      </div>
+                      <div className="account-card-meta">
+                        <div className="account-card-title-row">
+                          <span className="account-card-email">{entry.email}</span>
+                          {entry.display_name && (
+                            <span className="account-card-nick">({entry.display_name})</span>
+                          )}
+                          {entry.active && (
+                            <span className="status-pill active-acc">
+                              <IconCheck size={11} />
+                              当前使用
+                            </span>
+                          )}
+                          {entry.has_password ? (
+                            <span className="status-pill ok">授权码已加密</span>
+                          ) : (
+                            <span className="status-pill warn">待录入授权码</span>
+                          )}
+                          {entry.inbox_unread > 0 && (
+                            <span className="status-pill unread-acc">
+                              {entry.inbox_unread} 封未读
+                            </span>
+                          )}
+                        </div>
+                        <div className="account-card-sub">
+                          IMAP <code>{entry.imap_host || "未填"}:{entry.imap_port}</code>
+                          <span>·</span>
+                          SMTP <code>{entry.smtp_host || "未填"}:{entry.smtp_port}</code>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="account-card-actions">
+                      {!entry.active && (
+                        <button
+                          type="button"
+                          className="primary-btn compact-btn"
+                          disabled={switchingEmail === entry.email}
+                          onClick={() => handleQuickSwitch(entry.email)}
+                        >
+                          {switchingEmail === entry.email ? "切换中…" : "切换使用"}
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        className={`soft-btn compact-btn ${isEditingThis ? "active-soft" : ""}`}
+                        onClick={() => startEditAccount(entry)}
+                      >
+                        {isEditingThis ? "正在编辑" : "编辑参数"}
+                      </button>
+                      <button
+                        type="button"
+                        className="ghost-btn compact-btn danger-text"
+                        onClick={() =>
+                          setConfirmRemoveEmail(isConfirming ? null : entry.email)
+                        }
+                        title="解绑此邮箱账号"
+                      >
+                        <IconTrash size={13} />
+                        <span>解绑</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {isConfirming && (
+                    <div className="account-remove-confirm">
+                      <span className="account-remove-text">
+                        确认解绑 <b>{entry.email}</b>？（DPAPI 保险箱中对应的授权码将同步清除）
+                      </span>
+                      <div className="account-remove-btns">
+                        <button
+                          type="button"
+                          className="soft-btn compact-btn"
+                          disabled={removingEmail === entry.email}
+                          onClick={() => handleRemoveAccount(entry.email, false)}
+                        >
+                          仅解绑账号（保留本地邮件）
+                        </button>
+                        <button
+                          type="button"
+                          className="ghost-btn compact-btn danger-text"
+                          disabled={removingEmail === entry.email}
+                          onClick={() => handleRemoveAccount(entry.email, true)}
+                        >
+                          解绑并清空本地邮件
+                        </button>
+                        <button
+                          type="button"
+                          className="ghost-btn compact-btn"
+                          onClick={() => setConfirmRemoveEmail(null)}
+                        >
+                          取消
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        <div className="account-editor-box">
+          <div className="account-editor-head">
+            <div className="account-editor-title">
+              {formMode === "add" || accounts.length === 0 ? (
+                <>
+                  <span className="account-mode-tag add">新增接入</span>
+                  <span>绑定新的 IMAP / SMTP 邮箱账号</span>
+                </>
+              ) : (
+                <>
+                  <span className="account-mode-tag edit">参数编辑</span>
+                  <span>账号连接设置 · {a.email || "未选择"}</span>
+                </>
+              )}
+            </div>
+
+            <div className="account-editor-head-right">
+              {accounts.length > 0 &&
+                (formMode === "add" ||
+                  !accounts.some(
+                    (x) => x.active && x.email.toLowerCase() === a.email.trim().toLowerCase(),
+                  )) && (
+                  <label className="clean-switch compact-switch">
+                    <input
+                      type="checkbox"
+                      checked={setActiveOnSave}
+                      onChange={(e) => setSetActiveOnSave(e.target.checked)}
+                    />
+                    <span>保存后立即切换为当前使用账号</span>
+                  </label>
+                )}
+
+              {formMode === "add" && accounts.length > 0 && (
+                <button
+                  type="button"
+                  className="ghost-btn compact-btn"
+                  onClick={() => {
+                    const activeEntry = accounts.find((x) => x.active) ?? accounts[0];
+                    if (activeEntry) startEditAccount(activeEntry);
+                  }}
+                >
+                  取消新增
+                </button>
+              )}
+            </div>
+          </div>
+
+          <div className="preset-pills">
+            {["qq.com", "163.com", "126.com", "gmail.com", "outlook.com", "icloud.com", "aliyun.com"].map((d) => (
+              <button key={d} type="button" className="pill-btn" onClick={() => applyDomainPreset(d)}>
+                {PRESETS[d].label}
+              </button>
+            ))}
+          </div>
+
+          <div className="field-grid">
+            <label>
+              <span>邮箱地址</span>
+              <input
+                ref={emailInputRef}
+                value={a.email}
+                onChange={(e) => handleEmailChange(e.target.value)}
+                placeholder="name@example.com（输入后缀自动填充服务器）"
+              />
+            </label>
+            <label>
+              <span>发信显示昵称</span>
+              <input
+                value={a.display_name}
+                onChange={(e) => setA({ ...a, display_name: e.target.value })}
+                placeholder="选填，如：张三 / 工作号"
+              />
+            </label>
+            <label>
+              <span>IMAP 服务器</span>
+              <input value={a.imap_host} onChange={(e) => setA({ ...a, imap_host: e.target.value.trim() })} />
+            </label>
+            <label>
+              <span>IMAP 端口</span>
+              <input type="number" value={a.imap_port} onChange={(e) => setA({ ...a, imap_port: Number(e.target.value) })} />
+            </label>
+            <label>
+              <span>SMTP 服务器</span>
+              <input value={a.smtp_host} onChange={(e) => setA({ ...a, smtp_host: e.target.value.trim() })} />
+            </label>
+            <label>
+              <span>SMTP 端口</span>
+              <input type="number" value={a.smtp_port} onChange={(e) => setA({ ...a, smtp_port: Number(e.target.value) })} />
+            </label>
+          </div>
+
+          <label>
+            <span>
+              授权码 / 应用专用密码{" "}
+              {hasMailPassword && (
+                <em className="inline-ok">
+                  （保险箱已独立加密保存 secret:{targetMailSecretKey}，不修改可留空）
+                </em>
+              )}
+            </span>
+            <input
+              type="password"
+              value={a.password}
+              onChange={(e) => setA({ ...a, password: e.target.value })}
+              placeholder={
+                hasMailPassword
+                  ? "••••••••（该账号授权码已存入本地 DPAPI 保险箱）"
+                  : "输入后按账号独立加密存入本机 DPAPI 隐私保险箱"
+              }
+            />
+          </label>
+
+          <div className="row">
+            <button
+              type="button"
+              className="primary-btn"
+              onClick={saveAccount}
+              disabled={savingAcc || !a.email || (!a.password && !hasMailPassword)}
+            >
+              {savingAcc
+                ? "正在验证 IMAP / SMTP 连接…"
+                : formMode === "add" || accounts.length === 0
+                  ? setActiveOnSave || accounts.length === 0
+                    ? "验证并接入使用"
+                    : "验证并添加至备用账号"
+                  : "验证并保存修改"}
+            </button>
+            <button
+              type="button"
+              className="soft-btn"
+              onClick={async () => {
+                const n = await api.loadDemoData();
+                onDataChanged();
+                notify(n > 0 ? `已载入 ${n} 封演示邮件` : "演示数据已存在");
+              }}
+            >
+              载入沙盒演示数据
+            </button>
+            {hasDemo && (
+              <button
+                type="button"
+                className="ghost-btn danger-text"
+                onClick={async () => {
+                  const n = await api.clearDemoData();
+                  onDataChanged();
+                  notify(`已移除 ${n} 封演示邮件`);
+                }}
+              >
+                清空演示数据
+              </button>
+            )}
+          </div>
         </div>
       </div>
 

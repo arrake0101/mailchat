@@ -1,0 +1,16 @@
+[plugin]
+id = "otp-fast-lane"
+name = "验证码极速提取通道"
+version = "1.0.0"
+description = "在收信前置阶段毫秒级识别中英文登录验证码/动态口令，直接提取验证码并折叠进通知，零大模型 Token 消耗"
+author = "mailchat-official"
+source = "prebuilt"
+priority = 10
+
+[permissions]
+hooks = ["onBeforeTriage"]
+mail_access = "current"
+kv_storage = false
+
+[config]
+auto_archive = { default = true }
