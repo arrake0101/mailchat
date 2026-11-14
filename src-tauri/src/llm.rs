@@ -235,15 +235,14 @@ fn build_call_plans(cfg: &AgentConfig) -> Result<Vec<CallPlan>> {
                 (AdapterKind::OpenAI, "openai/v1/")
             };
 
+            // 注意：各 genai 适配器（OpenAI / OpenAIResp / Anthropic / Gemini）已通过 AuthData 自动注入鉴权头；
+            // 切勿在 extra_headers 中重复注入 lowercase "authorization"，否则会产生双 Authorization 头导致 Cloudflare 直接拦截报 400 HTML
             plans.push(CallPlan {
                 adapter,
                 endpoint_url: format!("{root}/{sub_path}"),
                 model_name,
                 auth: AuthData::from_single(api_key.to_string()),
-                extra_headers: vec![
-                    ("x-opencode-session".into(), sid.clone()),
-                    ("authorization".into(), format!("Bearer {api_key}")),
-                ],
+                extra_headers: vec![("x-opencode-session".into(), sid.clone())],
                 allow_json_mode: false,
             });
         }
@@ -335,8 +334,8 @@ fn build_call_plans(cfg: &AgentConfig) -> Result<Vec<CallPlan>> {
         } else {
             api_key.to_string()
         };
-        let extra_headers = if !api_key.is_empty() && !is_cloud {
-            vec![("authorization".into(), format!("Bearer {api_key}"))]
+        let native_extra_headers = if !api_key.is_empty() && !is_cloud {
+            vec![("Authorization".into(), format!("Bearer {api_key}"))]
         } else {
             vec![]
         };
@@ -348,7 +347,7 @@ fn build_call_plans(cfg: &AgentConfig) -> Result<Vec<CallPlan>> {
                 endpoint_url: native_root.clone(),
                 model_name: m.clone(),
                 auth: AuthData::from_single(auth_val.clone()),
-                extra_headers: extra_headers.clone(),
+                extra_headers: native_extra_headers.clone(),
                 allow_json_mode: true,
             });
             plans.push(CallPlan {
@@ -356,7 +355,7 @@ fn build_call_plans(cfg: &AgentConfig) -> Result<Vec<CallPlan>> {
                 endpoint_url: openai_root.clone(),
                 model_name: m.clone(),
                 auth: AuthData::from_single(auth_val.clone()),
-                extra_headers: extra_headers.clone(),
+                extra_headers: vec![],
                 allow_json_mode: true,
             });
         }
