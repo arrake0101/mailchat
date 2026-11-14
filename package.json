@@ -2,6 +2,7 @@
   "name": "mailchat",
   "private": true,
   "version": "0.2.0",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "start": "node scripts/run-tauri.mjs dev",
