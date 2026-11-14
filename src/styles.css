@@ -6422,29 +6422,6 @@ textarea:focus {
   flex-shrink: 0;
 }
 
-.conv-more-btn {
-  display: none;
-  width: 22px;
-  height: 22px;
-  padding: 0;
-  border-radius: 6px;
-  color: var(--ink-secondary);
-  flex-shrink: 0;
-}
-
-.conv:hover .conv-time {
-  display: none;
-}
-
-.conv:hover .conv-more-btn {
-  display: inline-flex;
-}
-
-.conv-more-btn:hover:not(:disabled) {
-  background: rgba(15, 23, 42, 0.08);
-  color: var(--ink);
-}
-
 .conv-otp-pill {
   display: inline-flex;
   align-items: center;

@@ -12,7 +12,6 @@ import {
   IconEdit,
   IconMailRead,
   IconMailUnread,
-  IconMore,
   IconMute,
   IconOtp,
   IconPin,
@@ -833,14 +832,6 @@ export function ConversationList({
                       )}
                     </div>
                     <span className="conv-time">{shortTime(c.last_date)}</span>
-                    <button
-                      type="button"
-                      className="conv-more-btn"
-                      title="更多会话操作"
-                      onClick={(e) => openItemMenu(e, c)}
-                    >
-                      <IconMore size={13} />
-                    </button>
                   </div>
                   <div className="conv-row">
                     {drafts?.[c.peer]?.trim() && selected !== c.peer ? (

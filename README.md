@@ -35,8 +35,9 @@
   - [声明式 `config.toml` 示例（脱敏形态）](#声明式-configtoml-示例脱敏形态)
 - [安装与快速开始](#安装与快速开始)
   - [方式一：Scoop 声明式安装（Windows 推荐）](#方式一scoop-声明式安装windows-推荐)
-  - [方式二：下载预编译发行包（Windows / macOS / Linux）](#方式二下载预编译发行包windows--macos--linux)
-  - [方式三：从源码开发构建](#方式三从源码开发构建)
+  - [方式二：Homebrew 声明式安装（macOS 推荐）](#方式二homebrew-声明式安装macos-推荐)
+  - [方式三：下载预编译发行包（Windows / macOS / Linux）](#方式三下载预编译发行包windows--macos--linux)
+  - [方式四：从源码开发构建](#方式四从源码开发构建)
 - [项目结构](#项目结构)
 - [隐私与安全设计原则](#隐私与安全设计原则)
 - [开源协议](#开源协议)
@@ -193,18 +194,27 @@ scoop install arrake/mailchat
 
 后续升级只需执行 `scoop update mailchat`（所有配置 `config.toml`、加密凭据保险箱 `secrets.vault.json` 与本地邮件库均保存在用户 `%APPDATA%\com.mailchat.app` 目录，版本升级零损耗）。
 
-### 方式二：下载预编译发行包（Windows / macOS / Linux）
+### 方式二：Homebrew 声明式安装（macOS 推荐）
+
+```bash
+brew tap arrake0101/tap
+brew install --cask mailchat
+```
+
+支持直接写入 `Brewfile`（`tap "arrake0101/tap"` + `cask "arrake0101/tap/mailchat"`）声明式装机。Cask 安装时会自动处理 macOS 隔离标记（`com.apple.quarantine`），装完即可直接从启动台打开，免除未公证应用「已损坏，无法打开」弹窗；后续升级执行 `brew upgrade --cask mailchat` 即可。
+
+### 方式三：下载预编译发行包（Windows / macOS / Linux）
 
 前往 [**GitHub Releases**](https://github.com/arrake0101/mailchat/releases) 下载对应平台安装包：
 
 - **Windows (`x64`)**：`MailChat_*_x64-setup.exe`（标准安装向导）或 `MailChat_*_x64-portable.zip`（免安装绿色包）
 - **macOS**：`MailChat_*_aarch64.dmg`（Apple Silicon M 系列）或 `MailChat_*_x64.dmg`（Intel）
-  - *注：macOS 首次打开未签名开源构建如遇提示，可执行 `xattr -cr /Applications/MailChat.app` 后启动*
+  - *注：若直接通过浏览器下载 `.dmg`（而非上方 Homebrew 安装），拖入 `/Applications` 后首次如遇 Gatekeeper 拦截，终端执行一次 `xattr -cr /Applications/MailChat.app` 即可正常启动*
 - **Linux (`x64`)**：`MailChat_*_amd64.deb`（Debian / Ubuntu）或 `MailChat_*_amd64.AppImage`（通用免安装）
 
 ---
 
-### 方式三：从源码开发构建
+### 方式四：从源码开发构建
 
 #### 环境准备
 - **Node.js** `>= 20` 与 `npm`
