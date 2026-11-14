@@ -111,12 +111,40 @@ pub struct MailboxStats {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AttachmentMeta {
+    #[serde(default)]
     pub id: String,
+    #[serde(default)]
     pub filename: String,
+    #[serde(default)]
     pub mime: String,
+    #[serde(default)]
     pub size: usize,
+    /// 旧版字段仅作反序列化兼容保留，禁止自动落盘缓存任何邮件附件
+    #[serde(default)]
     pub rel_path: String,
+    #[serde(default)]
     pub is_image: bool,
+    /// IMAP MIME 分段路径（如 "2"、"1.2"），仅在用户主动点击下载/预览时按需拉取
+    #[serde(default)]
+    pub part_id: String,
+    /// IMAP 分段传输编码（如 "base64"、"quoted-printable"、"7bit"、"8bit"、"binary"）
+    #[serde(default)]
+    pub encoding: String,
+    /// 该附件在原邮件附件列表中的 0-based 序号（供无 part_id 的历史记录回退定位）
+    #[serde(default)]
+    pub att_index: usize,
+    /// 用户主动通过系统“另存为”确认保存后的本地绝对路径（绝不自动写入）
+    #[serde(default)]
+    pub saved_path: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct MessageAttachmentLocator {
+    pub account_email: String,
+    pub folder: String,
+    pub uid: u32,
+    pub rfc_message_id: String,
+    pub meta: AttachmentMeta,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -150,6 +178,7 @@ pub struct Conversation {
     pub is_group: bool,
     pub members: Vec<GroupMember>,
     pub muted: bool,
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -256,6 +285,8 @@ pub struct AgentTurnRecord {
     pub changes: Vec<String>,
     #[serde(default)]
     pub config_diff: Option<crate::config::ConfigDiffReport>,
+    #[serde(default)]
+    pub snapshot_toml: String,
     pub secret_prompts: Vec<crate::vault::SecretPrompt>,
     pub suggestions: Vec<String>,
     pub created_at: i64,
@@ -270,6 +301,7 @@ pub struct NewAgentTurn<'a> {
     pub tool_steps: &'a [String],
     pub changes: &'a [String],
     pub config_diff: Option<&'a crate::config::ConfigDiffReport>,
+    pub snapshot_toml: &'a str,
     pub secret_prompts: &'a [crate::vault::SecretPrompt],
     pub suggestions: &'a [String],
 }
@@ -389,6 +421,7 @@ impl Db {
                 tool_steps_json TEXT NOT NULL DEFAULT '[]',
                 changes_json TEXT NOT NULL DEFAULT '[]',
                 config_diff_json TEXT NOT NULL DEFAULT '',
+                snapshot_toml TEXT NOT NULL DEFAULT '',
                 secret_prompts_json TEXT NOT NULL DEFAULT '[]',
                 suggestions_json TEXT NOT NULL DEFAULT '[]',
                 created_at INTEGER NOT NULL
@@ -408,6 +441,10 @@ impl Db {
         )?;
         let _ = conn.execute(
             "ALTER TABLE agent_turns ADD COLUMN config_diff_json TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE agent_turns ADD COLUMN snapshot_toml TEXT NOT NULL DEFAULT ''",
             [],
         );
 
@@ -644,6 +681,18 @@ impl Db {
 
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN attachments_json TEXT NOT NULL DEFAULT '[]'", []);
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN reply_to_json TEXT NOT NULL DEFAULT ''", []);
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS conv_prefs (
+                account_email TEXT NOT NULL DEFAULT '__unbound__',
+                peer TEXT NOT NULL,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                pinned_at INTEGER NOT NULL DEFAULT 0,
+                manual_unread INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (account_email, peer)
+            );
+            "#,
+        )?;
         // 将早期版本滞留在不可见 pending 状态的新邮件立即恢复至 inbox（AI 分拣统一通过 agent_done=0 后台推进）
         let _ = conn.execute("UPDATE messages SET status='inbox' WHERE status='pending'", []);
         // 清理日常短句聊天气泡下方冗余生成的复读型 AI 摘要框
@@ -655,11 +704,16 @@ impl Db {
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join("attachments");
+        // 安全治理：彻底清理旧版同步期间在后台自动落盘缓存的全部邮件附件（严禁未经用户确认将任何 .exe/.docx 等附件写入本地磁盘）
+        if attachments_dir.exists() {
+            let _ = std::fs::remove_dir_all(&attachments_dir);
+        }
         let db = Db(Mutex::new(conn), attachments_dir);
         let _ = db.ensure_accounts_migrated();
         Ok(db)
     }
 
+    #[allow(dead_code)]
     pub fn attachments_dir(&self) -> &Path {
         &self.1
     }
@@ -847,6 +901,7 @@ impl Db {
             let _ = c.execute("DELETE FROM sync_state WHERE account_email=?1", [&target]);
             let _ = c.execute("DELETE FROM groups WHERE account_email=?1", [&target]);
             let _ = c.execute("DELETE FROM contact_profiles WHERE account_email=?1", [&target]);
+            let _ = c.execute("DELETE FROM conv_prefs WHERE account_email=?1", [&target]);
         }
 
         self.account()
@@ -904,7 +959,28 @@ impl Db {
              GROUP BY account_email",
         )?;
         let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
-        Ok(rows.collect::<rusqlite::Result<HashMap<_, _>>>()?)
+        let mut counts = rows.collect::<rusqlite::Result<HashMap<_, _>>>()?;
+
+        let mut manual_st = c.prepare(
+            "SELECT p.account_email, COUNT(*) FROM conv_prefs p
+             WHERE p.manual_unread=1
+               AND (
+                 EXISTS (SELECT 1 FROM messages m WHERE m.account_email=p.account_email AND m.peer=p.peer AND m.status='inbox')
+                 OR EXISTS (SELECT 1 FROM groups g WHERE g.account_email=p.account_email AND g.peer=p.peer AND g.muted=0
+                            AND NOT EXISTS (SELECT 1 FROM messages m2 WHERE m2.account_email=p.account_email AND m2.peer=p.peer))
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM messages m3
+                 WHERE m3.account_email=p.account_email AND m3.peer=p.peer AND m3.status='inbox' AND m3.read=0 AND m3.outgoing=0
+               )
+             GROUP BY p.account_email",
+        )?;
+        let manual_rows = manual_st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        for item in manual_rows {
+            let (acc, n) = item?;
+            *counts.entry(acc).or_insert(0) += n;
+        }
+        Ok(counts)
     }
 
     pub fn agent_config(&self) -> Result<AgentConfig> {
@@ -1464,16 +1540,60 @@ impl Db {
         Ok(())
     }
 
+    fn all_conv_prefs_map_for(&self, account_email: &str) -> Result<HashMap<String, (bool, i64, bool)>> {
+        let scope = scope_key(account_email);
+        let c = self.0.lock().unwrap();
+        let mut st = c.prepare(
+            "SELECT peer, pinned, pinned_at, manual_unread FROM conv_prefs WHERE account_email=?1",
+        )?;
+        let rows = st.query_map([scope], |r| {
+            let peer: String = r.get(0)?;
+            let pinned: bool = r.get(1)?;
+            let pinned_at: i64 = r.get(2)?;
+            let manual_unread: bool = r.get(3)?;
+            Ok((peer, (pinned, pinned_at, manual_unread)))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<HashMap<_, _>>>()?)
+    }
+
     pub fn stats(&self) -> Result<MailboxStats> {
         let scope = self.active_scope_email()?;
         let c = self.0.lock().unwrap();
-        let inbox_unread: i64 = c.query_row(
+        let inbox_msg_unread: i64 = c.query_row(
             "SELECT COUNT(*) FROM messages WHERE account_email=?1 AND status='inbox' AND read=0 AND outgoing=0",
             [&scope],
             |r| r.get(0),
         )?;
-        let archived_unread: i64 = c.query_row(
+        let inbox_manual_unread: i64 = c.query_row(
+            "SELECT COUNT(*) FROM conv_prefs p
+             WHERE p.account_email=?1 AND p.manual_unread=1
+               AND (
+                 EXISTS (SELECT 1 FROM messages m WHERE m.account_email=?1 AND m.peer=p.peer AND m.status='inbox')
+                 OR EXISTS (SELECT 1 FROM groups g WHERE g.account_email=?1 AND g.peer=p.peer AND g.muted=0
+                            AND NOT EXISTS (SELECT 1 FROM messages m2 WHERE m2.account_email=?1 AND m2.peer=p.peer))
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM messages m3 WHERE m3.account_email=?1 AND m3.peer=p.peer AND m3.status='inbox' AND m3.read=0 AND m3.outgoing=0
+               )",
+            [&scope],
+            |r| r.get(0),
+        )?;
+        let archived_msg_unread: i64 = c.query_row(
             "SELECT COUNT(*) FROM messages WHERE account_email=?1 AND status='archived' AND read=0 AND outgoing=0",
+            [&scope],
+            |r| r.get(0),
+        )?;
+        let archived_manual_unread: i64 = c.query_row(
+            "SELECT COUNT(*) FROM conv_prefs p
+             WHERE p.account_email=?1 AND p.manual_unread=1
+               AND (
+                 EXISTS (SELECT 1 FROM messages m WHERE m.account_email=?1 AND m.peer=p.peer AND m.status='archived')
+                 OR EXISTS (SELECT 1 FROM groups g WHERE g.account_email=?1 AND g.peer=p.peer AND g.muted=1
+                            AND NOT EXISTS (SELECT 1 FROM messages m2 WHERE m2.account_email=?1 AND m2.peer=p.peer))
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM messages m3 WHERE m3.account_email=?1 AND m3.peer=p.peer AND m3.status='archived' AND m3.read=0 AND m3.outgoing=0
+               )",
             [&scope],
             |r| r.get(0),
         )?;
@@ -1493,8 +1613,8 @@ impl Db {
             |r| r.get(0),
         )?;
         Ok(MailboxStats {
-            inbox_unread,
-            archived_unread,
+            inbox_unread: inbox_msg_unread + inbox_manual_unread,
+            archived_unread: archived_msg_unread + archived_manual_unread,
             blocked_count,
             pending_count,
             has_demo: demo_count > 0,
@@ -1505,6 +1625,7 @@ impl Db {
         let scope = self.active_scope_email()?;
         let groups_map = self.all_groups_map_for(&scope)?;
         let profiles_map = self.all_contact_profiles_map_for(&scope)?;
+        let prefs_map = self.all_conv_prefs_map_for(&scope)?;
         let mut list: Vec<Conversation> = {
             let c = self.0.lock().unwrap();
             let mut st = c.prepare(
@@ -1540,9 +1661,13 @@ impl Db {
                 let last_subject: String = r.get(3)?;
                 let last_atts_json: String = r.get(4)?;
                 let last_date: i64 = r.get(5)?;
-                let unread: i64 = r.get(6)?;
+                let raw_unread: i64 = r.get(6)?;
                 let count: i64 = r.get(7)?;
                 let msg_category: String = r.get(8)?;
+
+                let (pinned, _pinned_at, manual_unread) =
+                    prefs_map.get(&peer).copied().unwrap_or((false, 0, false));
+                let unread = if raw_unread == 0 && manual_unread { 1 } else { raw_unread };
 
                 let is_group = peer.starts_with("group:");
                 let att_label = attachment_preview_label(&last_atts_json);
@@ -1601,6 +1726,7 @@ impl Db {
                     is_group,
                     members,
                     muted,
+                    pinned,
                 })
             })?;
             rows.collect::<std::result::Result<_, _>>()?
@@ -1619,6 +1745,8 @@ impl Db {
                 |r| r.get(0),
             )?;
             if total_msgs == 0 {
+                let (pinned, _pinned_at, manual_unread) =
+                    prefs_map.get(&peer).copied().unwrap_or((false, 0, false));
                 list.push(Conversation {
                     peer,
                     name: g.name,
@@ -1626,45 +1754,65 @@ impl Db {
                     note: String::new(),
                     preview: format!("👥 {} 位成员，发条消息开始群聊吧", g.members.len() + 1),
                     last_date: created_at,
-                    unread: 0,
+                    unread: if manual_unread { 1 } else { 0 },
                     count: 0,
                     category: "群聊".into(),
                     is_group: true,
                     members: g.members,
                     muted: g.muted,
+                    pinned,
                 });
             }
         }
-        list.sort_by(|a, b| b.last_date.cmp(&a.last_date));
+        list.sort_by(|a, b| {
+            b.pinned.cmp(&a.pinned).then_with(|| {
+                if a.pinned && b.pinned {
+                    let pa = prefs_map.get(&a.peer).map(|x| x.1).unwrap_or(0);
+                    let pb = prefs_map.get(&b.peer).map(|x| x.1).unwrap_or(0);
+                    pb.cmp(&pa).then_with(|| b.last_date.cmp(&a.last_date))
+                } else {
+                    b.last_date.cmp(&a.last_date)
+                }
+            })
+        });
         Ok(list)
     }
 
     pub fn messages(&self, peer: &str, status: &str) -> Result<Vec<MessageDto>> {
         let scope = self.active_scope_email()?;
+        let norm_peer = if peer.trim().starts_with("group:") {
+            peer.trim().to_string()
+        } else {
+            peer.trim().to_lowercase()
+        };
         let c = self.0.lock().unwrap();
-        if peer.starts_with("group:") && status != "blocked" {
+        let _ = c.execute(
+            "UPDATE conv_prefs SET manual_unread=0 WHERE account_email=?1 AND peer=?2 AND manual_unread<>0",
+            params![scope, norm_peer],
+        );
+        if norm_peer.starts_with("group:") && status != "blocked" {
             c.execute(
                 "UPDATE messages SET read=1 WHERE account_email=?1 AND peer=?2 AND status<>'blocked' AND read=0",
-                params![scope, peer],
+                params![scope, norm_peer],
             )?;
             let mut st = c.prepare(
                 "SELECT id,peer,from_addr,from_name,subject,body,body_full,date,outgoing,status,
                         category,summary,reason,extracted_code,suggested_reply,body_html,attachments_json,reply_to_json
                  FROM messages WHERE account_email=?1 AND peer=?2 AND status<>'blocked' ORDER BY date ASC",
             )?;
-            let rows = st.query_map(params![scope, peer], row_to_dto)?;
+            let rows = st.query_map(params![scope, norm_peer], row_to_dto)?;
             return Ok(rows.collect::<std::result::Result<_, _>>()?);
         }
         c.execute(
             "UPDATE messages SET read=1 WHERE account_email=?1 AND peer=?2 AND status=?3 AND read=0",
-            params![scope, peer, status],
+            params![scope, norm_peer, status],
         )?;
         let mut st = c.prepare(
             "SELECT id,peer,from_addr,from_name,subject,body,body_full,date,outgoing,status,
                     category,summary,reason,extracted_code,suggested_reply,body_html,attachments_json,reply_to_json
              FROM messages WHERE account_email=?1 AND peer=?2 AND status=?3 ORDER BY date ASC",
         )?;
-        let rows = st.query_map(params![scope, peer, status], row_to_dto)?;
+        let rows = st.query_map(params![scope, norm_peer, status], row_to_dto)?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
@@ -1873,6 +2021,203 @@ impl Db {
     pub fn move_peer(&self, peer: &str, to_status: &str) -> Result<()> {
         let scope = self.active_scope_email()?;
         self.move_peer_for(&scope, peer, to_status)
+    }
+
+    pub fn set_peer_pinned(&self, peer: &str, pinned: bool) -> Result<()> {
+        let scope = self.active_scope_email()?;
+        let norm_peer = if peer.trim().starts_with("group:") {
+            peer.trim().to_string()
+        } else {
+            peer.trim().to_lowercase()
+        };
+        if norm_peer.is_empty() {
+            return Ok(());
+        }
+        let now = if pinned { chrono::Utc::now().timestamp() } else { 0 };
+        let c = self.0.lock().unwrap();
+        c.execute(
+            "INSERT INTO conv_prefs(account_email, peer, pinned, pinned_at, manual_unread)
+             VALUES(?1, ?2, ?3, ?4, 0)
+             ON CONFLICT(account_email, peer) DO UPDATE SET
+               pinned=excluded.pinned,
+               pinned_at=excluded.pinned_at",
+            params![scope, norm_peer, pinned as i32, now],
+        )?;
+        let _ = c.execute(
+            "DELETE FROM conv_prefs WHERE account_email=?1 AND peer=?2 AND pinned=0 AND manual_unread=0",
+            params![scope, norm_peer],
+        );
+        Ok(())
+    }
+
+    pub fn set_peer_read(&self, peer: &str, status: &str, read: bool) -> Result<()> {
+        let scope = self.active_scope_email()?;
+        let norm_peer = if peer.trim().starts_with("group:") {
+            peer.trim().to_string()
+        } else {
+            peer.trim().to_lowercase()
+        };
+        if norm_peer.is_empty() {
+            return Ok(());
+        }
+        let c = self.0.lock().unwrap();
+        if read {
+            if norm_peer.starts_with("group:") && status != "blocked" {
+                c.execute(
+                    "UPDATE messages SET read=1 WHERE account_email=?1 AND peer=?2 AND status<>'blocked' AND read=0",
+                    params![scope, norm_peer],
+                )?;
+            } else {
+                c.execute(
+                    "UPDATE messages SET read=1 WHERE account_email=?1 AND peer=?2 AND status=?3 AND read=0",
+                    params![scope, norm_peer, status],
+                )?;
+            }
+            c.execute(
+                "UPDATE conv_prefs SET manual_unread=0 WHERE account_email=?1 AND peer=?2",
+                params![scope, norm_peer],
+            )?;
+            let _ = c.execute(
+                "DELETE FROM conv_prefs WHERE account_email=?1 AND peer=?2 AND pinned=0 AND manual_unread=0",
+                params![scope, norm_peer],
+            );
+        } else {
+            let latest_incoming_id: Option<i64> = if norm_peer.starts_with("group:") && status != "blocked" {
+                c.query_row(
+                    "SELECT id FROM messages WHERE account_email=?1 AND peer=?2 AND status<>'blocked' AND outgoing=0
+                     ORDER BY date DESC, id DESC LIMIT 1",
+                    params![scope, norm_peer],
+                    |r| r.get(0),
+                )
+                .optional()?
+            } else {
+                c.query_row(
+                    "SELECT id FROM messages WHERE account_email=?1 AND peer=?2 AND status=?3 AND outgoing=0
+                     ORDER BY date DESC, id DESC LIMIT 1",
+                    params![scope, norm_peer, status],
+                    |r| r.get(0),
+                )
+                .optional()?
+            };
+
+            if let Some(mid) = latest_incoming_id {
+                c.execute("UPDATE messages SET read=0 WHERE id=?1", [mid])?;
+                c.execute(
+                    "UPDATE conv_prefs SET manual_unread=0 WHERE account_email=?1 AND peer=?2",
+                    params![scope, norm_peer],
+                )?;
+            } else {
+                c.execute(
+                    "INSERT INTO conv_prefs(account_email, peer, pinned, pinned_at, manual_unread)
+                     VALUES(?1, ?2, 0, 0, 1)
+                     ON CONFLICT(account_email, peer) DO UPDATE SET manual_unread=1",
+                    params![scope, norm_peer],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn mark_all_read(&self, status: &str) -> Result<usize> {
+        let scope = self.active_scope_email()?;
+        let c = self.0.lock().unwrap();
+        let updated = c.execute(
+            "UPDATE messages SET read=1 WHERE account_email=?1 AND status=?2 AND read=0",
+            params![scope, status],
+        )?;
+        let manual_cleared = c.execute(
+            "UPDATE conv_prefs SET manual_unread=0
+             WHERE account_email=?1 AND manual_unread=1
+               AND (
+                 EXISTS (SELECT 1 FROM messages m WHERE m.account_email=?1 AND m.peer=conv_prefs.peer AND m.status=?2)
+                 OR (?2='inbox' AND EXISTS (SELECT 1 FROM groups g WHERE g.account_email=?1 AND g.peer=conv_prefs.peer AND g.muted=0))
+                 OR (?2='archived' AND EXISTS (SELECT 1 FROM groups g WHERE g.account_email=?1 AND g.peer=conv_prefs.peer AND g.muted=1))
+               )",
+            params![scope, status],
+        )?;
+        let _ = c.execute(
+            "DELETE FROM conv_prefs WHERE account_email=?1 AND pinned=0 AND manual_unread=0",
+            [&scope],
+        );
+        Ok(updated + manual_cleared)
+    }
+
+    pub fn set_peer_muted(&self, peer: &str, muted: bool) -> Result<()> {
+        let scope = self.active_scope_email()?;
+        let trimmed = peer.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+        if trimmed.starts_with("group:") {
+            {
+                let c = self.0.lock().unwrap();
+                c.execute(
+                    "UPDATE groups SET muted=?3 WHERE account_email=?1 AND peer=?2",
+                    params![scope, trimmed, muted as i32],
+                )?;
+            }
+            let target = if muted { "archived" } else { "inbox" };
+            let _ = self.move_peer_for(&scope, trimmed, target);
+        } else {
+            let clean_email = trimmed.to_lowercase();
+            let mut profile = self.get_contact_profile_for(&scope, &clean_email)?;
+            profile.muted = muted;
+            self.save_contact_profile_for(&scope, &profile)?;
+            let target = if muted { "archived" } else { "inbox" };
+            let _ = self.move_peer_for(&scope, &clean_email, target);
+        }
+        Ok(())
+    }
+
+    pub fn delete_message(&self, id: i64) -> Result<()> {
+        let scope = self.active_scope_email()?;
+        let c = self.0.lock().unwrap();
+        c.execute(
+            "DELETE FROM messages WHERE account_email=?1 AND id=?2",
+            params![scope, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_conversation(&self, peer: &str, status: Option<&str>) -> Result<usize> {
+        let scope = self.active_scope_email()?;
+        let norm_peer = if peer.trim().starts_with("group:") {
+            peer.trim().to_string()
+        } else {
+            peer.trim().to_lowercase()
+        };
+        if norm_peer.is_empty() {
+            return Ok(0);
+        }
+        let c = self.0.lock().unwrap();
+        let deleted = match status {
+            Some(st) if !norm_peer.starts_with("group:") => c.execute(
+                "DELETE FROM messages WHERE account_email=?1 AND peer=?2 AND status=?3",
+                params![scope, norm_peer, st],
+            )?,
+            _ => c.execute(
+                "DELETE FROM messages WHERE account_email=?1 AND peer=?2",
+                params![scope, norm_peer],
+            )?,
+        };
+        let remaining: i64 = c.query_row(
+            "SELECT COUNT(*) FROM messages WHERE account_email=?1 AND peer=?2",
+            params![scope, norm_peer],
+            |r| r.get(0),
+        )?;
+        if remaining == 0 {
+            let _ = c.execute(
+                "DELETE FROM conv_prefs WHERE account_email=?1 AND peer=?2",
+                params![scope, norm_peer],
+            );
+            if norm_peer.starts_with("group:") {
+                let _ = c.execute(
+                    "DELETE FROM groups WHERE account_email=?1 AND peer=?2",
+                    params![scope, norm_peer],
+                );
+            }
+        }
+        Ok(deleted)
     }
 
     /// 等待 Agent 处理的邮件
@@ -2528,7 +2873,8 @@ impl Db {
         let c = self.0.lock().unwrap();
         let mut st = c.prepare(
             "SELECT id, session_id, role, content, thinking, thinking_ms,
-                    tool_steps_json, changes_json, config_diff_json, secret_prompts_json, suggestions_json, created_at
+                    tool_steps_json, changes_json, config_diff_json, snapshot_toml,
+                    secret_prompts_json, suggestions_json, created_at
              FROM agent_turns
              WHERE session_id = ?1
              ORDER BY id ASC",
@@ -2537,8 +2883,9 @@ impl Db {
             let tool_steps_raw: String = r.get(6)?;
             let changes_raw: String = r.get(7)?;
             let config_diff_raw: String = r.get(8)?;
-            let secret_prompts_raw: String = r.get(9)?;
-            let suggestions_raw: String = r.get(10)?;
+            let snapshot_toml: String = r.get(9)?;
+            let secret_prompts_raw: String = r.get(10)?;
+            let suggestions_raw: String = r.get(11)?;
             let config_diff = if config_diff_raw.trim().is_empty() {
                 None
             } else {
@@ -2554,9 +2901,10 @@ impl Db {
                 tool_steps: serde_json::from_str(&tool_steps_raw).unwrap_or_default(),
                 changes: serde_json::from_str(&changes_raw).unwrap_or_default(),
                 config_diff,
+                snapshot_toml,
                 secret_prompts: serde_json::from_str(&secret_prompts_raw).unwrap_or_default(),
                 suggestions: serde_json::from_str(&suggestions_raw).unwrap_or_default(),
-                created_at: r.get(11)?,
+                created_at: r.get(12)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -2581,8 +2929,9 @@ impl Db {
         c.execute(
             "INSERT INTO agent_turns(
                 session_id, role, content, thinking, thinking_ms,
-                tool_steps_json, changes_json, config_diff_json, secret_prompts_json, suggestions_json, created_at
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                tool_steps_json, changes_json, config_diff_json, snapshot_toml,
+                secret_prompts_json, suggestions_json, created_at
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 turn.session_id,
                 turn.role,
@@ -2592,6 +2941,7 @@ impl Db {
                 tool_steps_json,
                 changes_json,
                 config_diff_json,
+                turn.snapshot_toml,
                 secret_prompts_json,
                 suggestions_json,
                 now
@@ -2664,6 +3014,175 @@ impl Db {
         )?;
         Ok(())
     }
+
+    /// 回退指定配置对话至某条消息之前（删除 id >= from_turn_id 的所有消息），并返回该检查点前的脱敏 config.toml 快照
+    pub fn rewind_agent_session(&self, session_id: &str, from_turn_id: i64) -> Result<Option<String>> {
+        let now = chrono::Utc::now().timestamp();
+        let c = self.0.lock().unwrap();
+
+        let mut st = c.prepare(
+            "SELECT snapshot_toml, config_diff_json
+             FROM agent_turns
+             WHERE session_id = ?1 AND id >= ?2
+             ORDER BY id ASC",
+        )?;
+        let candidates: Vec<(String, String)> = st
+            .query_map(params![session_id, from_turn_id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(st);
+
+        let mut rollback_toml: Option<String> = None;
+        for (snap, _) in &candidates {
+            if !snap.trim().is_empty() {
+                rollback_toml = Some(snap.clone());
+                break;
+            }
+        }
+        if rollback_toml.is_none() {
+            for (_, diff_raw) in &candidates {
+                if diff_raw.trim().is_empty() {
+                    continue;
+                }
+                if let Ok(diff) = serde_json::from_str::<crate::config::ConfigDiffReport>(diff_raw) {
+                    if !diff.before_toml.trim().is_empty() {
+                        rollback_toml = Some(diff.before_toml);
+                        break;
+                    }
+                }
+            }
+        }
+
+        c.execute(
+            "DELETE FROM agent_turns WHERE session_id = ?1 AND id >= ?2",
+            params![session_id, from_turn_id],
+        )?;
+
+        let remaining: i64 = c.query_row(
+            "SELECT COUNT(*) FROM agent_turns WHERE session_id = ?1",
+            [session_id],
+            |r| r.get(0),
+        )?;
+        if remaining == 0 {
+            c.execute(
+                "UPDATE agent_sessions SET title = '新配置对话', updated_at = ?1 WHERE id = ?2",
+                params![now, session_id],
+            )?;
+        } else {
+            c.execute(
+                "UPDATE agent_sessions SET updated_at = ?1 WHERE id = ?2",
+                params![now, session_id],
+            )?;
+        }
+
+        Ok(rollback_toml)
+    }
+
+    /// 定位指定消息下的单个附件元数据及其所属邮件在 IMAP 上的坐标（仅在用户主动触发下载/图片预览时调用）
+    pub fn locate_attachment(
+        &self,
+        message_id_pk: i64,
+        att_id: &str,
+    ) -> Result<Option<MessageAttachmentLocator>> {
+        let clean_target = att_id.trim();
+        if clean_target.is_empty() {
+            return Ok(None);
+        }
+        let c = self.0.lock().unwrap();
+        let row: Option<(String, String, u32, String, String)> = c
+            .query_row(
+                "SELECT account_email, folder, uid, message_id, attachments_json FROM messages WHERE id=?1",
+                [message_id_pk],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?;
+        let Some((account_email, folder, uid, rfc_message_id, atts_raw)) = row else {
+            return Ok(None);
+        };
+        let raw_list: Vec<AttachmentMeta> = if atts_raw.trim().is_empty() || atts_raw.trim() == "[]" {
+            Vec::new()
+        } else {
+            serde_json::from_str(&atts_raw).unwrap_or_default()
+        };
+        for (idx, mut item) in raw_list.into_iter().enumerate() {
+            let legacy_rel = item.rel_path.clone();
+            normalize_single_attachment(&mut item, idx);
+            if item.id == clean_target || (!legacy_rel.is_empty() && legacy_rel == clean_target) {
+                return Ok(Some(MessageAttachmentLocator {
+                    account_email,
+                    folder,
+                    uid,
+                    rfc_message_id,
+                    meta: item,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    /// 记录用户主动在“另存为”对话框确认写入后的本地保存路径
+    pub fn record_attachment_saved_path(
+        &self,
+        message_id_pk: i64,
+        att_id: &str,
+        saved_path: &str,
+    ) -> Result<Option<AttachmentMeta>> {
+        let clean_target = att_id.trim();
+        let c = self.0.lock().unwrap();
+        let atts_raw: Option<String> = c
+            .query_row(
+                "SELECT attachments_json FROM messages WHERE id=?1",
+                [message_id_pk],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(raw) = atts_raw else {
+            return Ok(None);
+        };
+        let mut list: Vec<AttachmentMeta> = serde_json::from_str(&raw).unwrap_or_default();
+        let mut updated: Option<AttachmentMeta> = None;
+        for (idx, item) in list.iter_mut().enumerate() {
+            let legacy_rel = item.rel_path.clone();
+            normalize_single_attachment(item, idx);
+            if item.id == clean_target || (!legacy_rel.is_empty() && legacy_rel == clean_target) {
+                item.saved_path = saved_path.to_string();
+                updated = Some(item.clone());
+            }
+        }
+        if updated.is_some() {
+            let next_json = serde_json::to_string(&list)?;
+            c.execute(
+                "UPDATE messages SET attachments_json=?2 WHERE id=?1",
+                params![message_id_pk, next_json],
+            )?;
+        }
+        Ok(updated)
+    }
+}
+
+fn normalize_single_attachment(item: &mut AttachmentMeta, idx: usize) {
+    if item.id.trim().is_empty() {
+        if !item.rel_path.trim().is_empty() {
+            item.id = format!("legacy-{}", item.rel_path.trim());
+        } else {
+            item.id = format!("att-idx-{idx}");
+        }
+    }
+    if item.att_index == 0 && idx > 0 {
+        item.att_index = idx;
+    }
+    item.rel_path.clear();
+    if !item.saved_path.is_empty() && !Path::new(&item.saved_path).is_file() {
+        item.saved_path.clear();
+    }
+}
+
+fn normalize_loaded_attachments(mut items: Vec<AttachmentMeta>) -> Vec<AttachmentMeta> {
+    for (idx, item) in items.iter_mut().enumerate() {
+        normalize_single_attachment(item, idx);
+    }
+    items
 }
 
 fn compact_preview(raw: &str) -> String {
@@ -2759,7 +3278,7 @@ fn row_to_dto(r: &rusqlite::Row) -> rusqlite::Result<MessageDto> {
     let attachments: Vec<AttachmentMeta> = if atts_raw.trim().is_empty() || atts_raw.trim() == "[]" {
         Vec::new()
     } else {
-        serde_json::from_str(&atts_raw).unwrap_or_default()
+        normalize_loaded_attachments(serde_json::from_str(&atts_raw).unwrap_or_default())
     };
     let reply_to: Option<ReplyQuote> = if reply_raw.trim().is_empty() {
         None

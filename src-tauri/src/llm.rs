@@ -57,18 +57,35 @@ pub fn is_opencode_cfg(cfg: &AgentConfig) -> bool {
         || cfg.base_url.to_lowercase().contains("opencode.ai")
 }
 
-/// 判断当前配置是否允许免 API Key 直连（本地 Ollama、局域网远程算力或内网自定义网关）
+pub fn is_magpie_base(base: &str) -> bool {
+    base.contains(":3425")
+}
+
+pub fn is_magpie_cfg(cfg: &AgentConfig) -> bool {
+    cfg.preset.trim().eq_ignore_ascii_case("magpie") || is_magpie_base(&cfg.base_url)
+}
+
+/// 判断当前配置是否允许免 API Key 直连（Magpie 本地路由网关、本地 Ollama、局域网远程算力或内网自定义网关）
 pub fn is_keyless_allowed(cfg: &AgentConfig) -> bool {
     let p = cfg.preset.trim().to_lowercase();
     let base = cfg.base_url.trim().to_lowercase();
-    matches!(p.as_str(), "ollama" | "ollama_remote" | "custom")
+    matches!(p.as_str(), "magpie" | "ollama" | "ollama_remote" | "custom")
         || base.contains("127.0.0.1")
         || base.contains("localhost")
         || base.contains(":11434")
+        || base.contains(":3425")
 }
 
 /// 规范化用于声明式配置展示与通用兼容网关的 Base URL
 pub fn normalize_openai_base(raw_base: &str, preset: &str) -> String {
+    let p = preset.trim().to_lowercase();
+    if p == "magpie" {
+        if raw_base.trim().is_empty() {
+            return crate::magpie::configured_local_base_url();
+        }
+        return crate::magpie::normalize_magpie_base_url(raw_base);
+    }
+
     let mut b = raw_base.trim().trim_end_matches('/').to_string();
     if b.is_empty() {
         let (_, def_base, _) = model_preset_defaults(preset);
@@ -77,7 +94,9 @@ pub fn normalize_openai_base(raw_base: &str, preset: &str) -> String {
     if b.is_empty() {
         return b;
     }
-    let p = preset.trim().to_lowercase();
+    if is_magpie_base(&b) {
+        return crate::magpie::normalize_magpie_base_url(&b);
+    }
     let looks_ollama = p.starts_with("ollama")
         || b.contains(":11434")
         || b.eq_ignore_ascii_case("https://ollama.com");
@@ -128,8 +147,16 @@ pub fn normalize_opencode_model(raw_model: &str, _is_go: bool) -> String {
     m.to_string()
 }
 
-/// 适配各网关对 `deepseek-v4.1-flash` 的实际模型参数名
+/// 适配各网关对 `deepseek-v4.1-flash` 的实际模型参数名（Magpie 路由保持 `provider/model` 与 `group/*` 原样透传）
 pub fn resolve_wire_model(base: &str, raw_model: &str) -> String {
+    if is_magpie_base(base) {
+        let trimmed = raw_model.trim();
+        return trimmed
+            .strip_prefix("magpie/")
+            .unwrap_or(trimmed)
+            .trim()
+            .to_string();
+    }
     let base_lower = base.to_lowercase();
     if base_lower.contains("opencode.ai") {
         return normalize_opencode_model(raw_model, base_lower.contains("/go"));
@@ -470,6 +497,67 @@ fn unpack_genai_error(err: &genai::Error) -> (Option<u16>, String) {
     }
 }
 
+/// 异步组装调用计划：针对 Magpie 路由网关支持 `auto` 动态跟随、网关自唤醒与多路由热备顺延
+async fn prepare_call_plans(cfg: &AgentConfig) -> Result<Vec<CallPlan>> {
+    if is_magpie_cfg(cfg) {
+        let base_norm = normalize_openai_base(&cfg.base_url, "magpie");
+        let clean_v1 = ensure_trailing_slash(base_norm.trim_end_matches("/chat/completions"));
+        let api_key = cfg.api_key.trim();
+
+        let auth = if !api_key.is_empty() {
+            AuthData::from_single(api_key.to_string())
+        } else if crate::magpie::is_loopback_url(&base_norm) {
+            AuthData::from_single(crate::magpie::MAGPIE_LOOPBACK_TOKEN)
+        } else {
+            bail!(
+                "访问局域网/远程 Magpie 网关（{base_norm}）需先在「凭据保险箱」录入 Magpie 网关密钥 (Gateway Key)"
+            );
+        };
+
+        let mut runtime_models = crate::magpie::resolve_runtime_models(&base_norm, api_key).await;
+        if runtime_models.is_empty() && crate::magpie::is_loopback_url(&base_norm) {
+            if crate::magpie::try_auto_wake_once(&base_norm, api_key).await {
+                runtime_models = crate::magpie::resolve_runtime_models(&base_norm, api_key).await;
+            }
+        }
+
+        let raw_m = cfg.model.trim();
+        let clean_m = raw_m.strip_prefix("magpie/").unwrap_or(raw_m).trim();
+        let is_auto = clean_m.is_empty() || clean_m.eq_ignore_ascii_case("auto");
+
+        let candidate_models = if is_auto {
+            if runtime_models.is_empty() {
+                bail!(
+                    "未能从本机 Magpie 模型路由网关（{base_norm}）获取到可用模型。请确认 Magpie 已运行且已启用至少一个模型或路由组"
+                );
+            }
+            runtime_models
+        } else {
+            let mut list = vec![clean_m.to_string()];
+            for rm in runtime_models {
+                if !list.iter().any(|x| x == &rm) && list.len() < 3 {
+                    list.push(rm);
+                }
+            }
+            list
+        };
+
+        return Ok(candidate_models
+            .into_iter()
+            .map(|m| CallPlan {
+                adapter: AdapterKind::OpenAI,
+                endpoint_url: clean_v1.clone(),
+                model_name: m,
+                auth: auth.clone(),
+                extra_headers: vec![],
+                allow_json_mode: false,
+            })
+            .collect());
+    }
+
+    build_call_plans(cfg)
+}
+
 /// 统一的异步文本/JSON 补全入口（底层由 `genai::Client` 执行）
 pub async fn complete(
     cfg: &AgentConfig,
@@ -478,7 +566,7 @@ pub async fn complete(
     want_json: bool,
     max_tokens: u32,
 ) -> Result<String> {
-    let plans = build_call_plans(cfg)?;
+    let plans = prepare_call_plans(cfg).await?;
     let client = genai_client();
 
     let mut last_code: Option<u16> = None;
@@ -532,8 +620,9 @@ pub async fn complete(
                 let msg_low = msg.to_lowercase();
 
                 let can_try_next = idx + 1 < plans.len()
-                    && (matches!(code, Some(400 | 402 | 403 | 404 | 422)) || code.is_none())
+                    && (matches!(code, Some(400 | 402 | 403 | 404 | 422 | 502 | 503)) || code.is_none())
                     && (is_opencode_cfg(cfg)
+                        || is_magpie_cfg(cfg)
                         || cfg.preset.starts_with("ollama")
                         || msg_low.contains("model")
                         || msg_low.contains("not found")
@@ -563,7 +652,9 @@ pub async fn complete(
 }
 
 fn build_privacy_hint(cfg: &AgentConfig, code: Option<u16>, err_low: &str) -> &'static str {
-    if is_opencode_cfg(cfg)
+    if is_magpie_cfg(cfg) && code.is_none() {
+        "（提示：请确认本机 Magpie 路由网关已启动，或在「配置 → 模型接入」点击「一键唤醒本机网关」）"
+    } else if is_opencode_cfg(cfg)
         && cfg.model.to_lowercase().contains("deepseek")
         && (code == Some(403)
             || err_low.contains("privacy")
@@ -716,7 +807,7 @@ pub async fn stream_agent_step<F>(
 where
     F: FnMut(AgentStreamDelta<'_>),
 {
-    let plans = build_call_plans(cfg)?;
+    let plans = prepare_call_plans(cfg).await?;
     let client = genai_client();
     let req_has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
 
@@ -991,8 +1082,9 @@ fn should_fallback_next_plan(
 ) -> bool {
     let msg_low = msg.to_lowercase();
     idx + 1 < total_plans
-        && (matches!(code, Some(400 | 402 | 403 | 404 | 422)) || code.is_none())
+        && (matches!(code, Some(400 | 402 | 403 | 404 | 422 | 502 | 503)) || code.is_none())
         && (is_opencode_cfg(cfg)
+            || is_magpie_cfg(cfg)
             || cfg.preset.starts_with("ollama")
             || msg_low.contains("model")
             || msg_low.contains("not found")
@@ -1002,8 +1094,25 @@ fn should_fallback_next_plan(
             || msg_low.contains("unsupported"))
 }
 
-/// 动态拉取远端或本地服务可用模型列表（优先通过 `genai::Client::all_model_names` 获取，并对 OpenCode 注入会话路由头）
+/// 动态拉取远端或本地服务可用模型列表（优先通过 `genai::Client::all_model_names` 获取，支持 Magpie 路由组排序与 OpenCode 会话路由头）
 pub async fn fetch_remote_models(cfg: &AgentConfig) -> Result<Vec<String>> {
+    if is_magpie_cfg(cfg) {
+        let base_norm = normalize_openai_base(&cfg.base_url, "magpie");
+        let api_key = cfg.api_key.trim();
+        let mut report = crate::magpie::probe_magpie(Some(&base_norm), Some(api_key)).await;
+        if !report.gateway_online && crate::magpie::is_loopback_url(&base_norm) && report.cli_installed {
+            if let Ok(woken) =
+                crate::magpie::start_local_magpie_gateway(Some(&base_norm), Some(api_key)).await
+            {
+                report = woken;
+            }
+        }
+        if !report.models.is_empty() {
+            return Ok(report.models);
+        }
+        bail!("{}", report.message);
+    }
+
     if is_opencode_cfg(cfg) {
         let b_low = cfg.base_url.to_lowercase();
         let url = if cfg.preset.trim().eq_ignore_ascii_case("opencode_go") || b_low.contains("/go") {

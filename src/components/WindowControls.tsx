@@ -10,14 +10,18 @@ import {
 } from "react";
 import { api } from "../api";
 import type { AccountEntry } from "../types";
+import { copyText } from "../util";
+import { useContextMenu } from "./ContextMenu";
 import {
   IconArrowDown,
   IconArrowUp,
   IconCheck,
   IconChevron,
   IconClose,
+  IconCopy,
   IconPin,
   IconPlus,
+  IconRefresh,
   IconSliders,
   IconWinMaximize,
   IconWinMinimize,
@@ -49,6 +53,7 @@ export function toggleWindowMaximize(e: MouseEvent) {
 }
 
 export interface WindowControlsProps {
+  hydrated?: boolean;
   accountEmail?: string;
   accountName?: string;
   accounts?: AccountEntry[];
@@ -60,6 +65,8 @@ export interface WindowControlsProps {
   onReorderAccounts?: (emails: string[]) => Promise<void> | void;
   onAddAccount?: () => void;
   onManageAccounts?: () => void;
+  onSyncNow?: () => void;
+  notify?: (text: string, isError?: boolean) => void;
 }
 
 function avatarChar(displayName?: string, email?: string): string {
@@ -81,6 +88,7 @@ function getDotStatus(acc: AccountEntry, syncing: boolean, switchingAccount: boo
 
 /** 微信桌面端风格的外层顶部窗口栏（左侧品牌 + 自适应平铺/折叠多邮箱栏 + 右侧窗口控制按钮） */
 export function WindowControls({
+  hydrated = true,
   accountEmail,
   accountName,
   accounts = [],
@@ -92,7 +100,10 @@ export function WindowControls({
   onReorderAccounts,
   onAddAccount,
   onManageAccounts,
+  onSyncNow,
+  notify,
 }: WindowControlsProps) {
+  const { openContextMenu } = useContextMenu();
   const [maximized, setMaximized] = useState(false);
   const [pinned, setPinned] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -382,8 +393,12 @@ export function WindowControls({
     onReorderAccounts?.(next);
   };
 
-  const emptyLabel = hasDemo ? "演示信箱 · 点击绑定邮箱" : "未绑定邮箱 · 点击配置";
-  const emptyDotKind = hasDemo ? "demo" : "idle";
+  const emptyLabel = !hydrated
+    ? "正在载入信箱状态…"
+    : hasDemo
+      ? "演示信箱 · 点击绑定邮箱"
+      : "未绑定邮箱 · 点击配置";
+  const emptyDotKind = !hydrated ? "syncing" : hasDemo ? "demo" : "idle";
 
   return (
     <header
@@ -407,10 +422,44 @@ export function WindowControls({
                 if (onAddAccount) onAddAccount();
                 else onClickAccount?.();
               }}
+              onContextMenu={(e) => {
+                openContextMenu(e, [
+                  {
+                    label: "立即绑定邮箱账号",
+                    icon: <IconPlus size={14} />,
+                    accent: true,
+                    onSelect: () => {
+                      if (onAddAccount) onAddAccount();
+                      else onClickAccount?.();
+                    },
+                  },
+                  {
+                    label: "打开配置与隐私中心",
+                    icon: <IconSliders size={14} />,
+                    onSelect: () => {
+                      if (onManageAccounts) onManageAccounts();
+                      else onClickAccount?.();
+                    },
+                  },
+                  { kind: "divider" },
+                  {
+                    label: pinned ? "取消窗口置顶" : "窗口始终置顶",
+                    checked: pinned,
+                    icon: <IconPin size={14} />,
+                    onSelect: async () => {
+                      try {
+                        setPinned(await api.windowAction("toggle_pin"));
+                      } catch {
+                        // ignore
+                      }
+                    },
+                  },
+                ]);
+              }}
               title={
                 hasDemo
-                  ? "当前展示本地演示会话，点击绑定真实 IMAP / SMTP 邮箱"
-                  : "尚未绑定邮箱账号，点击前往配置"
+                  ? "当前展示本地演示会话，点击绑定真实 IMAP / SMTP 邮箱 · 右键快捷操作"
+                  : "尚未绑定邮箱账号，点击前往配置 · 右键快捷操作"
               }
             >
               <span className={`win-status-dot ${emptyDotKind}`} aria-hidden="true" />
@@ -419,6 +468,9 @@ export function WindowControls({
           ) : (
             <div className="win-account-strip" ref={pillsRowRef}>
               {visibleAccounts.map((acc) => {
+                const fullIdx = displayAccounts.findIndex(
+                  (x) => x.email.toLowerCase() === acc.email.toLowerCase(),
+                );
                 const isDraggingThis =
                   Boolean(dragEmail) && dragEmail!.toLowerCase() === acc.email.toLowerCase();
                 const dotKind = getDotStatus(acc, syncing, switchingAccount);
@@ -427,8 +479,8 @@ export function WindowControls({
                 const dragHint =
                   displayAccounts.length > 1 ? " · 按住左右拖动可调整前后顺序" : "";
                 const pillTitle = acc.active
-                  ? `当前使用：${nickPart}${acc.email}（点击展开账号菜单${dragHint}）`
-                  : `点击切换至：${nickPart}${acc.email}${dragHint}`;
+                  ? `当前使用：${nickPart}${acc.email}（点击展开账号菜单${dragHint} · 右键快捷操作）`
+                  : `点击切换至：${nickPart}${acc.email}${dragHint} · 右键快捷操作`;
 
                 return (
                   <button
@@ -447,6 +499,84 @@ export function WindowControls({
                         setMenuOpen(false);
                         onSwitchAccount?.(acc.email);
                       }
+                    }}
+                    onContextMenu={(e) => {
+                      setMenuOpen(false);
+                      openContextMenu(e, [
+                        {
+                          kind: "header",
+                          label: acc.display_name?.trim() || acc.email.split("@")[0],
+                          badge: acc.active ? "当前主用" : "点击切换",
+                        },
+                        !acc.active
+                          ? {
+                              label: "切换至此邮箱账号",
+                              icon: <IconCheck size={14} />,
+                              accent: true,
+                              onSelect: () => onSwitchAccount?.(acc.email),
+                            }
+                          : null,
+                        acc.active && onSyncNow
+                          ? {
+                              label: syncing ? "正在同步收信…" : "立即同步收信",
+                              disabled: syncing,
+                              icon: <IconRefresh size={14} />,
+                              accent: true,
+                              onSelect: () => onSyncNow(),
+                            }
+                          : null,
+                        {
+                          label: "复制邮箱地址",
+                          sublabel: acc.email,
+                          icon: <IconCopy size={14} />,
+                          onSelect: async () => {
+                            await copyText(acc.email);
+                            notify?.(`已复制邮箱 ${acc.email}`);
+                          },
+                        },
+                        displayAccounts.length > 1 ? { kind: "divider" } : null,
+                        displayAccounts.length > 1 && fullIdx > 0
+                          ? {
+                              label: "在顶栏向前移动一位",
+                              icon: <IconArrowUp size={14} />,
+                              onSelect: () => {
+                                const next = displayAccounts.map((x) => x.email);
+                                const [picked] = next.splice(fullIdx, 1);
+                                next.splice(fullIdx - 1, 0, picked);
+                                void onReorderAccounts?.(next);
+                              },
+                            }
+                          : null,
+                        displayAccounts.length > 1 && fullIdx >= 0 && fullIdx < displayAccounts.length - 1
+                          ? {
+                              label: "在顶栏向后移动一位",
+                              icon: <IconArrowDown size={14} />,
+                              onSelect: () => {
+                                const next = displayAccounts.map((x) => x.email);
+                                const [picked] = next.splice(fullIdx, 1);
+                                next.splice(fullIdx + 1, 0, picked);
+                                void onReorderAccounts?.(next);
+                              },
+                            }
+                          : null,
+                        { kind: "divider" },
+                        {
+                          label: "接入新邮箱账号…",
+                          icon: <IconPlus size={14} />,
+                          onSelect: () => {
+                            if (onAddAccount) onAddAccount();
+                            else onClickAccount?.();
+                          },
+                        },
+                        {
+                          label: "管理多账号与服务器连接",
+                          icon: <IconSliders size={14} />,
+                          onSelect: () => {
+                            if (onManageAccounts) onManageAccounts();
+                            else onClickAccount?.();
+                          },
+                        },
+                      ]);
                     }}
                     title={pillTitle}
                   >

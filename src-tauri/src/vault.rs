@@ -39,6 +39,7 @@ pub struct Vault {
 
 pub const KNOWN_SECRETS: &[(&str, &str, &str)] = &[
     ("mail_password", "邮箱 IMAP/SMTP 授权码", "mail"),
+    ("llm_magpie", "Magpie 网关密钥（本机免填，仅局域网/远程网关需填）", "llm"),
     ("llm_deepseek", "DeepSeek 官网 API Key（优先推荐）", "llm"),
     ("llm_opencode_go", "OpenCode Go 订阅 API Key（优先推荐）", "llm"),
     ("llm_ollama_cloud", "Ollama 远程订阅 API Key（优先推荐）", "llm"),
@@ -55,6 +56,7 @@ pub const KNOWN_SECRETS: &[(&str, &str, &str)] = &[
 pub fn llm_secret_key(preset: &str) -> Option<&'static str> {
     match preset.trim().to_lowercase().as_str() {
         "ollama" => None,
+        "magpie" => Some("llm_magpie"),
         "opencode_go" => Some("llm_opencode_go"),
         "deepseek" => Some("llm_deepseek"),
         "openai" => Some("llm_openai"),

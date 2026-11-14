@@ -8,9 +8,18 @@ import {
   type AgentStreamPayload,
   type AgentTurnRecord,
   type ChatTurn,
+  type ConfigDiffReport,
+  type DeclarativeBundle,
+  type DeclarativeConfigSpec,
+  type MagpieProbeReport,
   type SecretPrompt,
   type SecretStatus,
 } from "../types";
+import {
+  AgentConfigInspector,
+  ConfigChangeSummaryCard,
+  type InspectorTab,
+} from "./AgentConfigInspector";
 import {
   IconChat,
   IconCheck,
@@ -27,6 +36,7 @@ import {
   IconStop,
   IconThink,
   IconTrash,
+  IconUndo,
 } from "./Icons";
 import { MarkdownText } from "./MarkdownText";
 import type { SettingsTab } from "./Settings";
@@ -40,6 +50,8 @@ interface RichTurn {
   thinkingMs?: number;
   toolSteps?: string[];
   changes?: string[];
+  configDiff?: ConfigDiffReport | null;
+  snapshotToml?: string;
   secretPrompts?: SecretPrompt[];
   suggestions?: string[];
   streaming?: boolean;
@@ -117,11 +129,23 @@ function mapRecordToRichTurn(r: AgentTurnRecord): RichTurn {
     thinkingMs: r.thinking_ms || 0,
     toolSteps: r.tool_steps || [],
     changes: r.changes || [],
+    configDiff: r.config_diff ?? null,
+    snapshotToml: r.snapshot_toml || "",
     secretPrompts: r.secret_prompts || [],
     suggestions: r.suggestions || [],
     streaming: false,
     createdAt: r.created_at,
   };
+}
+
+function extractLatestDiff(list: RichTurn[]): ConfigDiffReport | null {
+  for (let i = list.length - 1; i >= 0; i--) {
+    const d = list[i].configDiff;
+    if (d && (d.items.length > 0 || d.before_toml.trim() !== d.after_toml.trim())) {
+      return d;
+    }
+  }
+  return null;
 }
 
 function formatSessionTime(unixSecs: number): string {
@@ -140,12 +164,14 @@ function formatSessionTime(unixSecs: number): string {
 
 export function AgentWorkspace({
   activeAccountEmail,
+  onSwitchAccount,
   notify,
   onDataChanged,
   onOpenSettings,
   onGoToInbox,
 }: {
   activeAccountEmail?: string;
+  onSwitchAccount?: (email: string) => Promise<void> | void;
   notify: (text: string, isError?: boolean) => void;
   onDataChanged: () => void;
   onOpenSettings: (tab: SettingsTab) => void;
@@ -160,20 +186,28 @@ export function AgentWorkspace({
   const [busy, setBusy] = useState(false);
 
   const [agentConfig, setAgentConfig] = useState<AgentConfig | null>(null);
+  const [spec, setSpec] = useState<DeclarativeConfigSpec | null>(null);
   const [configPath, setConfigPath] = useState("");
   const [savedToml, setSavedToml] = useState("");
   const [draftToml, setDraftToml] = useState("");
   const [secrets, setSecrets] = useState<SecretStatus[]>([]);
-  const [showToml, setShowToml] = useState<boolean>(() =>
-    typeof window !== "undefined" ? window.innerWidth >= 1040 : true,
-  );
+  const [inspectorTab, setInspectorTab] = useState<InspectorTab>("visual");
+  const [activeDiff, setActiveDiff] = useState<ConfigDiffReport | null>(null);
+  const [focusSignal, setFocusSignal] = useState<{ seq: number; targetKey: string } | null>(null);
   const [applyingToml, setApplyingToml] = useState(false);
 
   const [showModelQuickMenu, setShowModelQuickMenu] = useState(false);
   const [switchingModel, setSwitchingModel] = useState(false);
+  const [magpieProbe, setMagpieProbe] = useState<MagpieProbeReport | null>(null);
 
   const [showVaultDrawer, setShowVaultDrawer] = useState(false);
   const [vaultFocusKey, setVaultFocusKey] = useState<string | null>(null);
+
+  const [rewindConfirm, setRewindConfirm] = useState<{
+    turnId: number;
+    anchor: "user" | "latest";
+  } | null>(null);
+  const [rewinding, setRewinding] = useState(false);
 
   const feedRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
@@ -187,10 +221,27 @@ export function AgentWorkspace({
   const tomlDirty = draftToml !== savedToml;
   tomlDirtyRef.current = tomlDirty;
 
+  const applyBundleState = useCallback(
+    (bundle: DeclarativeBundle, msg?: string) => {
+      setConfigPath(bundle.path);
+      setSpec(bundle.spec);
+      setSavedToml(bundle.toml);
+      setDraftToml(bundle.toml);
+      setSecrets(bundle.secrets);
+      api
+        .getAgentConfig()
+        .then(setAgentConfig)
+        .catch(() => {});
+      if (msg) notify(msg);
+    },
+    [notify],
+  );
+
   const refreshConfigState = useCallback(async () => {
     try {
       const [bundle, ag] = await Promise.all([api.getDeclarativeConfig(), api.getAgentConfig()]);
       setConfigPath(bundle.path);
+      setSpec(bundle.spec);
       setSavedToml(bundle.toml);
       if (!tomlDirtyRef.current) {
         setDraftToml(bundle.toml);
@@ -214,18 +265,28 @@ export function AgentWorkspace({
         ]);
         if (cancelled) return;
         setConfigPath(bundle.path);
+        setSpec(bundle.spec);
         setSavedToml(bundle.toml);
         setDraftToml(bundle.toml);
         setSecrets(bundle.secrets);
         setAgentConfig(ag);
         setSessions(sessList);
 
+        api
+          .probeMagpie(ag.preset === "magpie" ? ag.base_url : undefined)
+          .then((rep) => {
+            if (!cancelled) setMagpieProbe(rep);
+          })
+          .catch(() => {});
+
         if (sessList.length > 0) {
           const latestId = sessList[0].id;
           setActiveSessionId(latestId);
           const records = await api.getAgentSessionTurns(latestId);
           if (!cancelled) {
-            setTurns(records.map(mapRecordToRichTurn));
+            const mapped = records.map(mapRecordToRichTurn);
+            setTurns(mapped);
+            setActiveDiff(extractLatestDiff(mapped));
           }
         }
       } catch (e) {
@@ -237,7 +298,7 @@ export function AgentWorkspace({
     };
   }, [notify]);
 
-  // 顶栏切换当前活跃邮箱时，实时同步右侧 config.toml 与保险箱状态
+  // 顶栏切换当前活跃邮箱时，实时同步右侧可视化表单、config.toml 与保险箱状态
   const prevAccEmailRef = useRef<string | undefined>(activeAccountEmail);
   useEffect(() => {
     if (prevAccEmailRef.current !== activeAccountEmail) {
@@ -246,7 +307,7 @@ export function AgentWorkspace({
     }
   }, [activeAccountEmail, refreshConfigState]);
 
-  // 订阅 Rust 原生流式引擎实时推理增量（思考片段 / 正文片段 / 工具步骤 / 实时 TOML）
+  // 订阅 Rust 原生流式引擎实时推理增量（思考片段 / 正文片段 / 工具步骤 / 实时 TOML / 结构化 Spec 预览与 Diff）
   useEffect(() => {
     const unlistenPromise = listen<AgentStreamPayload>("agent-chat-stream", (ev) => {
       const p = ev.payload;
@@ -258,6 +319,36 @@ export function AgentWorkspace({
         setSavedToml(p.delta);
         if (!tomlDirtyRef.current) {
           setDraftToml(p.delta);
+        }
+        return;
+      }
+
+      if (p.kind === "spec_preview" && p.delta) {
+        try {
+          const parsed = JSON.parse(p.delta) as {
+            spec?: DeclarativeConfigSpec;
+            config_diff?: ConfigDiffReport | null;
+          };
+          if (parsed.spec) {
+            setSpec(parsed.spec);
+          }
+          if (
+            parsed.config_diff &&
+            (parsed.config_diff.items.length > 0 ||
+              parsed.config_diff.before_toml.trim() !== parsed.config_diff.after_toml.trim())
+          ) {
+            setActiveDiff(parsed.config_diff);
+            const tid = streamingTurnIdRef.current;
+            if (tid) {
+              setTurns((prev) =>
+                prev.map((t) =>
+                  t.id === tid ? { ...t, configDiff: parsed.config_diff } : t,
+                ),
+              );
+            }
+          }
+        } catch {
+          // ignore malformed preview payload
         }
         return;
       }
@@ -328,17 +419,27 @@ export function AgentWorkspace({
     el.style.overflowY = contentH > maxPx ? "auto" : "hidden";
   }, [input]);
 
-  // 点击外部关闭模型切换菜单
+  // 点击外部关闭模型切换菜单，并在展开菜单时自动刷新本机 Magpie 路由状态
   useEffect(() => {
     if (!showModelQuickMenu) return;
+    let cancelled = false;
+    api
+      .probeMagpie(agentConfig?.preset === "magpie" ? agentConfig.base_url : undefined)
+      .then((rep) => {
+        if (!cancelled) setMagpieProbe(rep);
+      })
+      .catch(() => {});
     const onDocClick = (e: MouseEvent) => {
       if (quickMenuRef.current && !quickMenuRef.current.contains(e.target as Node)) {
         setShowModelQuickMenu(false);
       }
     };
     document.addEventListener("mousedown", onDocClick);
-    return () => document.removeEventListener("mousedown", onDocClick);
-  }, [showModelQuickMenu]);
+    return () => {
+      cancelled = true;
+      document.removeEventListener("mousedown", onDocClick);
+    };
+  }, [showModelQuickMenu, agentConfig?.preset, agentConfig?.base_url]);
 
   const openVaultDrawer = useCallback((focusKey?: string | null) => {
     setShowModelQuickMenu(false);
@@ -360,7 +461,10 @@ export function AgentWorkspace({
       stickToBottomRef.current = true;
       setActiveSessionId(sessionId);
       const records = await api.getAgentSessionTurns(sessionId);
-      setTurns(records.map(mapRecordToRichTurn));
+      const mapped = records.map(mapRecordToRichTurn);
+      setTurns(mapped);
+      setActiveDiff(extractLatestDiff(mapped));
+      setRewindConfirm(null);
       setShowHistoryDrawer(false);
     } catch (e) {
       notify(`加载历史会话失败：${e}`, true);
@@ -377,6 +481,8 @@ export function AgentWorkspace({
       setSessions((prev) => [created, ...prev.filter((s) => s.id !== created.id)]);
       setActiveSessionId(created.id);
       setTurns([]);
+      setActiveDiff(null);
+      setRewindConfirm(null);
       setShowHistoryDrawer(false);
       stickToBottomRef.current = true;
       requestAnimationFrame(() => inputRef.current?.focus());
@@ -394,14 +500,18 @@ export function AgentWorkspace({
       const nextSessions = await api.deleteAgentSession(sessionId);
       setSessions(nextSessions);
       if (sessionId === activeSessionId) {
+        setRewindConfirm(null);
         if (nextSessions.length > 0) {
           const nextId = nextSessions[0].id;
           setActiveSessionId(nextId);
           const records = await api.getAgentSessionTurns(nextId);
-          setTurns(records.map(mapRecordToRichTurn));
+          const mapped = records.map(mapRecordToRichTurn);
+          setTurns(mapped);
+          setActiveDiff(extractLatestDiff(mapped));
         } else {
           setActiveSessionId(null);
           setTurns([]);
+          setActiveDiff(null);
         }
       }
     } catch (err) {
@@ -409,21 +519,109 @@ export function AgentWorkspace({
     }
   };
 
-  const handleClearCurrentSession = async () => {
-    if (busy) return;
-    if (!activeSessionId) {
-      setTurns([]);
-      return;
-    }
-    try {
-      const nextSessions = await api.clearAgentSessionTurns(activeSessionId);
-      setSessions(nextSessions);
-      setTurns([]);
-      notify("已清空当前配置对话记录");
-    } catch (e) {
-      notify(`清空对话失败：${e}`, true);
-    }
-  };
+  const inspectRewindFromIndex = useCallback(
+    (fromIdx: number) => {
+      const target = turns[fromIdx];
+      if (!target || typeof target.id !== "number") return null;
+      const slice = turns.slice(fromIdx);
+      const userRoundCount = Math.max(1, slice.filter((x) => x.role === "user").length);
+
+      let rollbackToml: string | null = null;
+      if (target.snapshotToml && target.snapshotToml.trim().length > 0) {
+        rollbackToml = target.snapshotToml;
+      } else {
+        for (const item of slice) {
+          if (item.configDiff?.before_toml?.trim()) {
+            rollbackToml = item.configDiff.before_toml;
+            break;
+          }
+        }
+      }
+
+      let changedItemCount = 0;
+      let hasDiffInSlice = false;
+      for (const item of slice) {
+        const d = item.configDiff;
+        if (d && (d.items.length > 0 || d.before_toml.trim() !== d.after_toml.trim())) {
+          hasDiffInSlice = true;
+          changedItemCount += d.items.length;
+        }
+      }
+      const snapshotDiffers =
+        rollbackToml !== null && rollbackToml.trim() !== savedToml.trim();
+      const hasConfigChanges =
+        Boolean(rollbackToml) && (hasDiffInSlice || snapshotDiffers);
+
+      return {
+        turnId: target.id,
+        promptText: target.content,
+        userRoundCount,
+        hasConfigChanges,
+        changedItemCount,
+      };
+    },
+    [turns, savedToml],
+  );
+
+  const executeRewind = useCallback(
+    async (turnId: number, promptText: string, restoreConfig: boolean) => {
+      if (!activeSessionId || busy || rewinding) return;
+      setRewinding(true);
+      try {
+        const res = await api.rewindAgentSession(activeSessionId, turnId, restoreConfig);
+        const mapped = res.turns.map(mapRecordToRichTurn);
+        const nextDiff = extractLatestDiff(mapped);
+        setTurns(mapped);
+        setSessions(res.sessions);
+        setActiveDiff(nextDiff);
+        if (!nextDiff && inspectorTab === "diff") {
+          setInspectorTab("visual");
+        }
+        if (res.config_restored) {
+          applyBundleState(res.bundle);
+          onDataChanged();
+        }
+        setRewindConfirm(null);
+        setInput(promptText);
+        requestAnimationFrame(() => {
+          const el = inputRef.current;
+          if (el) {
+            el.focus();
+            const len = el.value.length;
+            el.setSelectionRange(len, len);
+          }
+        });
+        notify(
+          res.config_restored
+            ? "已回退对话并还原对应配置，原指令已填回输入框"
+            : "已回退至该条消息，可修改指令后重新发送",
+        );
+      } catch (e) {
+        notify(`回退对话失败：${e}`, true);
+      } finally {
+        setRewinding(false);
+      }
+    },
+    [activeSessionId, applyBundleState, busy, inspectorTab, notify, onDataChanged, rewinding],
+  );
+
+  const requestRewindAt = useCallback(
+    (fromIdx: number, anchor: "user" | "latest") => {
+      if (busy || rewinding) return;
+      const info = inspectRewindFromIndex(fromIdx);
+      if (!info) return;
+      if (!info.hasConfigChanges && info.userRoundCount <= 1) {
+        void executeRewind(info.turnId, info.promptText, false);
+        return;
+      }
+      setRewindConfirm((prev) =>
+        prev?.turnId === info.turnId && prev.anchor === anchor
+          ? null
+          : { turnId: info.turnId, anchor },
+      );
+    },
+    [busy, executeRewind, inspectRewindFromIndex, rewinding],
+  );
 
   const handleStopStreaming = async () => {
     const rid = activeRequestIdRef.current;
@@ -438,9 +636,35 @@ export function AgentWorkspace({
     if (switchingModel) return;
     setSwitchingModel(true);
     try {
+      if (presetId === "magpie") {
+        const res = await api.connectMagpie({
+          baseUrl: agentConfig?.preset === "magpie" ? agentConfig.base_url : undefined,
+          model: modelName,
+          autoStart: true,
+        });
+        setMagpieProbe(res.probe);
+        setAgentConfig(res.agent_config);
+        setConfigPath(res.bundle.path);
+        if (res.bundle.spec) setSpec(res.bundle.spec);
+        setSavedToml(res.bundle.toml);
+        if (!tomlDirtyRef.current) {
+          setDraftToml(res.bundle.toml);
+        }
+        setSecrets(res.bundle.secrets);
+        setShowModelQuickMenu(false);
+        onDataChanged();
+        notify(
+          res.probe.gateway_online
+            ? `已切换至 Magpie 模型路由 · ${res.agent_config.model}`
+            : `已切换至 Magpie 模型路由（${res.probe.message}）`,
+        );
+        return;
+      }
+
       const res = await api.switchActiveModel(presetId, modelName);
       setAgentConfig(res.agent_config);
       setConfigPath(res.bundle.path);
+      if (res.bundle.spec) setSpec(res.bundle.spec);
       setSavedToml(res.bundle.toml);
       if (!tomlDirtyRef.current) {
         setDraftToml(res.bundle.toml);
@@ -464,6 +688,7 @@ export function AgentWorkspace({
     if (rawText === undefined) setInput("");
     setShowModelQuickMenu(false);
     setShowHistoryDrawer(false);
+    setRewindConfirm(null);
     stickToBottomRef.current = true;
 
     const reqId = `req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -479,6 +704,7 @@ export function AgentWorkspace({
       id: `user-${reqId}`,
       role: "user",
       content: msg,
+      snapshotToml: savedToml,
     };
     const optimisticAssistantTurn: RichTurn = {
       id: streamTurnId,
@@ -497,34 +723,47 @@ export function AgentWorkspace({
       const res = await api.chatWithAgent(msg, historyPayload, activeSessionId, reqId);
       setActiveSessionId(res.session_id);
       setSessions(res.sessions);
+      setSpec(res.spec);
       setSavedToml(res.toml);
       if (!tomlDirtyRef.current) {
         setDraftToml(res.toml);
       }
       setSecrets(res.secrets);
+      if (
+        res.config_diff &&
+        (res.config_diff.items.length > 0 ||
+          res.config_diff.before_toml.trim() !== res.config_diff.after_toml.trim())
+      ) {
+        setActiveDiff(res.config_diff);
+      }
       api
         .getAgentConfig()
         .then(setAgentConfig)
         .catch(() => {});
 
-      setTurns((prev) =>
-        prev.map((t) =>
-          t.id === streamTurnId
-            ? {
-                id: streamTurnId,
-                role: "assistant",
-                content: res.reply,
-                thinking: res.thinking,
-                thinkingMs: res.thinking_ms,
-                toolSteps: res.tool_steps,
-                changes: res.changes,
-                secretPrompts: res.secret_prompts,
-                suggestions: res.suggestions,
-                streaming: false,
-              }
-            : t,
-        ),
-      );
+      if (res.turns && res.turns.length > 0) {
+        setTurns(res.turns.map(mapRecordToRichTurn));
+      } else {
+        setTurns((prev) =>
+          prev.map((t) =>
+            t.id === streamTurnId
+              ? {
+                  id: streamTurnId,
+                  role: "assistant",
+                  content: res.reply,
+                  thinking: res.thinking,
+                  thinkingMs: res.thinking_ms,
+                  toolSteps: res.tool_steps,
+                  changes: res.changes,
+                  configDiff: res.config_diff ?? null,
+                  secretPrompts: res.secret_prompts,
+                  suggestions: res.suggestions,
+                  streaming: false,
+                }
+              : t,
+          ),
+        );
+      }
       onDataChanged();
     } catch (e) {
       setTurns((prev) => {
@@ -538,6 +777,16 @@ export function AgentWorkspace({
         }
         return prev.filter((t) => t.id !== streamTurnId);
       });
+      if (activeSessionId) {
+        api
+          .getAgentSessionTurns(activeSessionId)
+          .then((records) => {
+            if (records.length > 0) {
+              setTurns(records.map(mapRecordToRichTurn));
+            }
+          })
+          .catch(() => {});
+      }
       notify(`配置助手响应失败：${e}`, true);
     } finally {
       activeRequestIdRef.current = null;
@@ -550,19 +799,45 @@ export function AgentWorkspace({
     setApplyingToml(true);
     try {
       const b = await api.applyDeclarativeConfig(draftToml);
-      setSavedToml(b.toml);
-      setDraftToml(b.toml);
-      setSecrets(b.secrets);
-      const ag = await api.getAgentConfig();
-      setAgentConfig(ag);
+      applyBundleState(b, "声明式 config.toml 已校验并生效");
       onDataChanged();
-      notify("声明式 config.toml 已校验并生效");
     } catch (e) {
       notify(`TOML 校验失败：${e}`, true);
     } finally {
       setApplyingToml(false);
     }
   };
+
+  const handleLocateInForm = useCallback(
+    (targetKey: string, diff?: ConfigDiffReport | null) => {
+      if (diff) {
+        setActiveDiff(diff);
+      }
+      setInspectorTab("visual");
+      setFocusSignal((prev) => ({ seq: (prev?.seq ?? 0) + 1, targetKey }));
+    },
+    [],
+  );
+
+  const handleOpenDiffTab = useCallback((diff: ConfigDiffReport) => {
+    setActiveDiff(diff);
+    setInspectorTab("diff");
+  }, []);
+
+  const handleRevertBeforeToml = useCallback(
+    async (beforeToml: string) => {
+      try {
+        const b = await api.applyDeclarativeConfig(beforeToml);
+        applyBundleState(b, "已还原至该轮修改前的配置");
+        setActiveDiff(null);
+        onDataChanged();
+      } catch (e) {
+        notify(`还原配置失败：${e}`, true);
+        throw e;
+      }
+    },
+    [applyBundleState, notify, onDataChanged],
+  );
 
   // 当前激活模型元信息
   const activeMeta = useMemo(() => {
@@ -571,7 +846,11 @@ export function AgentWorkspace({
     const presetLabel = presetObj?.name ?? presetId;
     const secretSlot = presetId === "ollama" ? null : `llm_${presetId}`;
     const hasSecret = secretSlot ? secrets.some((s) => s.key === secretSlot && s.configured) : true;
+    const isLocalMagpie =
+      presetId === "magpie" &&
+      (!baseUrl || baseUrl.includes("127.0.0.1") || baseUrl.includes("localhost"));
     const keylessOk =
+      isLocalMagpie ||
       presetId === "ollama" ||
       presetId === "ollama_remote" ||
       (presetId === "custom" && Boolean(baseUrl));
@@ -579,7 +858,7 @@ export function AgentWorkspace({
     return { presetId, presetLabel, modelName, ready, secretSlot };
   }, [savedToml, agentConfig, secrets]);
 
-  // 动态提取「已配置好的模型服务商及候选模型」
+  // 动态提取「已配置好的模型服务商及候选模型」（含自动发现的本机在线 Magpie 路由）
   const configuredProviders = useMemo<ConfiguredProviderOption[]>(() => {
     const list: ConfiguredProviderOption[] = [];
     for (const preset of MODEL_PRESETS) {
@@ -590,7 +869,13 @@ export function AgentWorkspace({
       const isActive = activeMeta.presetId === preset.id;
 
       let isConfigured = false;
-      if (preset.needsKey) {
+      if (preset.id === "magpie") {
+        isConfigured =
+          isActive ||
+          Boolean(prof?.base_url?.trim()) ||
+          hasSecret ||
+          Boolean(magpieProbe?.gateway_online);
+      } else if (preset.needsKey) {
         isConfigured = hasSecret;
       } else if (preset.id === "custom") {
         const activeCustomReady =
@@ -606,35 +891,71 @@ export function AgentWorkspace({
       if (!isConfigured) continue;
 
       const savedModel =
-        (isActive ? agentConfig?.model?.trim() : prof?.model?.trim()) ||
-        prof?.model?.trim() ||
-        preset.defaultModel ||
-        activeMeta.modelName;
+        preset.id === "magpie"
+          ? (isActive ? agentConfig?.model?.trim() : prof?.model?.trim()) ||
+            magpieProbe?.recommended_model ||
+            preset.defaultModel
+          : (isActive ? agentConfig?.model?.trim() : prof?.model?.trim()) ||
+            prof?.model?.trim() ||
+            preset.defaultModel ||
+            activeMeta.modelName;
 
       const dedupModels: string[] = [];
-      for (const m of [savedModel, ...preset.models]) {
+      const rawCandidates =
+        preset.id === "magpie" && magpieProbe
+          ? [
+              savedModel,
+              "auto",
+              ...magpieProbe.agent_bindings.map((b) => b.model),
+              ...magpieProbe.groups,
+              ...magpieProbe.models,
+            ]
+          : [savedModel, ...preset.models];
+
+      for (const m of rawCandidates) {
         const trimmed = m?.trim();
         if (trimmed && !dedupModels.includes(trimmed)) {
           dedupModels.push(trimmed);
         }
       }
 
+      const maskedSecret =
+        preset.id === "magpie"
+          ? sec?.configured
+            ? sec.masked
+            : magpieProbe?.gateway_online
+              ? `本机免配 · ${magpieProbe.models.length} 模型`
+              : "免密钥直连"
+          : sec?.configured
+            ? sec.masked
+            : preset.needsKey
+              ? ""
+              : "免密钥直连";
+
       list.push({
         preset,
         isActive,
         savedModel,
-        candidateModels: dedupModels.slice(0, 6),
+        candidateModels: dedupModels.slice(0, 7),
         secretKey,
-        maskedSecret: sec?.configured ? sec.masked : preset.needsKey ? "" : "免密钥直连",
+        maskedSecret,
       });
     }
 
     list.sort((a, b) => Number(b.isActive) - Number(a.isActive));
     return list;
-  }, [agentConfig, secrets, activeMeta.presetId, activeMeta.modelName]);
+  }, [agentConfig, secrets, activeMeta.presetId, activeMeta.modelName, magpieProbe]);
 
   const configuredSecretCount = secrets.filter((s) => s.configured).length;
   const canSend = !busy && input.trim().length > 0;
+  const lastUserTurnIdx = useMemo(() => {
+    for (let i = turns.length - 1; i >= 0; i--) {
+      if (turns[i].role === "user" && typeof turns[i].id === "number") {
+        return i;
+      }
+    }
+    return -1;
+  }, [turns]);
 
   return (
     <section className="agent-workspace">
@@ -656,8 +977,8 @@ export function AgentWorkspace({
                   仅限 config.toml
                 </span>
               </div>
-              <div className="pane-subtitle">
-                编排账号、模型、过滤规则与群聊声明 · 不读取邮件正文、不代写发信
+              <div className="pane-subtitle" title="编排账号、模型、过滤规则与群聊声明 · 不读取邮件正文、不代写发信">
+                对话式编排账号、模型、规则与群聊 · 不读正文不代发
               </div>
             </div>
           </div>
@@ -698,25 +1019,6 @@ export function AgentWorkspace({
               <IconLock size={14} />
               <span>保险箱 ({configuredSecretCount})</span>
             </button>
-
-            <button
-              type="button"
-              className={`soft-btn hdr-btn ${showToml ? "active-soft" : ""}`}
-              onClick={() => setShowToml((v) => !v)}
-              title="展开或收起右侧实时 config.toml 声明式配置文件"
-            >
-              <IconCode size={14} />
-              <span>config.toml</span>
-            </button>
-
-            <button
-              type="button"
-              className="ghost-btn icon-only-btn"
-              onClick={() => onOpenSettings("visual")}
-              title="打开传统表单配置页"
-            >
-              <IconSliders size={15} />
-            </button>
           </div>
         </header>
 
@@ -735,8 +1037,8 @@ export function AgentWorkspace({
               </div>
               <h2>声明式配置助手</h2>
               <p>
-                用自然语言编排邮箱账号、模型参数、过滤规则与多人邮件群聊，变更实时同步至右侧{" "}
-                <code>config.toml</code>；密码与 API Key 走本机 DPAPI 加密通道独立存储。
+                用自然语言编排邮箱账号、模型参数、过滤规则与多人邮件群聊，变更实时同步至右侧
+                <strong>可视化表单</strong>与 <code>config.toml</code>（可自由切换），并清晰标明每次修改的具体字段。
               </p>
 
               <div className="agent-scope-strip">
@@ -785,6 +1087,31 @@ export function AgentWorkspace({
 
               {turns.map((t, idx) => {
                 const isLast = idx === turns.length - 1;
+                const canRewindUserTurn =
+                  !busy && t.role === "user" && typeof t.id === "number";
+                const isLatestUserTurn = idx === lastUserTurnIdx;
+                const userRewindInfo =
+                  canRewindUserTurn && rewindConfirm?.turnId === t.id && rewindConfirm.anchor === "user"
+                    ? inspectRewindFromIndex(idx)
+                    : null;
+
+                const canRewindLatestFromAssistant =
+                  isLast &&
+                  !busy &&
+                  !t.streaming &&
+                  t.role === "assistant" &&
+                  lastUserTurnIdx >= 0;
+                const latestUserTurn =
+                  lastUserTurnIdx >= 0 ? turns[lastUserTurnIdx] : null;
+                const latestRewindInfo =
+                  canRewindLatestFromAssistant &&
+                  latestUserTurn &&
+                  typeof latestUserTurn.id === "number" &&
+                  rewindConfirm?.turnId === latestUserTurn.id &&
+                  rewindConfirm.anchor === "latest"
+                    ? inspectRewindFromIndex(lastUserTurnIdx)
+                    : null;
+
                 return (
                   <div key={t.id} className={`agent-turn ${t.role}`}>
                     {t.role === "assistant" && (
@@ -798,6 +1125,9 @@ export function AgentWorkspace({
                         {t.role === "assistant" ? (
                           <AssistantTurnBody
                             turn={t}
+                            onLocateInForm={handleLocateInForm}
+                            onOpenDiffTab={handleOpenDiffTab}
+                            onRevertBeforeToml={handleRevertBeforeToml}
                             onSecretSaved={async (nextSecrets, msg) => {
                               setSecrets(nextSecrets);
                               await refreshConfigState();
@@ -811,20 +1141,83 @@ export function AgentWorkspace({
                         )}
                       </div>
 
-                      {isLast && !t.streaming && t.suggestions && t.suggestions.length > 0 && (
-                        <div className="followup-pills">
-                          {t.suggestions.map((sug) => (
-                            <button
-                              key={sug}
-                              type="button"
-                              className="followup-btn"
-                              onClick={() => sendPrompt(sug)}
-                              disabled={busy}
-                            >
-                              {sug}
-                            </button>
-                          ))}
+                      {canRewindUserTurn && (
+                        <div
+                          className={`agent-user-actions ${isLatestUserTurn || Boolean(userRewindInfo) ? "is-latest" : ""}`}
+                        >
+                          <button
+                            type="button"
+                            className={`agent-rewind-chip ${userRewindInfo ? "active" : ""}`}
+                            onClick={() => requestRewindAt(idx, "user")}
+                            disabled={rewinding}
+                            title="回退至此条消息前，并将指令填回输入框重新编辑"
+                          >
+                            <IconUndo size={11} />
+                            <span>{isLatestUserTurn ? "回退重编" : "回退至此"}</span>
+                          </button>
                         </div>
+                      )}
+
+                      {userRewindInfo && (
+                        <RewindConfirmCard
+                          userRoundCount={userRewindInfo.userRoundCount}
+                          hasConfigChanges={userRewindInfo.hasConfigChanges}
+                          changedItemCount={userRewindInfo.changedItemCount}
+                          rewinding={rewinding}
+                          onConfirm={(restoreCfg) =>
+                            executeRewind(userRewindInfo.turnId, userRewindInfo.promptText, restoreCfg)
+                          }
+                          onCancel={() => setRewindConfirm(null)}
+                        />
+                      )}
+
+                      {isLast &&
+                        !t.streaming &&
+                        ((t.suggestions && t.suggestions.length > 0) ||
+                          canRewindLatestFromAssistant) && (
+                          <div className="followup-pills">
+                            {t.suggestions?.map((sug) => (
+                              <button
+                                key={sug}
+                                type="button"
+                                className="followup-btn"
+                                onClick={() => sendPrompt(sug)}
+                                disabled={busy || rewinding}
+                              >
+                                {sug}
+                              </button>
+                            ))}
+
+                            {canRewindLatestFromAssistant && (
+                              <button
+                                type="button"
+                                className={`followup-rewind-btn ${latestRewindInfo ? "active" : ""}`}
+                                onClick={() => requestRewindAt(lastUserTurnIdx, "latest")}
+                                disabled={busy || rewinding}
+                                title="撤回上一轮问答并将原指令填回输入框（如修改了配置可选择同步还原）"
+                              >
+                                <IconUndo size={12} />
+                                <span>回退本轮</span>
+                              </button>
+                            )}
+                          </div>
+                        )}
+
+                      {latestRewindInfo && (
+                        <RewindConfirmCard
+                          userRoundCount={latestRewindInfo.userRoundCount}
+                          hasConfigChanges={latestRewindInfo.hasConfigChanges}
+                          changedItemCount={latestRewindInfo.changedItemCount}
+                          rewinding={rewinding}
+                          onConfirm={(restoreCfg) =>
+                            executeRewind(
+                              latestRewindInfo.turnId,
+                              latestRewindInfo.promptText,
+                              restoreCfg,
+                            )
+                          }
+                          onCancel={() => setRewindConfirm(null)}
+                        />
                       )}
                     </div>
                   </div>
@@ -956,6 +1349,20 @@ export function AgentWorkspace({
                       )}
 
                       <div className="composer-menu-divider" />
+                      {activeMeta.presetId !== "magpie" &&
+                        magpieProbe &&
+                        !magpieProbe.gateway_online &&
+                        (magpieProbe.cli_installed || magpieProbe.config_found) && (
+                          <button
+                            type="button"
+                            className="composer-menu-action"
+                            disabled={switchingModel}
+                            onClick={() => handleSwitchModel("magpie")}
+                          >
+                            <IconSparkles size={13} />
+                            <span>唤醒并免配沿用本机 Magpie 模型路由</span>
+                          </button>
+                        )}
                       <button
                         type="button"
                         className="composer-menu-action"
@@ -991,17 +1398,6 @@ export function AgentWorkspace({
                     <span>录入密钥</span>
                   </button>
                 )}
-
-                {turns.length > 0 && (
-                  <button
-                    type="button"
-                    className="composer-quick-chip"
-                    onClick={handleClearCurrentSession}
-                    disabled={busy}
-                  >
-                    <span>清空</span>
-                  </button>
-                )}
               </div>
 
               <div className="agent-composer-right">
@@ -1034,66 +1430,35 @@ export function AgentWorkspace({
         </footer>
       </div>
 
-      {showToml && (
-        <aside className="toml-pane">
-          <div
-            className="toml-head"
-            onMouseDown={startWindowDrag}
-            onDoubleClick={toggleWindowMaximize}
-          >
-            <div className="toml-head-info">
-              <div className="toml-title-row">
-                <span className="toml-filename">config.toml</span>
-                <span className="privacy-pill">
-                  <IconLock size={11} />
-                  密钥脱敏
-                </span>
-              </div>
-              {configPath && (
-                <div className="toml-path" title={configPath}>
-                  {configPath}
-                </div>
-              )}
-            </div>
-            <div className="toml-actions">
-              {tomlDirty && (
-                <button type="button" className="ghost-btn compact-btn" onClick={() => setDraftToml(savedToml)}>
-                  还原
-                </button>
-              )}
-              <button
-                type="button"
-                className={`${tomlDirty ? "primary-btn" : "soft-btn"} compact-btn`}
-                onClick={applyManualToml}
-                disabled={applyingToml || !tomlDirty}
-              >
-                {applyingToml ? "校验中…" : tomlDirty ? "应用变更" : "已同步"}
-              </button>
-              <button
-                type="button"
-                className="ghost-btn icon-only-btn toml-close-btn"
-                onClick={() => setShowToml(false)}
-                title="收起 config.toml 面板"
-              >
-                <IconClose size={14} />
-              </button>
-            </div>
-          </div>
-
-          <textarea
-            className="toml-editor"
-            spellCheck={false}
-            value={draftToml}
-            onChange={(e) => setDraftToml(e.target.value)}
-            onKeyDown={(e) => {
-              if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
-                e.preventDefault();
-                if (tomlDirty) applyManualToml();
-              }
-            }}
-          />
-        </aside>
-      )}
+      <AgentConfigInspector
+        tab={inspectorTab}
+        onTabChange={setInspectorTab}
+        spec={spec}
+        secrets={secrets}
+        configPath={configPath}
+        savedToml={savedToml}
+        draftToml={draftToml}
+        onDraftTomlChange={setDraftToml}
+        tomlDirty={tomlDirty}
+        applyingToml={applyingToml}
+        onApplyToml={applyManualToml}
+        onResetToml={() => setDraftToml(savedToml)}
+        activeDiff={activeDiff}
+        focusSignal={focusSignal}
+        onClearHighlight={() => setActiveDiff(null)}
+        onBundleUpdated={applyBundleState}
+        onSecretUpdated={async (nextSecrets, msg) => {
+          setSecrets(nextSecrets);
+          await refreshConfigState();
+          if (msg) notify(msg);
+        }}
+        onSwitchAccount={onSwitchAccount}
+        onOpenVault={openVaultDrawer}
+        onOpenFullSettings={() => onOpenSettings("visual")}
+        notify={notify}
+        onDataChanged={onDataChanged}
+        onRevertBeforeToml={handleRevertBeforeToml}
+      />
 
       {showHistoryDrawer && (
         <HistoryDrawerModal
@@ -1129,6 +1494,78 @@ export function AgentWorkspace({
         />
       )}
     </section>
+  );
+}
+
+function RewindConfirmCard({
+  userRoundCount,
+  hasConfigChanges,
+  changedItemCount,
+  rewinding,
+  onConfirm,
+  onCancel,
+}: {
+  userRoundCount: number;
+  hasConfigChanges: boolean;
+  changedItemCount: number;
+  rewinding: boolean;
+  onConfirm: (restoreConfig: boolean) => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div className="rewind-confirm-bar" role="region" aria-label="回退对话确认">
+      <div className="rewind-confirm-desc">
+        <IconUndo size={13} className="rewind-confirm-icon" />
+        <span>
+          {hasConfigChanges
+            ? userRoundCount > 1
+              ? `回退此条及后续共 ${userRoundCount} 轮对话 · 检测到期间修改了配置${changedItemCount > 0 ? ` (${changedItemCount} 项)` : ""}`
+              : `回退本轮对话 · 检测到本轮修改了配置${changedItemCount > 0 ? ` (${changedItemCount} 项)` : ""}`
+            : `确认回退此条及后续共 ${userRoundCount} 轮对话？（原指令将填回输入框）`}
+        </span>
+      </div>
+      <div className="rewind-confirm-actions">
+        {hasConfigChanges ? (
+          <>
+            <button
+              type="button"
+              className="rewind-confirm-btn primary"
+              disabled={rewinding}
+              onClick={() => onConfirm(true)}
+              title="撤回对话记录，并将 config.toml 与各项设置还原到该条消息发送前的状态"
+            >
+              {rewinding ? "回退中…" : "回退并还原配置"}
+            </button>
+            <button
+              type="button"
+              className="rewind-confirm-btn secondary"
+              disabled={rewinding}
+              onClick={() => onConfirm(false)}
+              title="仅撤回对话记录并将指令填回输入框，保留当前已生效的配置"
+            >
+              仅回退对话
+            </button>
+          </>
+        ) : (
+          <button
+            type="button"
+            className="rewind-confirm-btn primary"
+            disabled={rewinding}
+            onClick={() => onConfirm(false)}
+          >
+            {rewinding ? "回退中…" : "确认回退"}
+          </button>
+        )}
+        <button
+          type="button"
+          className="rewind-confirm-btn ghost"
+          disabled={rewinding}
+          onClick={onCancel}
+        >
+          取消
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -1241,10 +1678,16 @@ function HistoryDrawerModal({
 
 function AssistantTurnBody({
   turn,
+  onLocateInForm,
+  onOpenDiffTab,
+  onRevertBeforeToml,
   onSecretSaved,
   onSecretError,
 }: {
   turn: RichTurn;
+  onLocateInForm: (targetKey: string, diff?: ConfigDiffReport | null) => void;
+  onOpenDiffTab: (diff: ConfigDiffReport) => void;
+  onRevertBeforeToml: (beforeToml: string) => Promise<void>;
   onSecretSaved: (secrets: SecretStatus[], message: string) => void;
   onSecretError: (message: string) => void;
 }) {
@@ -1334,16 +1777,14 @@ function AssistantTurnBody({
         <div className="thinking-inline-hint">正在生成配置答复…</div>
       ) : null}
 
-      {turn.changes && turn.changes.length > 0 && (
-        <div className="applied-changes">
-          {turn.changes.map((ch, i) => (
-            <span key={i} className="change-pill">
-              <IconCheck size={12} />
-              <span>{ch}</span>
-            </span>
-          ))}
-        </div>
-      )}
+      <ConfigChangeSummaryCard
+        configDiff={turn.configDiff}
+        legacyChanges={turn.changes}
+        streaming={turn.streaming}
+        onLocateInForm={onLocateInForm}
+        onOpenDiffTab={onOpenDiffTab}
+        onRevertBeforeToml={onRevertBeforeToml}
+      />
 
       {turn.secretPrompts && turn.secretPrompts.length > 0 && (
         <div className="secret-cards-stack">
@@ -1473,7 +1914,8 @@ function VaultDrawerModal({
     : null;
   const defaultExpanded = useMemo(() => {
     if (initialFocusKey) return initialFocusKey;
-    const activeKey = activePresetId === "ollama" ? null : `llm_${activePresetId}`;
+    const activeKey =
+      activePresetId === "ollama" || activePresetId === "magpie" ? null : `llm_${activePresetId}`;
     const activeStatus = activeKey ? secrets.find((s) => s.key === activeKey) : null;
     if (activeKey && !activeStatus?.configured) return activeKey;
     return null;

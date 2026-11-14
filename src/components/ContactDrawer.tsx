@@ -25,7 +25,12 @@ interface ContactDrawerProps {
   onClose: () => void;
   onOpenSearch: () => void;
   onRunSummary: () => void;
-  onPreviewImage: (att: AttachmentMeta, dataUrl: string) => void;
+  onPreviewImage: (
+    att: AttachmentMeta,
+    dataUrl: string,
+    messageId: number,
+    savedPath?: string,
+  ) => void;
   onSaved: (profile: ContactProfile, prevMuted: boolean) => void;
   onChanged: () => void;
   notify: (text: string, isError?: boolean) => void;

@@ -3,6 +3,7 @@ export type Status = "inbox" | "archived" | "blocked";
 export type ProviderProtocol = "openai" | "anthropic" | "gemini";
 
 export type ProviderPresetId =
+  | "magpie"
   | "opencode_go"
   | "deepseek"
   | "openai"
@@ -98,8 +99,12 @@ export interface AttachmentMeta {
   filename: string;
   mime: string;
   size: number;
-  rel_path: string;
   is_image: boolean;
+  part_id?: string;
+  encoding?: string;
+  att_index?: number;
+  saved_path?: string;
+  rel_path?: string;
 }
 
 export interface SendAttachmentInput {
@@ -136,6 +141,7 @@ export interface Conversation {
   is_group: boolean;
   members: GroupMember[];
   muted: boolean;
+  pinned?: boolean;
 }
 
 export interface Message {
@@ -275,7 +281,7 @@ export interface ConfigDiffReport {
 export interface DeclarativeBundle {
   path: string;
   toml: string;
-  spec?: DeclarativeConfigSpec;
+  spec: DeclarativeConfigSpec;
   secrets: SecretStatus[];
 }
 
@@ -309,6 +315,7 @@ export interface AgentTurnRecord {
   tool_steps: string[];
   changes: string[];
   config_diff?: ConfigDiffReport | null;
+  snapshot_toml?: string;
   secret_prompts: SecretPrompt[];
   suggestions: string[];
   created_at: number;
@@ -327,6 +334,31 @@ export interface ModelSwitchResult {
   bundle: DeclarativeBundle;
 }
 
+export interface MagpieAgentBinding {
+  agent: string;
+  model: string;
+}
+
+export interface MagpieProbeReport {
+  cli_installed: boolean;
+  config_found: boolean;
+  gateway_online: boolean;
+  base_url: string;
+  port: number;
+  version: string;
+  recommended_model: string;
+  groups: string[];
+  models: string[];
+  agent_bindings: MagpieAgentBinding[];
+  message: string;
+}
+
+export interface MagpieConnectResult {
+  probe: MagpieProbeReport;
+  agent_config: AgentConfig;
+  bundle: DeclarativeBundle;
+}
+
 export interface AgentChatResponse {
   session_id: string;
   reply: string;
@@ -336,9 +368,17 @@ export interface AgentChatResponse {
   changes: string[];
   config_diff?: ConfigDiffReport | null;
   toml: string;
-  spec?: DeclarativeConfigSpec;
+  spec: DeclarativeConfigSpec;
   secrets: SecretStatus[];
   secret_prompts: SecretPrompt[];
   suggestions: string[];
   sessions: AgentSessionSummary[];
+  turns?: AgentTurnRecord[];
+}
+
+export interface RewindAgentResponse {
+  turns: AgentTurnRecord[];
+  sessions: AgentSessionSummary[];
+  config_restored: boolean;
+  bundle: DeclarativeBundle;
 }

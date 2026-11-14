@@ -10,10 +10,11 @@ import {
 } from "react";
 import { api } from "../api";
 import type { Conversation, GroupInfo, GroupMember, Message, Status } from "../types";
-import { Avatar, clockTime, dayLabel, GroupAvatar, senderColor } from "../util";
+import { Avatar, clockTime, copyText, dayLabel, GroupAvatar, senderColor } from "../util";
 import {
   AttachmentLightbox,
   BubbleAttachments,
+  cacheSentMessageImagePreviews,
   DrawerAttachmentList,
   filesToPendingAttachments,
   type LightboxItem,
@@ -21,15 +22,20 @@ import {
   type PendingAttachmentItem,
 } from "./AttachmentItems";
 import { ContactDrawer } from "./ContactDrawer";
-import { hasHtmlBody, HtmlMailView, isRichHtmlEmail } from "./HtmlMailView";
+import { type ContextMenuEntry, useContextMenu } from "./ContextMenu";
+import { hasHtmlBody, HtmlMailView, type HtmlMailContextInfo, isRichHtmlEmail } from "./HtmlMailView";
 import {
   IconArrowDown,
   IconArrowUp,
   IconAt,
+  IconBell,
+  IconChat,
   IconCheck,
   IconClose,
   IconCopy,
   IconDraft,
+  IconEdit,
+  IconExternalLink,
   IconFolder,
   IconForward,
   IconMore,
@@ -37,11 +43,18 @@ import {
   IconNote,
   IconOtp,
   IconPaperclip,
+  IconPaste,
   IconReply,
+  IconScissors,
   IconSearch,
+  IconSelectAll,
+  IconSend,
+  IconShield,
   IconSmile,
   IconSparkles,
   IconTag,
+  IconTrash,
+  IconUnmute,
   IconUsers,
 } from "./Icons";
 import { MarkdownText } from "./MarkdownText";
@@ -54,7 +67,9 @@ interface Props {
   status: Status;
   messages: Message[];
   initialDraft?: string;
+  openDrawerSeq?: number;
   onDraftChange?: (text: string) => void;
+  onStartDirectChat?: (email: string, name?: string) => void;
   onSent: (m: Message) => void;
   onChanged: () => void;
   onGroupUpdated: (grp: GroupInfo) => void;
@@ -110,12 +125,15 @@ export function ChatView({
   status,
   messages,
   initialDraft = "",
+  openDrawerSeq = 0,
   onDraftChange,
+  onStartDirectChat,
   onSent,
   onChanged,
   onGroupUpdated,
   notify,
 }: Props) {
+  const { openContextMenu } = useContextMenu();
   const [text, setTextState] = useState(initialDraft);
   const [customSubject, setCustomSubject] = useState("");
   const [showSubjectInput, setShowSubjectInput] = useState(!conv.is_group && conv.count === 0);
@@ -132,11 +150,11 @@ export function ChatView({
   const [composerHeight, setComposerHeight] = useState<number>(() => {
     try {
       const saved = Number(localStorage.getItem(COMPOSER_HEIGHT_STORAGE_KEY));
-      if (Number.isFinite(saved) && saved >= 106 && saved <= 300) return saved;
+      if (Number.isFinite(saved) && saved >= 92 && saved <= 280) return saved;
     } catch {
       // ignore
     }
-    return 132;
+    return 106;
   });
 
   // 附件与大图灯箱
@@ -152,14 +170,6 @@ export function ChatView({
   } | null>(null);
   const [flashMsgId, setFlashMsgId] = useState<number | null>(null);
   const [showScrollBottom, setShowScrollBottom] = useState(false);
-  const [ctxMenu, setCtxMenu] = useState<{
-    x: number;
-    y: number;
-    msg: Message;
-    canShowHtml: boolean;
-    showingHtml: boolean;
-    selectedText: string;
-  } | null>(null);
   const [forwardMsg, setForwardMsg] = useState<Message | null>(null);
   const [forwardManualPeer, setForwardManualPeer] = useState("");
   const [forwarding, setForwarding] = useState(false);
@@ -261,28 +271,33 @@ export function ChatView({
         openSearchBar();
       } else if (e.key === "Escape") {
         setActivePopover("none");
-        setCtxMenu(null);
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [openSearchBar]);
 
-  // 点击浮层外部自动收起表情 / AI 起草 / 发送模式菜单与右键菜单
+  // 点击浮层外部自动收起表情 / AI 起草 / @提及面板
   useEffect(() => {
-    if (activePopover === "none" && !ctxMenu) return;
+    if (activePopover === "none") return;
     const onPointerDown = (e: MouseEvent) => {
       const target = e.target as HTMLElement | null;
-      if (ctxMenu && !target?.closest(".msg-context-menu")) {
-        setCtxMenu(null);
-      }
-      if (activePopover !== "none" && !target?.closest("[data-popover-zone='true']")) {
+      if (!target?.closest("[data-popover-zone='true']")) {
         setActivePopover("none");
       }
     };
     window.addEventListener("mousedown", onPointerDown);
     return () => window.removeEventListener("mousedown", onPointerDown);
-  }, [activePopover, ctxMenu]);
+  }, [activePopover]);
+
+  useEffect(() => {
+    if (openDrawerSeq <= 0) return;
+    if (conv.is_group) {
+      setShowGroupDrawer(true);
+    } else {
+      setShowDetailDrawer(true);
+    }
+  }, [openDrawerSeq, conv.is_group]);
 
   useEffect(() => {
     if (trimmedSearch) return;
@@ -306,7 +321,6 @@ export function ChatView({
     if (!el) return;
     const dist = el.scrollHeight - el.scrollTop - el.clientHeight;
     setShowScrollBottom(dist > 240);
-    if (ctxMenu) setCtxMenu(null);
   };
 
   const scrollToLatest = () => {
@@ -321,7 +335,7 @@ export function ChatView({
 
     const onMove = (ev: MouseEvent) => {
       const delta = startY - ev.clientY;
-      latestH = Math.max(106, Math.min(300, startH + delta));
+      latestH = Math.max(92, Math.min(280, startH + delta));
       setComposerHeight(latestH);
     };
     const onUp = () => {
@@ -362,7 +376,6 @@ export function ChatView({
   };
 
   const startReplyTo = (m: Message) => {
-    setCtxMenu(null);
     const sender = m.outgoing
       ? "我"
       : (!conv.is_group ? cleanTitle : "") ||
@@ -496,6 +509,7 @@ export function ChatView({
         attPayload,
         replyTarget?.id ?? null,
       );
+      cacheSentMessageImagePreviews(m, pendingAttachments);
       setText("");
       setCustomSubject("");
       setShowSubjectInput(false);
@@ -541,34 +555,505 @@ export function ChatView({
   };
 
   const copyMessageText = async (m: Message, preferredSelection?: string) => {
-    setCtxMenu(null);
-    const content = (preferredSelection?.trim() || m.body.trim() || m.subject.trim());
+    const content = preferredSelection?.trim() || m.body.trim() || m.subject.trim();
     if (!content) {
       notify("该消息暂无可复制的文本内容");
       return;
     }
-    try {
-      await navigator.clipboard.writeText(content);
+    const ok = await copyText(content);
+    if (ok) {
       notify(preferredSelection?.trim() ? "已复制选中内容" : "已复制消息内容");
-    } catch {
+    } else {
       notify("复制失败，请手动选中复制", true);
     }
   };
 
-  const openBubbleContextMenu = (
-    e: ReactMouseEvent,
+  const pasteFromClipboardSmart = async () => {
+    try {
+      if (navigator.clipboard && typeof navigator.clipboard.read === "function") {
+        const items = await navigator.clipboard.read();
+        const imageFiles: File[] = [];
+        for (const clipItem of items) {
+          const imgType = clipItem.types.find((t) => t.startsWith("image/"));
+          if (imgType) {
+            const blob = await clipItem.getType(imgType);
+            const ext = imgType.split("/")[1]?.split("+")[0] || "png";
+            const fileName = `粘贴截图_${new Date().toISOString().slice(11, 19).replace(/:/g, "")}.${ext}`;
+            imageFiles.push(new File([blob], fileName, { type: imgType }));
+          }
+        }
+        if (imageFiles.length > 0) {
+          await appendFiles(imageFiles);
+          notify(`已从剪贴板粘贴 ${imageFiles.length} 张图片`);
+          return;
+        }
+      }
+    } catch {
+      // 若浏览器未返回图片项则回退读取文本剪贴板
+    }
+
+    try {
+      const clipText = await navigator.clipboard.readText();
+      if (clipText) {
+        insertAtCursor(clipText);
+      } else {
+        notify("剪贴板暂无可粘贴的文本或图片");
+      }
+    } catch {
+      notify("无法读取系统剪贴板，请直接使用 Ctrl+V", true);
+    }
+  };
+
+  const buildMessageMenuEntries = (
     m: Message,
-    canShowHtml: boolean,
-    showingHtml: boolean,
+    opts: {
+      canShowHtml: boolean;
+      showingHtml: boolean;
+      hasExpandable: boolean;
+      isExpanded: boolean;
+      expandLabel: string;
+      collapseLabel: string;
+      selectedText: string;
+      linkUrl: string | null;
+    },
+  ): ContextMenuEntry[] => {
+    const sender = m.outgoing
+      ? "我"
+      : (!conv.is_group ? cleanTitle : "") || m.from_name || m.from_addr.split("@")[0] || m.from_addr;
+
+    const entries: ContextMenuEntry[] = [
+      { kind: "header", label: sender, badge: clockTime(m.date) },
+    ];
+
+    if (opts.selectedText) {
+      entries.push({
+        label: "复制选中文字",
+        shortcut: "Ctrl+C",
+        icon: <IconCopy size={14} />,
+        accent: true,
+        onSelect: () => copyMessageText(m, opts.selectedText),
+      });
+    }
+
+    if (opts.linkUrl) {
+      if (opts.linkUrl.toLowerCase().startsWith("mailto:")) {
+        const addr = opts.linkUrl.slice(7).split("?")[0].trim().toLowerCase();
+        if (addr && onStartDirectChat) {
+          entries.push({
+            label: `向 ${addr} 发起单聊`,
+            icon: <IconChat size={14} />,
+            accent: true,
+            onSelect: () => onStartDirectChat(addr),
+          });
+        }
+        if (addr) {
+          entries.push({
+            label: "复制链接中的邮箱",
+            icon: <IconCopy size={14} />,
+            onSelect: async () => {
+              await copyText(addr);
+              notify(`已复制邮箱 ${addr}`);
+            },
+          });
+        }
+      } else {
+        entries.push({
+          label: "在默认浏览器打开链接",
+          icon: <IconExternalLink size={14} />,
+          onSelect: () => {
+            if (status === "blocked") {
+              const ok = window.confirm(
+                `该邮件位于「拦截」列表，确定要在外部浏览器中打开此链接吗？\n\n${opts.linkUrl}`,
+              );
+              if (!ok) return;
+            }
+            void api.openExternalUrl(opts.linkUrl!);
+          },
+        });
+        entries.push({
+          label: "复制链接地址",
+          icon: <IconCopy size={14} />,
+          onSelect: async () => {
+            await copyText(opts.linkUrl!);
+            notify("已复制链接地址");
+          },
+        });
+      }
+      entries.push({ kind: "divider" });
+    }
+
+    if (m.extracted_code) {
+      entries.push({
+        label: `复制验证码 ${m.extracted_code}`,
+        icon: <IconOtp size={14} />,
+        accent: !opts.selectedText,
+        onSelect: () => copyCode(m.extracted_code),
+      });
+    }
+
+    if (status !== "blocked") {
+      entries.push({
+        label: "引用回复",
+        icon: <IconReply size={14} />,
+        onSelect: () => startReplyTo(m),
+      });
+    }
+
+    entries.push({
+      label: "转发消息…",
+      icon: <IconForward size={14} />,
+      onSelect: () => setForwardMsg(m),
+    });
+
+    if (!m.outgoing && status !== "blocked") {
+      entries.push({
+        label: "针对此条 AI 起草回复",
+        icon: <IconDraft size={14} />,
+        onSelect: () => {
+          startReplyTo(m);
+          const snippet = (m.body.trim() || m.subject.trim()).slice(0, 180);
+          void draft(`请重点针对对方这条消息起草得体回复：${snippet}`);
+        },
+      });
+    }
+
+    entries.push({ kind: "divider" });
+
+    if (m.body.trim()) {
+      entries.push({
+        label: "复制整条消息文本",
+        icon: <IconCopy size={14} />,
+        onSelect: () => copyMessageText(m),
+      });
+    }
+
+    if (m.subject.trim()) {
+      entries.push({
+        label: "复制邮件主题",
+        sublabel: m.subject.trim().slice(0, 28),
+        icon: <IconTag size={14} />,
+        onSelect: async () => {
+          await copyText(m.subject.trim());
+          notify("已复制邮件主题");
+        },
+      });
+    }
+
+    if (!opts.showingHtml && opts.hasExpandable) {
+      entries.push({
+        label: opts.isExpanded ? opts.collapseLabel : opts.expandLabel,
+        icon: <IconNote size={14} />,
+        onSelect: () => toggle(m.id),
+      });
+    }
+
+    if (opts.canShowHtml) {
+      entries.push({
+        label: opts.showingHtml ? "切换为精简纯文本" : "切换为原版网页视图",
+        icon: <IconNote size={14} />,
+        onSelect: () => toggleHtmlMode(m.id, opts.showingHtml),
+      });
+    }
+
+    entries.push({ kind: "divider" });
+
+    if (!conv.is_group && !m.outgoing) {
+      if (status === "inbox") {
+        entries.push({
+          label: "将此封移入「通知」",
+          icon: <IconBell size={14} />,
+          onSelect: () => act(() => api.setMessageStatus(m.id, "archived"), "已移入通知折叠"),
+        });
+      } else {
+        entries.push({
+          label: "将此封移回「消息」",
+          icon: <IconChat size={14} />,
+          onSelect: () => act(() => api.setMessageStatus(m.id, "inbox"), "已移回消息列表"),
+        });
+      }
+    }
+
+    entries.push({
+      label: "删除此条本地消息",
+      icon: <IconTrash size={14} />,
+      danger: true,
+      onSelect: () => {
+        if (!window.confirm("确定从本地客户端删除此条消息记录吗？（不会删除远端邮箱服务器原件）")) {
+          return;
+        }
+        void act(() => api.deleteMessage(m.id), "已删除该条消息");
+      },
+    });
+
+    return entries;
+  };
+
+  const openBubbleContextMenu = (
+    e: ReactMouseEvent<HTMLElement>,
+    m: Message,
+    opts: {
+      canShowHtml: boolean;
+      showingHtml: boolean;
+      hasExpandable: boolean;
+      isExpanded: boolean;
+      expandLabel: string;
+      collapseLabel: string;
+    },
   ) => {
-    e.preventDefault();
-    e.stopPropagation();
     const sel = window.getSelection()?.toString().trim() ?? "";
-    const menuW = 168;
-    const menuH = 176;
-    const x = Math.min(e.clientX, window.innerWidth - menuW - 12);
-    const y = Math.min(e.clientY, window.innerHeight - menuH - 12);
-    setCtxMenu({ x, y, msg: m, canShowHtml, showingHtml, selectedText: sel });
+    const anchor = (e.target as Element | null)?.closest("a[href]") as HTMLAnchorElement | null;
+    const linkUrl = anchor?.getAttribute("href")?.trim() || null;
+    openContextMenu(
+      e,
+      buildMessageMenuEntries(m, {
+        ...opts,
+        selectedText: sel,
+        linkUrl,
+      }),
+    );
+  };
+
+  const openHtmlContextMenu = (
+    info: HtmlMailContextInfo,
+    m: Message,
+    opts: {
+      canShowHtml: boolean;
+      showingHtml: boolean;
+      hasExpandable: boolean;
+      isExpanded: boolean;
+      expandLabel: string;
+      collapseLabel: string;
+    },
+  ) => {
+    openContextMenu(
+      { x: info.clientX, y: info.clientY },
+      buildMessageMenuEntries(m, {
+        ...opts,
+        selectedText: info.selectedText,
+        linkUrl: info.linkUrl,
+      }),
+    );
+  };
+
+  const openAvatarContextMenu = (
+    e: ReactMouseEvent<HTMLElement>,
+    m: Message,
+    speakerLabel: string,
+  ) => {
+    const senderEmail = m.from_addr.trim().toLowerCase();
+    openContextMenu(e, [
+      { kind: "header", label: speakerLabel, badge: senderEmail },
+      conv.is_group && status !== "blocked"
+        ? {
+            label: `在输入框 @${speakerLabel}`,
+            icon: <IconAt size={14} />,
+            accent: true,
+            onSelect: () => insertMention(speakerLabel),
+          }
+        : null,
+      conv.is_group && senderEmail && onStartDirectChat
+        ? {
+            label: "向 TA 发起私聊",
+            icon: <IconChat size={14} />,
+            onSelect: () => onStartDirectChat(senderEmail, m.from_name || speakerLabel),
+          }
+        : null,
+      !conv.is_group
+        ? {
+            label: "查看联系人详情 / 修改备注",
+            icon: <IconEdit size={14} />,
+            accent: true,
+            onSelect: () => setShowDetailDrawer(true),
+          }
+        : null,
+      status !== "blocked"
+        ? {
+            label: "引用此条消息回复",
+            icon: <IconReply size={14} />,
+            onSelect: () => startReplyTo(m),
+          }
+        : null,
+      senderEmail
+        ? {
+            label: "复制发件人邮箱",
+            sublabel: senderEmail,
+            icon: <IconCopy size={14} />,
+            onSelect: async () => {
+              await copyText(senderEmail);
+              notify(`已复制邮箱 ${senderEmail}`);
+            },
+          }
+        : null,
+      { kind: "divider" },
+      senderEmail && status !== "blocked"
+        ? {
+            label: "屏蔽该发件人",
+            icon: <IconShield size={14} />,
+            danger: true,
+            onSelect: () => {
+              if (!window.confirm(`确定屏蔽 ${senderEmail} 并将往来邮件移入「拦截」吗？`)) return;
+              void act(() => api.blockSender(senderEmail), `已屏蔽 ${senderEmail}`);
+            },
+          }
+        : null,
+    ]);
+  };
+
+  const openHeaderContextMenu = (e: ReactMouseEvent<HTMLElement>) => {
+    const allGroupEmails = conv.is_group
+      ? conv.members.map((m) => m.email).join(", ")
+      : conv.peer;
+    openContextMenu(e, [
+      { kind: "header", label: cleanTitle },
+      {
+        label: conv.is_group ? "群聊成员与设置" : "联系人详情与修改备注",
+        icon: conv.is_group ? <IconUsers size={14} /> : <IconEdit size={14} />,
+        accent: true,
+        onSelect: () => {
+          if (conv.is_group) setShowGroupDrawer(true);
+          else setShowDetailDrawer(true);
+        },
+      },
+      messages.length > 0
+        ? {
+            label: "搜索会话聊天记录",
+            shortcut: "Ctrl+F",
+            icon: <IconSearch size={14} />,
+            onSelect: openSearchBar,
+          }
+        : null,
+      messages.length >= 2
+        ? {
+            label: conv.is_group ? "AI 提炼群聊纪要" : "AI 提炼对话要点",
+            icon: <IconNote size={14} />,
+            onSelect: () => void runSummary(),
+          }
+        : null,
+      { kind: "divider" },
+      {
+        label: conv.muted ? "关闭免打扰（移回消息）" : "开启免打扰（折叠进通知）",
+        icon: conv.muted ? <IconUnmute size={14} /> : <IconMute size={14} />,
+        onSelect: () =>
+          act(
+            () => api.setConversationMuted(conv.peer, !conv.muted),
+            conv.muted ? "已恢复正常消息提醒" : "已开启免打扰并归入通知",
+          ),
+      },
+      allGroupEmails
+        ? {
+            label: conv.is_group ? "复制全部群成员邮箱" : "复制对方邮箱地址",
+            sublabel: conv.is_group ? `共 ${conv.members.length} 位成员` : conv.peer,
+            icon: <IconCopy size={14} />,
+            onSelect: async () => {
+              await copyText(allGroupEmails);
+              notify(conv.is_group ? "已复制全部群成员邮箱" : `已复制 ${conv.peer}`);
+            },
+          }
+        : null,
+    ]);
+  };
+
+  const openComposerContextMenu = (e: ReactMouseEvent<HTMLTextAreaElement>) => {
+    const el = inputRef.current;
+    const selStart = el?.selectionStart ?? 0;
+    const selEnd = el?.selectionEnd ?? 0;
+    const hasSel = selEnd > selStart;
+    const selectedSlice = hasSel ? text.slice(selStart, selEnd) : "";
+
+    openContextMenu(e, [
+      {
+        label: "粘贴（支持截图 / 文本）",
+        shortcut: "Ctrl+V",
+        icon: <IconPaste size={14} />,
+        accent: true,
+        onSelect: () => void pasteFromClipboardSmart(),
+      },
+      {
+        label: "剪切",
+        shortcut: "Ctrl+X",
+        icon: <IconScissors size={14} />,
+        disabled: !hasSel,
+        onSelect: async () => {
+          await copyText(selectedSlice);
+          const next = text.slice(0, selStart) + text.slice(selEnd);
+          setText(next);
+          requestAnimationFrame(() => {
+            el?.focus();
+            el?.setSelectionRange(selStart, selStart);
+          });
+        },
+      },
+      {
+        label: "复制",
+        shortcut: "Ctrl+C",
+        icon: <IconCopy size={14} />,
+        disabled: !hasSel,
+        onSelect: () => copyText(selectedSlice),
+      },
+      {
+        label: "全选",
+        shortcut: "Ctrl+A",
+        icon: <IconSelectAll size={14} />,
+        disabled: text.length === 0,
+        onSelect: () => {
+          el?.focus();
+          el?.select();
+        },
+      },
+      { kind: "divider" },
+      {
+        label: "屏幕区域截图",
+        sublabel: "截图后可直接右键粘贴",
+        icon: <IconScissors size={14} />,
+        onSelect: async () => {
+          try {
+            await api.startScreenSnip();
+          } catch (err) {
+            notify(`启动截图工具失败：${err}`, true);
+          }
+        },
+      },
+      {
+        label: "发送本地图片或文件…",
+        icon: <IconFolder size={14} />,
+        onSelect: () => fileInputRef.current?.click(),
+      },
+      messages.length > 0
+        ? {
+            label: "AI 智能起草回复",
+            icon: <IconDraft size={14} />,
+            onSelect: () => void draft(),
+          }
+        : null,
+      text.trim().length > 0
+        ? {
+            label: "AI 润色当前草稿",
+            icon: <IconSparkles size={14} />,
+            onSelect: () => void polishCurrentText(POLISH_INTENTS[0].hint),
+          }
+        : null,
+      {
+        label: showSubjectInput ? "隐藏自定义邮件主题栏" : "指定邮件主题栏",
+        checked: showSubjectInput,
+        icon: <IconTag size={14} />,
+        onSelect: () => setShowSubjectInput((v) => !v),
+      },
+      text.length > 0 || pendingAttachments.length > 0
+        ? { kind: "divider" }
+        : null,
+      text.length > 0 || pendingAttachments.length > 0
+        ? {
+            label: "清空当前输入与待发附件",
+            icon: <IconTrash size={14} />,
+            danger: true,
+            onSelect: () => {
+              setText("");
+              setPendingAttachments([]);
+              setReplyTarget(null);
+            },
+          }
+        : null,
+    ]);
   };
 
   const executeForward = async (targetPeer: string, targetLabel: string) => {
@@ -748,88 +1233,102 @@ export function ChatView({
           onMouseDown={startWindowDrag}
           onDoubleClick={toggleWindowMaximize}
         >
-          <button
-            type="button"
-            className="chat-identity-trigger"
-            data-no-drag="true"
-            onClick={toggleHeaderDrawer}
-            title={conv.is_group ? "点击查看与编辑群聊信息" : "点击查看联系人详情、修改备注与管理会话"}
-          >
-            {conv.is_group ? (
-              <GroupAvatar members={conv.members} seed={conv.peer} size={38} />
-            ) : (
-              <Avatar name={cleanTitle} seed={conv.peer} size={38} />
-            )}
-            <div className="chat-title">
-              <div className="chat-name">
-                <span>
-                  {cleanTitle}
-                  {conv.is_group ? ` (${conv.members.length + 1})` : ""}
-                </span>
-                {conv.muted && (
-                  <span className="soft-chip muted">
-                    <IconMute size={11} />
-                    免打扰
+          <div className="chat-head-inner">
+            <button
+              type="button"
+              className="chat-identity-trigger"
+              data-no-drag="true"
+              onClick={toggleHeaderDrawer}
+              onContextMenu={openHeaderContextMenu}
+              title={
+                conv.is_group
+                  ? "点击查看与编辑群聊信息 · 右键快捷操作"
+                  : "点击查看联系人详情、修改备注与管理会话 · 右键快捷操作"
+              }
+            >
+              {conv.is_group ? (
+                <GroupAvatar members={conv.members} seed={conv.peer} size={38} />
+              ) : (
+                <Avatar name={cleanTitle} seed={conv.peer} size={38} />
+              )}
+              <div className="chat-title">
+                <div className="chat-name">
+                  <span className="chat-name-text">
+                    {cleanTitle}
+                    {conv.is_group ? ` (${conv.members.length + 1})` : ""}
                   </span>
-                )}
-                {conv.category && <span className="soft-chip">{conv.category}</span>}
+                  {conv.muted && (
+                    <span className="soft-chip muted">
+                      <IconMute size={11} />
+                      免打扰
+                    </span>
+                  )}
+                  {conv.category && <span className="soft-chip">{conv.category}</span>}
+                </div>
+                <div className="chat-sub" title={conv.is_group ? groupMemberSummary : directSubtitle}>
+                  {conv.is_group ? `全员邮件互通 · ${groupMemberSummary}` : directSubtitle}
+                </div>
               </div>
-              <div className="chat-sub" title={conv.is_group ? groupMemberSummary : directSubtitle}>
-                {conv.is_group ? `全员邮件互通 · ${groupMemberSummary}` : directSubtitle}
-              </div>
+            </button>
+
+            <div className="chat-actions">
+              {messages.length > 0 && (
+                <button
+                  type="button"
+                  className={`tool-btn ${showSearchBar ? "active" : ""}`}
+                  onClick={() => (showSearchBar ? closeSearchBar() : openSearchBar())}
+                  title="搜索当前对话内容 (Ctrl+F)"
+                >
+                  <IconSearch size={15} />
+                </button>
+              )}
+
+              {messages.length >= 2 && (
+                <button
+                  type="button"
+                  className="soft-btn chat-action-btn chat-summary-btn"
+                  onClick={runSummary}
+                  disabled={summarizing}
+                  title={summarizing ? "正在提炼对话纪要…" : "AI 提炼对话纪要"}
+                >
+                  <IconNote size={14} />
+                  <span className="chat-action-label">{summarizing ? "提炼中…" : "纪要总结"}</span>
+                </button>
+              )}
+
+              {status === "blocked" && !conv.is_group && (
+                <button
+                  type="button"
+                  className="primary-btn chat-action-btn"
+                  onClick={() => act(() => api.allowSender(conv.peer), "已恢复并加入白名单")}
+                >
+                  <IconCheck size={14} />
+                  <span className="chat-action-label">恢复并信任</span>
+                </button>
+              )}
+
+              {conv.is_group ? (
+                <button
+                  type="button"
+                  className={`soft-btn chat-action-btn chat-drawer-btn ${showGroupDrawer ? "active-soft" : ""}`}
+                  onClick={() => setShowGroupDrawer((v) => !v)}
+                  title="查看与编辑群聊信息"
+                >
+                  <IconUsers size={14} />
+                  <span className="chat-action-label">群信息</span>
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className={`soft-btn chat-action-btn chat-drawer-btn ${showDetailDrawer ? "active-soft" : ""}`}
+                  onClick={() => setShowDetailDrawer((v) => !v)}
+                  title="查看详情、修改备注及更多操作"
+                >
+                  <IconMore size={15} />
+                  <span className="chat-action-label">详情</span>
+                </button>
+              )}
             </div>
-          </button>
-
-          <div className="chat-actions">
-            {messages.length > 0 && (
-              <button
-                type="button"
-                className={`tool-btn ${showSearchBar ? "active" : ""}`}
-                onClick={() => (showSearchBar ? closeSearchBar() : openSearchBar())}
-                title="搜索当前对话内容 (Ctrl+F)"
-              >
-                <IconSearch size={15} />
-              </button>
-            )}
-
-            {messages.length >= 2 && (
-              <button type="button" className="soft-btn" onClick={runSummary} disabled={summarizing}>
-                <IconNote size={14} />
-                <span>{summarizing ? "提炼中…" : "纪要总结"}</span>
-              </button>
-            )}
-
-            {status === "blocked" && !conv.is_group && (
-              <button
-                type="button"
-                className="primary-btn"
-                onClick={() => act(() => api.allowSender(conv.peer), "已恢复并加入白名单")}
-              >
-                <IconCheck size={14} />
-                <span>恢复并信任</span>
-              </button>
-            )}
-
-            {conv.is_group ? (
-              <button
-                type="button"
-                className={`soft-btn ${showGroupDrawer ? "active-soft" : ""}`}
-                onClick={() => setShowGroupDrawer((v) => !v)}
-              >
-                <IconUsers size={14} />
-                <span>群信息</span>
-              </button>
-            ) : (
-              <button
-                type="button"
-                className={`soft-btn ${showDetailDrawer ? "active-soft" : ""}`}
-                onClick={() => setShowDetailDrawer((v) => !v)}
-                title="查看详情、修改备注及更多操作"
-              >
-                <IconMore size={15} />
-                <span>详情</span>
-              </button>
-            )}
           </div>
         </header>
 
@@ -1007,7 +1506,12 @@ export function ChatView({
                           ? () => insertMention(speakerLabel)
                           : () => setShowDetailDrawer(true)
                       }
-                      title={conv.is_group ? `点击 @${speakerLabel}` : "点击查看联系人详情"}
+                      onContextMenu={(e) => openAvatarContextMenu(e, m, speakerLabel)}
+                      title={
+                        conv.is_group
+                          ? `点击 @${speakerLabel} · 右键发起私聊或复制邮箱`
+                          : "点击查看联系人详情 · 右键更多操作"
+                      }
                     />
                   )}
 
@@ -1022,7 +1526,16 @@ export function ChatView({
                     ]
                       .filter(Boolean)
                       .join(" ")}
-                    onContextMenu={(e) => openBubbleContextMenu(e, m, canShowHtml, showingHtml)}
+                    onContextMenu={(e) =>
+                      openBubbleContextMenu(e, m, {
+                        canShowHtml,
+                        showingHtml,
+                        hasExpandable: analyzed.hasExpandable,
+                        isExpanded,
+                        expandLabel: analyzed.expandLabel,
+                        collapseLabel: analyzed.collapseLabel,
+                      })
+                    }
                   >
                     {conv.is_group && !m.outgoing && (
                       <div className="bubble-sender">
@@ -1040,7 +1553,8 @@ export function ChatView({
 
                     {showSubject && (
                       <div className="bubble-subject">
-                        {trimmedSearch ? highlightText(subj, trimmedSearch) : subj}
+                        <IconTag size={11} className="bubble-subject-icon" />
+                        <span>{trimmedSearch ? highlightText(subj, trimmedSearch) : subj}</span>
                       </div>
                     )}
 
@@ -1077,7 +1591,20 @@ export function ChatView({
                     {hasTextContent && (
                       <div className="bubble-text">
                         {showingHtml ? (
-                          <HtmlMailView html={m.body_html} status={status} />
+                          <HtmlMailView
+                            html={m.body_html}
+                            status={status}
+                            onContextMenuRequest={(info) =>
+                              openHtmlContextMenu(info, m, {
+                                canShowHtml,
+                                showingHtml,
+                                hasExpandable: analyzed.hasExpandable,
+                                isExpanded,
+                                expandLabel: analyzed.expandLabel,
+                                collapseLabel: analyzed.collapseLabel,
+                              })
+                            }
+                          />
                         ) : (
                           <MessageContent
                             analyzed={analyzed}
@@ -1091,15 +1618,18 @@ export function ChatView({
 
                     {atts.length > 0 && (
                       <BubbleAttachments
+                        messageId={m.id}
                         attachments={atts}
                         outgoing={m.outgoing}
                         highlightQuery={trimmedSearch || undefined}
-                        onPreviewImage={(att, dataUrl) =>
+                        onPreviewImage={(att, dataUrl, msgId, savedPath) =>
                           setLightbox({
                             src: dataUrl,
                             title: att.filename,
                             size: att.size,
-                            relPath: att.rel_path,
+                            messageId: msgId,
+                            attachmentId: att.id,
+                            savedPath,
                           })
                         }
                         notify={notify}
@@ -1121,14 +1651,14 @@ export function ChatView({
 
                     <div className="bubble-meta">
                       {!showingHtml && analyzed.hasExpandable && (
-                        <button type="button" className="text-link" onClick={() => toggle(m.id)}>
+                        <button type="button" className="bubble-meta-link" onClick={() => toggle(m.id)}>
                           {isExpanded ? analyzed.collapseLabel : analyzed.expandLabel}
                         </button>
                       )}
                       {canShowHtml && (
                         <button
                           type="button"
-                          className="text-link"
+                          className="bubble-meta-link"
                           onClick={() => toggleHtmlMode(m.id, showingHtml)}
                         >
                           {showingHtml ? "精简文本" : "网页视图"}
@@ -1137,7 +1667,7 @@ export function ChatView({
                       {status !== "inbox" && !m.outgoing && !conv.is_group && (
                         <button
                           type="button"
-                          className="text-link"
+                          className="bubble-meta-link"
                           onClick={() => act(() => api.setMessageStatus(m.id, "inbox"), "已移回消息")}
                         >
                           移回消息
@@ -1169,12 +1699,6 @@ export function ChatView({
 
         {status !== "blocked" && (
           <div className="im-composer" ref={composerRef}>
-            <div
-              className="im-composer-resizer"
-              onMouseDown={startResizeComposer}
-              title="上下拖动调整输入区高度"
-            />
-
             <input
               ref={fileInputRef}
               type="file"
@@ -1186,341 +1710,324 @@ export function ChatView({
               }}
             />
 
-            {(replyTarget || pendingAttachments.length > 0 || showSubjectInput) && (
-              <div className="im-composer-context">
-                {replyTarget && (
-                  <div className="reply-quote-bar">
-                    <IconReply size={13} className="reply-quote-icon" />
-                    <div
-                      className="reply-quote-body"
-                      onClick={() => jumpToMessage(replyTarget.id)}
-                      title="点击定位查看原消息"
-                    >
-                      <span className="reply-quote-sender">引用 {replyTarget.sender}：</span>
-                      <span className="reply-quote-snippet">{replyTarget.snippet}</span>
-                    </div>
-                    <button
-                      type="button"
-                      className="tool-btn small"
-                      onClick={() => setReplyTarget(null)}
-                      title="取消引用 (Esc)"
-                    >
-                      <IconClose size={12} />
-                    </button>
-                  </div>
-                )}
-
-                <PendingAttachmentsBar
-                  items={pendingAttachments}
-                  onRemove={(id) => setPendingAttachments((prev) => prev.filter((x) => x.id !== id))}
-                  onClear={() => setPendingAttachments([])}
-                  onPreviewImage={(item) => setLightbox(item)}
-                />
-
-                {showSubjectInput && (
-                  <div className="subject-bar">
-                    <span>邮件主题</span>
-                    <input
-                      className="grow"
-                      placeholder={conv.is_group ? `默认沿用「${cleanTitle}」` : "留空则自动沿用会话主题"}
-                      value={customSubject}
-                      onChange={(e) => setCustomSubject(e.target.value)}
-                    />
-                    <button
-                      type="button"
-                      className="tool-btn small"
-                      onClick={() => setShowSubjectInput(false)}
-                      title="收起主题栏"
-                    >
-                      <IconClose size={12} />
-                    </button>
-                  </div>
-                )}
+            {showSuggestChip && latestSuggestedMsg && (
+              <div className="im-suggest-row">
+                <div className="im-suggest-chip" title={`点击填入建议回复：${latestSuggestedMsg.suggested_reply}`}>
+                  <button
+                    type="button"
+                    className="im-suggest-fill"
+                    onClick={() => {
+                      setText(latestSuggestedMsg.suggested_reply);
+                      inputRef.current?.focus();
+                    }}
+                  >
+                    <IconSparkles size={12} />
+                    <span className="im-suggest-prefix">建议回复：</span>
+                    <span className="im-suggest-label">{latestSuggestedMsg.suggested_reply}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="im-suggest-close"
+                    onClick={() => setDismissedSuggestMsgId(latestSuggestedMsg.id)}
+                    title="忽略此条建议"
+                  >
+                    <IconClose size={11} />
+                  </button>
+                </div>
               </div>
             )}
 
-            <div className="im-composer-stage" style={{ height: `${composerHeight}px` }}>
-              <textarea
-              ref={inputRef}
-              className="im-composer-textarea"
-              value={text}
-              placeholder={
-                conv.is_group
-                  ? `全员回复 ${conv.members.length} 位群成员（可输入 @ 提及成员，支持粘贴图片或拖拽文件）`
-                  : "输入消息…（支持 Ctrl+V 粘贴图片/文件，拖拽发送附件）"
-              }
-              onChange={(e) => {
-                const val = e.target.value;
-                setText(val);
-                if (conv.is_group && val.endsWith("@")) {
-                  setActivePopover("mention");
-                } else if (activePopover === "mention" && !val.includes("@")) {
-                  setActivePopover("none");
-                }
+            <div
+              className="im-composer-card"
+              onClick={(e) => {
+                const target = e.target as HTMLElement;
+                if (target.closest("button, input, textarea, [data-popover-zone]")) return;
+                inputRef.current?.focus();
               }}
-              onPaste={handlePaste}
-              onKeyDown={(e) => {
-                if (e.key === "Escape") {
-                  if (activePopover !== "none") {
-                    e.preventDefault();
-                    setActivePopover("none");
-                    return;
-                  }
-                  if (replyTarget) {
-                    e.preventDefault();
-                    setReplyTarget(null);
-                    return;
-                  }
-                }
-                if (
-                  e.key === "Enter" &&
-                  !e.shiftKey &&
-                  !e.ctrlKey &&
-                  !e.metaKey &&
-                  !e.nativeEvent.isComposing
-                ) {
-                  e.preventDefault();
-                  void send();
-                }
-              }}
-            />
+            >
+              <div
+                className="im-composer-resizer"
+                onMouseDown={startResizeComposer}
+                title="上下拖动调整输入区高度"
+              />
 
-            <footer className="im-composer-bar">
-              <div className="im-composer-tools" data-popover-zone="true">
-                <div className="im-tool-anchor">
-                  <button
-                    type="button"
-                    className={`im-tool-btn ${activePopover === "emoji" ? "active" : ""}`}
-                    onClick={() => setActivePopover((p) => (p === "emoji" ? "none" : "emoji"))}
-                    title="插入表情"
-                  >
-                    <IconSmile size={18} />
-                  </button>
-                  {activePopover === "emoji" && (
-                    <div className="im-popover emoji-popover">
-                      <div className="im-popover-title">常用表情</div>
-                      <div className="emoji-grid">
-                        {COMMON_EMOJIS.map((em) => (
-                          <button
-                            key={em}
-                            type="button"
-                            className="emoji-cell"
-                            onClick={() => {
-                              insertAtCursor(em);
-                              setActivePopover("none");
-                            }}
-                          >
-                            {em}
-                          </button>
-                        ))}
+              {(replyTarget || pendingAttachments.length > 0 || showSubjectInput) && (
+                <div className="im-composer-context">
+                  {replyTarget && (
+                    <div className="reply-quote-bar">
+                      <IconReply size={13} className="reply-quote-icon" />
+                      <div
+                        className="reply-quote-body"
+                        onClick={() => jumpToMessage(replyTarget.id)}
+                        title="点击定位查看原消息"
+                      >
+                        <span className="reply-quote-sender">引用 {replyTarget.sender}：</span>
+                        <span className="reply-quote-snippet">{replyTarget.snippet}</span>
                       </div>
+                      <button
+                        type="button"
+                        className="tool-btn small"
+                        onClick={() => setReplyTarget(null)}
+                        title="取消引用 (Esc)"
+                      >
+                        <IconClose size={12} />
+                      </button>
                     </div>
                   )}
+
+                  {showSubjectInput && (
+                    <div className="subject-bar">
+                      <span className="subject-bar-badge">
+                        <IconTag size={11} />
+                        邮件主题
+                      </span>
+                      <input
+                        className="grow"
+                        placeholder={conv.is_group ? `默认沿用「${cleanTitle}」` : "留空则自动沿用会话主题"}
+                        value={customSubject}
+                        onChange={(e) => setCustomSubject(e.target.value)}
+                      />
+                      <button
+                        type="button"
+                        className="tool-btn small"
+                        onClick={() => setShowSubjectInput(false)}
+                        title="收起主题栏"
+                      >
+                        <IconClose size={12} />
+                      </button>
+                    </div>
+                  )}
+
+                  <PendingAttachmentsBar
+                    items={pendingAttachments}
+                    onRemove={(id) => setPendingAttachments((prev) => prev.filter((x) => x.id !== id))}
+                    onClear={() => setPendingAttachments([])}
+                    onPreviewImage={(item) => setLightbox(item)}
+                  />
                 </div>
+              )}
 
-                <button
-                  type="button"
-                  className="im-tool-btn"
-                  onClick={() => fileInputRef.current?.click()}
-                  title="发送文件（支持拖拽添加或 Ctrl+V 粘贴）"
-                >
-                  <IconFolder size={18} />
-                </button>
+              <div className="im-composer-stage" style={{ height: `${composerHeight}px` }}>
+                <textarea
+                  ref={inputRef}
+                  className="im-composer-textarea"
+                  value={text}
+                  placeholder={
+                    conv.is_group
+                      ? `全员回复 ${conv.members.length} 位群成员（可输入 @ 提及成员，支持粘贴图片或拖拽文件）`
+                      : "输入消息…（支持 Ctrl+V 粘贴图片/文件，拖拽发送附件）"
+                  }
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    setText(val);
+                    if (conv.is_group && val.endsWith("@")) {
+                      setActivePopover("mention");
+                    } else if (activePopover === "mention" && !val.includes("@")) {
+                      setActivePopover("none");
+                    }
+                  }}
+                  onPaste={handlePaste}
+                  onContextMenu={openComposerContextMenu}
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape") {
+                      if (activePopover !== "none") {
+                        e.preventDefault();
+                        setActivePopover("none");
+                        return;
+                      }
+                      if (replyTarget) {
+                        e.preventDefault();
+                        setReplyTarget(null);
+                        return;
+                      }
+                    }
+                    if (
+                      e.key === "Enter" &&
+                      !e.shiftKey &&
+                      !e.ctrlKey &&
+                      !e.metaKey &&
+                      !e.nativeEvent.isComposing
+                    ) {
+                      e.preventDefault();
+                      void send();
+                    }
+                  }}
+                />
 
-                {conv.is_group && conv.members.length > 0 && (
-                  <div className="im-tool-anchor">
+                <footer className="im-composer-bar">
+                  <div className="im-composer-tools" data-popover-zone="true">
+                    <div className="im-tool-anchor">
+                      <button
+                        type="button"
+                        className={`im-tool-btn ${activePopover === "emoji" ? "active" : ""}`}
+                        onClick={() => setActivePopover((p) => (p === "emoji" ? "none" : "emoji"))}
+                        title="插入表情"
+                      >
+                        <IconSmile size={17} />
+                      </button>
+                      {activePopover === "emoji" && (
+                        <div className="im-popover emoji-popover">
+                          <div className="im-popover-title">常用表情</div>
+                          <div className="emoji-grid">
+                            {COMMON_EMOJIS.map((em) => (
+                              <button
+                                key={em}
+                                type="button"
+                                className="emoji-cell"
+                                onClick={() => {
+                                  insertAtCursor(em);
+                                  setActivePopover("none");
+                                }}
+                              >
+                                {em}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
                     <button
                       type="button"
-                      className={`im-tool-btn ${activePopover === "mention" ? "active" : ""}`}
-                      onClick={() => setActivePopover((p) => (p === "mention" ? "none" : "mention"))}
-                      title="@提及群成员"
+                      className="im-tool-btn"
+                      onClick={() => fileInputRef.current?.click()}
+                      title="发送文件或图片（支持拖拽添加或右键粘贴）"
                     >
-                      <IconAt size={17} />
+                      <IconFolder size={17} />
                     </button>
-                    {activePopover === "mention" && (
-                      <div className="im-popover mention-popover">
-                        <div className="im-popover-title">选择要 @ 的成员</div>
+
+                    <button
+                      type="button"
+                      className="im-tool-btn"
+                      onClick={() => {
+                        api.startScreenSnip().catch((err) => notify(`启动截图工具失败：${err}`, true));
+                      }}
+                      title="屏幕区域截图（截图后直接 Ctrl+V 或右键粘贴）"
+                    >
+                      <IconScissors size={16} />
+                    </button>
+
+                    {conv.is_group && conv.members.length > 0 && (
+                      <div className="im-tool-anchor">
                         <button
                           type="button"
-                          className="im-popover-item"
-                          onClick={() => insertMention("所有人")}
+                          className={`im-tool-btn ${activePopover === "mention" ? "active" : ""}`}
+                          onClick={() => setActivePopover((p) => (p === "mention" ? "none" : "mention"))}
+                          title="@提及群成员"
                         >
-                          <span className="im-popover-item-main">@所有人</span>
-                          <span className="im-popover-item-sub">提醒全体成员</span>
+                          <IconAt size={16} />
                         </button>
-                        {conv.members.map((m) => {
-                          const label = m.name || m.email.split("@")[0];
-                          return (
+                        {activePopover === "mention" && (
+                          <div className="im-popover mention-popover">
+                            <div className="im-popover-title">选择要 @ 的成员</div>
                             <button
-                              key={m.email}
                               type="button"
                               className="im-popover-item"
-                              onClick={() => insertMention(label)}
+                              onClick={() => insertMention("所有人")}
                             >
-                              <span className="im-popover-item-main">@{label}</span>
-                              <span className="im-popover-item-sub">{m.email}</span>
+                              <span className="im-popover-item-main">@所有人</span>
+                              <span className="im-popover-item-sub">提醒全体成员</span>
                             </button>
-                          );
-                        })}
-                      </div>
-                    )}
-                  </div>
-                )}
-
-                {(messages.length > 0 || text.trim().length > 0) && (
-                  <div className="im-tool-anchor">
-                    <button
-                      type="button"
-                      className={`im-tool-btn ${activePopover === "draft" ? "active" : ""}`}
-                      onClick={() => setActivePopover((p) => (p === "draft" ? "none" : "draft"))}
-                      disabled={drafting}
-                      title="AI 辅助帮写与文本润色"
-                    >
-                      <span className={drafting ? "spin" : ""}>
-                        <IconDraft size={17} />
-                      </span>
-                    </button>
-                    {activePopover === "draft" && (
-                      <div className="im-popover draft-popover">
-                        {text.trim().length > 0 && (
-                          <>
-                            <div className="im-popover-title">润色当前草稿</div>
-                            {POLISH_INTENTS.map((item) => (
-                              <button
-                                key={item.label}
-                                type="button"
-                                className="im-popover-item"
-                                onClick={() => void polishCurrentText(item.hint)}
-                              >
-                                <span className="im-popover-item-main">{item.label}</span>
-                              </button>
-                            ))}
-                            {messages.length > 0 && <div className="im-popover-sep" />}
-                          </>
-                        )}
-                        {messages.length > 0 && (
-                          <>
-                            <div className="im-popover-title">结合上下文帮写</div>
-                            {DRAFT_INTENTS.map((item) => (
-                              <button
-                                key={item.label}
-                                type="button"
-                                className="im-popover-item"
-                                onClick={() => void draft(item.hint)}
-                              >
-                                <span className="im-popover-item-main">{item.label}</span>
-                                <span className="im-popover-item-sub">{item.desc}</span>
-                              </button>
-                            ))}
-                          </>
+                            {conv.members.map((m) => {
+                              const label = m.name || m.email.split("@")[0];
+                              return (
+                                <button
+                                  key={m.email}
+                                  type="button"
+                                  className="im-popover-item"
+                                  onClick={() => insertMention(label)}
+                                >
+                                  <span className="im-popover-item-main">@{label}</span>
+                                  <span className="im-popover-item-sub">{m.email}</span>
+                                </button>
+                              );
+                            })}
+                          </div>
                         )}
                       </div>
                     )}
-                  </div>
-                )}
 
-                <button
-                  type="button"
-                  className={`im-tool-btn ${showSubjectInput || customSubject.trim() ? "active" : ""}`}
-                  onClick={() => setShowSubjectInput((v) => !v)}
-                  title="自定义邮件主题"
-                >
-                  <IconTag size={16} />
-                </button>
-              </div>
+                    {(messages.length > 0 || text.trim().length > 0) && (
+                      <div className="im-tool-anchor">
+                        <button
+                          type="button"
+                          className={`im-tool-btn ${activePopover === "draft" ? "active" : ""}`}
+                          onClick={() => setActivePopover((p) => (p === "draft" ? "none" : "draft"))}
+                          disabled={drafting}
+                          title="AI 辅助帮写与文本润色"
+                        >
+                          <span className={drafting ? "spin" : ""}>
+                            <IconDraft size={16} />
+                          </span>
+                        </button>
+                        {activePopover === "draft" && (
+                          <div className="im-popover draft-popover">
+                            {text.trim().length > 0 && (
+                              <>
+                                <div className="im-popover-title">润色当前草稿</div>
+                                {POLISH_INTENTS.map((item) => (
+                                  <button
+                                    key={item.label}
+                                    type="button"
+                                    className="im-popover-item"
+                                    onClick={() => void polishCurrentText(item.hint)}
+                                  >
+                                    <span className="im-popover-item-main">{item.label}</span>
+                                  </button>
+                                ))}
+                                {messages.length > 0 && <div className="im-popover-sep" />}
+                              </>
+                            )}
+                            {messages.length > 0 && (
+                              <>
+                                <div className="im-popover-title">结合上下文帮写</div>
+                                {DRAFT_INTENTS.map((item) => (
+                                  <button
+                                    key={item.label}
+                                    type="button"
+                                    className="im-popover-item"
+                                    onClick={() => void draft(item.hint)}
+                                  >
+                                    <span className="im-popover-item-main">{item.label}</span>
+                                    <span className="im-popover-item-sub">{item.desc}</span>
+                                  </button>
+                                ))}
+                              </>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    )}
 
-              <div className="im-composer-right" data-popover-zone="true">
-                {showSuggestChip && latestSuggestedMsg && (
-                  <div className="im-suggest-chip" title={`点击填入建议回复：${latestSuggestedMsg.suggested_reply}`}>
                     <button
                       type="button"
-                      className="im-suggest-fill"
-                      onClick={() => {
-                        setText(latestSuggestedMsg.suggested_reply);
-                        inputRef.current?.focus();
-                      }}
+                      className={`im-tool-btn ${showSubjectInput || customSubject.trim() ? "active" : ""}`}
+                      onClick={() => setShowSubjectInput((v) => !v)}
+                      title="自定义邮件主题"
                     >
-                      <IconSparkles size={12} />
-                      <span className="im-suggest-label">{latestSuggestedMsg.suggested_reply}</span>
-                    </button>
-                    <button
-                      type="button"
-                      className="im-suggest-close"
-                      onClick={() => setDismissedSuggestMsgId(latestSuggestedMsg.id)}
-                      title="忽略此条建议"
-                    >
-                      <IconClose size={11} />
+                      <IconTag size={15} />
                     </button>
                   </div>
-                )}
 
-                <button
-                  type="button"
-                  className={`im-send-btn ${canSend ? "ready" : ""}`}
-                  onClick={() => void send()}
-                  disabled={!canSend}
-                  title="发送 (Enter 发送，Shift+Enter 换行)"
-                >
-                  {sending ? "发送中…" : "发送"}
-                </button>
+                  <div className="im-composer-right" data-popover-zone="true">
+                    <span className="im-composer-hint">Enter 发送 · Shift+Enter 换行</span>
+                    <button
+                      type="button"
+                      className={`im-send-btn ${canSend ? "ready" : ""}`}
+                      onClick={() => void send()}
+                      disabled={!canSend}
+                      title="发送 (Enter 发送，Shift+Enter 换行)"
+                    >
+                      <IconSend size={13} />
+                      <span>{sending ? "发送中…" : "发送"}</span>
+                    </button>
+                  </div>
+                </footer>
               </div>
-            </footer>
             </div>
           </div>
         )}
       </div>
-
-      {ctxMenu && (
-        <div
-          className="msg-context-menu"
-          style={{ left: `${ctxMenu.x}px`, top: `${ctxMenu.y}px` }}
-        >
-          {(ctxMenu.selectedText || ctxMenu.msg.body.trim()) && (
-            <button
-              type="button"
-              className="msg-context-item"
-              onClick={() => void copyMessageText(ctxMenu.msg, ctxMenu.selectedText)}
-            >
-              <IconCopy size={13} />
-              <span>{ctxMenu.selectedText ? "复制选中文字" : "复制文本内容"}</span>
-            </button>
-          )}
-          {status !== "blocked" && (
-            <button
-              type="button"
-              className="msg-context-item"
-              onClick={() => startReplyTo(ctxMenu.msg)}
-            >
-              <IconReply size={13} />
-              <span>引用回复</span>
-            </button>
-          )}
-          <button
-            type="button"
-            className="msg-context-item"
-            onClick={() => {
-              setForwardMsg(ctxMenu.msg);
-              setCtxMenu(null);
-            }}
-          >
-            <IconForward size={13} />
-            <span>转发…</span>
-          </button>
-          {ctxMenu.canShowHtml && (
-            <button
-              type="button"
-              className="msg-context-item"
-              onClick={() => {
-                toggleHtmlMode(ctxMenu.msg.id, ctxMenu.showingHtml);
-                setCtxMenu(null);
-              }}
-            >
-              <IconNote size={13} />
-              <span>{ctxMenu.showingHtml ? "切换精简文本" : "切换网页视图"}</span>
-            </button>
-          )}
-        </div>
-      )}
 
       {forwardMsg && (
         <div className="modal-backdrop" onClick={() => !forwarding && setForwardMsg(null)}>
@@ -1602,12 +2109,14 @@ export function ChatView({
           onOpenSearch={openSearchBar}
           onRunSummary={() => void runSummary()}
           summarizing={summarizing}
-          onPreviewImage={(att, dataUrl) =>
+          onPreviewImage={(att, dataUrl, msgId, savedPath) =>
             setLightbox({
               src: dataUrl,
               title: att.filename,
               size: att.size,
-              relPath: att.rel_path,
+              messageId: msgId,
+              attachmentId: att.id,
+              savedPath,
             })
           }
           notify={notify}
@@ -1723,12 +2232,14 @@ export function ChatView({
               <div className="drawer-section-title">群内图片与文件</div>
               <DrawerAttachmentList
                 messages={messages}
-                onPreviewImage={(att, dataUrl) =>
+                onPreviewImage={(att, dataUrl, msgId, savedPath) =>
                   setLightbox({
                     src: dataUrl,
                     title: att.filename,
                     size: att.size,
-                    relPath: att.rel_path,
+                    messageId: msgId,
+                    attachmentId: att.id,
+                    savedPath,
                   })
                 }
                 notify={notify}

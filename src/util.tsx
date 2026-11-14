@@ -1,3 +1,4 @@
+import type { MouseEvent as ReactMouseEvent } from "react";
 import type { GroupMember } from "./types";
 
 // 低饱和柔和莫兰迪/石板色系，避免刺眼的 AI 模板高饱和色
@@ -36,19 +37,22 @@ export function Avatar({
   seed,
   size = 42,
   onClick,
+  onContextMenu,
   title,
 }: {
   name: string;
   seed: string;
   size?: number;
   onClick?: () => void;
+  onContextMenu?: (e: ReactMouseEvent<HTMLDivElement>) => void;
   title?: string;
 }) {
   const ch = (name.trim()[0] ?? "?").toUpperCase();
   return (
     <div
-      className={`avatar ${onClick ? "clickable-avatar" : ""}`}
+      className={`avatar ${onClick || onContextMenu ? "clickable-avatar" : ""}`}
       onClick={onClick}
+      onContextMenu={onContextMenu}
       title={title}
       style={{
         width: size,
@@ -60,6 +64,32 @@ export function Avatar({
       {ch}
     </div>
   );
+}
+
+/** 安全复制文本到系统剪贴板（兼容剪贴板权限回退） */
+export async function copyText(text: string): Promise<boolean> {
+  const val = text ?? "";
+  if (!val) return false;
+  try {
+    await navigator.clipboard.writeText(val);
+    return true;
+  } catch {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = val;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      ta.style.pointerEvents = "none";
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      const ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      return ok;
+    } catch {
+      return false;
+    }
+  }
 }
 
 /** 柔和圆角四宫格拼接群头像 */

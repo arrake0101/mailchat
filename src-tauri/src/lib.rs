@@ -2,6 +2,7 @@ mod agent;
 mod config;
 mod db;
 mod llm;
+mod magpie;
 mod mail;
 mod vault;
 
@@ -200,6 +201,15 @@ struct AgentChatResponse {
     secret_prompts: Vec<SecretPrompt>,
     suggestions: Vec<String>,
     sessions: Vec<AgentSessionSummary>,
+    turns: Vec<AgentTurnRecord>,
+}
+
+#[derive(Serialize)]
+struct RewindAgentResponse {
+    turns: Vec<AgentTurnRecord>,
+    sessions: Vec<AgentSessionSummary>,
+    config_restored: bool,
+    bundle: DeclarativeBundle,
 }
 
 #[derive(Serialize, Clone)]
@@ -213,6 +223,13 @@ struct AgentStreamPayload {
 
 #[derive(Serialize)]
 struct ModelSwitchResult {
+    agent_config: AgentConfig,
+    bundle: DeclarativeBundle,
+}
+
+#[derive(Serialize)]
+struct MagpieConnectResult {
+    probe: magpie::MagpieProbeReport,
     agent_config: AgentConfig,
     bundle: DeclarativeBundle,
 }
@@ -973,6 +990,70 @@ fn clear_agent_session_turns(
     state.db.list_agent_sessions().map_err(err)
 }
 
+#[tauri::command]
+fn rewind_agent_session(
+    app: AppHandle,
+    state: State<AppState>,
+    session_id: String,
+    from_turn_id: i64,
+    restore_config: bool,
+) -> CmdResult<RewindAgentResponse> {
+    let prev_spec = config::build_spec(&state.db).unwrap_or_default();
+    let rollback_toml = state
+        .db
+        .rewind_agent_session(&session_id, from_turn_id)
+        .map_err(err)?;
+
+    let mut config_restored = false;
+    if restore_config {
+        if let Some(ref target_toml) = rollback_toml {
+            if !target_toml.trim().is_empty() {
+                config::apply_toml(&state.app_dir, target_toml, &state.db, &state.vault)
+                    .map_err(err)?;
+                if let Ok(rules) = state.db.rules() {
+                    let _ = state.db.scan_existing_with_rules(|from, subject, body| {
+                        agent::apply_rules(&rules, from, subject, body)
+                            .map(|h| (h.status, h.reason))
+                    });
+                }
+                let next_spec = config::build_spec(&state.db).unwrap_or_default();
+                let mail_changed = prev_spec.active_account != next_spec.active_account
+                    || serde_json::to_string(&prev_spec.accounts).ok()
+                        != serde_json::to_string(&next_spec.accounts).ok();
+                if mail_changed {
+                    state.watcher.reconnect_now();
+                }
+                let _ = app.emit(
+                    "mail-updated",
+                    SyncReport {
+                        new_incoming: 0,
+                        agent_processed: 0,
+                        error: None,
+                    },
+                );
+                config_restored = true;
+            }
+        }
+    }
+
+    let toml = config::export_toml(&state.db).map_err(err)?;
+    let spec = config::build_spec(&state.db).map_err(err)?;
+    let turns = state.db.get_agent_session_turns(&session_id).map_err(err)?;
+    let sessions = state.db.list_agent_sessions().map_err(err)?;
+
+    Ok(RewindAgentResponse {
+        turns,
+        sessions,
+        config_restored,
+        bundle: DeclarativeBundle {
+            path: config_file_path(&state),
+            toml,
+            spec,
+            secrets: vault_statuses(&state.db, &state.vault),
+        },
+    })
+}
+
 /// 零延迟原子切换当前激活模型服务商或模型名称（不调用远端 LLM，直接更新 AgentConfig 与 config.toml）
 #[tauri::command]
 fn switch_active_model(
@@ -1009,11 +1090,16 @@ fn switch_active_model(
         ag.provider = "openai".to_string();
     }
 
+    let fallback_base = if target_preset == "magpie" {
+        magpie::configured_local_base_url()
+    } else {
+        def_base.to_string()
+    };
     let resolved_base = saved_prof
         .as_ref()
         .map(|p| p.base_url.trim())
         .filter(|s| !s.is_empty())
-        .unwrap_or(def_base)
+        .unwrap_or(&fallback_base)
         .to_string();
     if !resolved_base.is_empty() || target_preset != "custom" {
         ag.base_url = resolved_base;
@@ -1036,9 +1122,12 @@ fn switch_active_model(
     }
 
     // 若对应服务商密钥已配置或支持免密直连，切换时自动启用 AI 分拣
-    let key_ready = llm_secret_key(&target_preset)
-        .map(|sk| state.vault.get(sk).is_some())
-        .unwrap_or(true)
+    let is_local_magpie = target_preset == "magpie"
+        && (ag.base_url.trim().is_empty() || magpie::is_loopback_url(&ag.base_url));
+    let key_ready = is_local_magpie
+        || llm_secret_key(&target_preset)
+            .map(|sk| state.vault.get(sk).is_some())
+            .unwrap_or(true)
         || matches!(target_preset.as_str(), "ollama" | "ollama_remote" | "custom");
     if key_ready {
         ag.enabled = true;
@@ -1107,7 +1196,13 @@ async fn chat_with_agent(
             .collect()
     };
 
-    // 持久化用户本轮配置请求（自动脱敏可能误输的明文密钥）
+    let cfg = config::hydrated_agent(&state.db, &state.vault).map_err(err)?;
+    let spec = config::build_spec(&state.db).map_err(err)?;
+    let stats = state.db.stats().unwrap_or_default();
+    let current_toml = config::export_toml(&state.db).map_err(err)?;
+    let statuses = vault_statuses(&state.db, &state.vault);
+
+    // 持久化用户本轮配置请求及本轮执行前的脱敏 config.toml 检查点快照（自动脱敏可能误输的明文密钥）
     let safe_user_content = agent::sanitize_user_input_for_history(&message);
     let _ = state.db.append_agent_turn(&NewAgentTurn {
         session_id: &sid,
@@ -1118,15 +1213,10 @@ async fn chat_with_agent(
         tool_steps: &[],
         changes: &[],
         config_diff: None,
+        snapshot_toml: &current_toml,
         secret_prompts: &[],
         suggestions: &[],
     });
-
-    let cfg = config::hydrated_agent(&state.db, &state.vault).map_err(err)?;
-    let spec = config::build_spec(&state.db).map_err(err)?;
-    let stats = state.db.stats().unwrap_or_default();
-    let current_toml = config::export_toml(&state.db).map_err(err)?;
-    let statuses = vault_statuses(&state.db, &state.vault);
 
     let cancel_flag = Arc::new(AtomicBool::new(false));
     {
@@ -1369,10 +1459,12 @@ async fn chat_with_agent(
         tool_steps: &plan.tool_steps,
         changes: &plan.changes,
         config_diff: config_diff.as_ref(),
+        snapshot_toml: "",
         secret_prompts: &secret_prompts,
         suggestions: &plan.suggestions,
     });
 
+    let turns = state.db.get_agent_session_turns(&sid).unwrap_or_default();
     let sessions = state.db.list_agent_sessions().unwrap_or_default();
 
     let _ = app.emit(
@@ -1398,6 +1490,7 @@ async fn chat_with_agent(
         secret_prompts,
         suggestions: plan.suggestions,
         sessions,
+        turns,
     })
 }
 
@@ -1642,6 +1735,142 @@ async fn fetch_models(state: State<'_, AppState>, mut config: AgentConfig) -> Cm
 }
 
 #[tauri::command]
+async fn probe_magpie(
+    state: State<'_, AppState>,
+    base_url: Option<String>,
+) -> CmdResult<magpie::MagpieProbeReport> {
+    let gw_key = state.vault.get("llm_magpie").unwrap_or_default();
+    Ok(magpie::probe_magpie(base_url.as_deref(), Some(&gw_key)).await)
+}
+
+#[tauri::command]
+async fn start_magpie_gateway(
+    state: State<'_, AppState>,
+    base_url: Option<String>,
+) -> CmdResult<magpie::MagpieProbeReport> {
+    let gw_key = state.vault.get("llm_magpie").unwrap_or_default();
+    magpie::start_local_magpie_gateway(base_url.as_deref(), Some(&gw_key))
+        .await
+        .map_err(err)
+}
+
+#[tauri::command]
+async fn connect_magpie(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    base_url: Option<String>,
+    model: Option<String>,
+    auto_start: Option<bool>,
+) -> CmdResult<MagpieConnectResult> {
+    let gw_key = state.vault.get("llm_magpie").unwrap_or_default();
+    let mut probe = magpie::probe_magpie(base_url.as_deref(), Some(&gw_key)).await;
+    if !probe.gateway_online
+        && auto_start.unwrap_or(true)
+        && magpie::is_loopback_url(&probe.base_url)
+        && probe.cli_installed
+    {
+        if let Ok(started) =
+            magpie::start_local_magpie_gateway(Some(&probe.base_url), Some(&gw_key)).await
+        {
+            probe = started;
+        }
+    }
+
+    let mut ag = state.db.agent_config().map_err(err)?;
+    let prev_preset = ag.preset.trim().to_lowercase();
+    if !prev_preset.is_empty() {
+        ag.profiles.insert(
+            prev_preset,
+            ProviderProfile {
+                base_url: ag.base_url.clone(),
+                api_key: String::new(),
+                model: ag.model.clone(),
+            },
+        );
+    }
+
+    let saved_prof = ag.profiles.get("magpie").cloned();
+    let explicit_model = model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.strip_prefix("magpie/").unwrap_or(s).trim().to_string());
+
+    let chosen_model = if let Some(m) = explicit_model {
+        m
+    } else if let Some(saved_m) = saved_prof
+        .as_ref()
+        .map(|p| p.model.trim())
+        .filter(|s| {
+            !s.is_empty()
+                && !s.eq_ignore_ascii_case("auto")
+                && (probe.models.is_empty() || probe.models.iter().any(|x| x == *s))
+        })
+    {
+        saved_m.to_string()
+    } else if !probe.recommended_model.is_empty() {
+        probe.recommended_model.clone()
+    } else {
+        "auto".to_string()
+    };
+
+    ag.preset = "magpie".to_string();
+    ag.provider = "openai".to_string();
+    ag.base_url = probe.base_url.clone();
+    ag.model = chosen_model;
+    let key_ready = magpie::is_loopback_url(&ag.base_url) || !gw_key.trim().is_empty();
+    if key_ready {
+        ag.enabled = true;
+    }
+
+    ag.profiles.insert(
+        "magpie".to_string(),
+        ProviderProfile {
+            base_url: ag.base_url.clone(),
+            api_key: String::new(),
+            model: ag.model.clone(),
+        },
+    );
+    ag.api_key.clear();
+    for p in ag.profiles.values_mut() {
+        p.api_key.clear();
+    }
+
+    state.db.save_agent_config(&ag).map_err(err)?;
+    let toml = config::sync_disk_toml(&state.app_dir, &state.db).map_err(err)?;
+    let spec = config::build_spec(&state.db).map_err(err)?;
+
+    if ag.enabled && probe.gateway_online {
+        spawn_agent_triage(
+            app.clone(),
+            state.db.clone(),
+            state.vault.clone(),
+            state.watcher.clone(),
+        );
+    }
+
+    let _ = app.emit(
+        "mail-updated",
+        SyncReport {
+            new_incoming: 0,
+            agent_processed: 0,
+            error: None,
+        },
+    );
+
+    Ok(MagpieConnectResult {
+        probe,
+        agent_config: ag,
+        bundle: DeclarativeBundle {
+            path: config_file_path(&state),
+            toml,
+            spec,
+            secrets: vault_statuses(&state.db, &state.vault),
+        },
+    })
+}
+
+#[tauri::command]
 fn window_action(window: tauri::WebviewWindow, action: String) -> CmdResult<bool> {
     match action.as_str() {
         "drag" => {
@@ -1791,35 +2020,52 @@ fn save_contact_profile(
     Ok(saved)
 }
 
-fn resolve_safe_attachment_path(state: &AppState, rel_path: &str) -> CmdResult<PathBuf> {
-    let clean = rel_path.trim();
-    if clean.is_empty()
-        || clean.contains("..")
-        || clean.contains('/')
-        || clean.contains('\\')
-        || clean.contains(':')
-        || clean.chars().any(|c| c.is_control())
-    {
-        return Err("非法的本地附件路径".into());
-    }
-    let full = state.db.attachments_dir().join(clean);
-    if !full.exists() {
-        return Err("本地附件文件不存在或已被清理".into());
-    }
-    Ok(full)
-}
-
-#[tauri::command]
-fn read_attachment_data_url(state: State<AppState>, rel_path: String) -> CmdResult<String> {
-    let full = resolve_safe_attachment_path(&state, &rel_path)?;
-    let bytes = std::fs::read(&full).map_err(err)?;
-    let mime_raw = mail::infer_mime_type(&rel_path, "", &bytes);
-    let mime = mime_raw
-        .split(';')
+fn is_dangerous_executable_filename(name: &str) -> bool {
+    let base = name
+        .rsplit(['/', '\\'])
         .next()
-        .unwrap_or("application/octet-stream")
-        .trim();
-    Ok(format!("data:{mime};base64,{}", mail::base64_encode(&bytes)))
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(|c: char| c.is_whitespace() || c == '.');
+    let ext = match base.rsplit_once('.') {
+        Some((_, e)) => e.trim().to_ascii_lowercase(),
+        None => return false,
+    };
+    matches!(
+        ext.as_str(),
+        "exe"
+            | "msi"
+            | "msp"
+            | "bat"
+            | "cmd"
+            | "com"
+            | "scr"
+            | "pif"
+            | "vbs"
+            | "vbe"
+            | "js"
+            | "jse"
+            | "wsf"
+            | "wsh"
+            | "ps1"
+            | "psm1"
+            | "hta"
+            | "cpl"
+            | "jar"
+            | "reg"
+            | "lnk"
+            | "dll"
+            | "sys"
+            | "msc"
+            | "application"
+            | "appref-ms"
+            | "iso"
+            | "img"
+            | "vhd"
+            | "vhdx"
+    )
 }
 
 #[cfg(target_os = "windows")]
@@ -1865,9 +2111,378 @@ fn win_shell_open(target: &str) -> CmdResult<()> {
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
+fn pick_save_file_path(
+    hwnd_owner: isize,
+    default_filename: &str,
+    initial_dir: Option<&std::path::Path>,
+) -> CmdResult<Option<PathBuf>> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    #[repr(C)]
+    struct OpenFileNameW {
+        l_struct_size: u32,
+        hwnd_owner: isize,
+        h_instance: isize,
+        lpstr_filter: *const u16,
+        lpstr_custom_filter: *mut u16,
+        n_max_cust_filter: u32,
+        n_filter_index: u32,
+        lpstr_file: *mut u16,
+        n_max_file: u32,
+        lpstr_file_title: *mut u16,
+        n_max_file_title: u32,
+        lpstr_initial_dir: *const u16,
+        lpstr_title: *const u16,
+        flags: u32,
+        n_file_offset: u16,
+        n_file_extension: u16,
+        lpstr_def_ext: *const u16,
+        l_cust_data: isize,
+        lpfn_hook: *const core::ffi::c_void,
+        lp_template_name: *const u16,
+        pv_reserved: *mut core::ffi::c_void,
+        dw_reserved: u32,
+        flags_ex: u32,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LoadLibraryA(lp_lib_file_name: *const u8) -> isize;
+        fn GetProcAddress(h_module: isize, lp_proc_name: *const u8) -> *const core::ffi::c_void;
+    }
+    type GetSaveFileNameWFn = unsafe extern "system" fn(*mut OpenFileNameW) -> i32;
+    type CommDlgExtendedErrorFn = unsafe extern "system" fn() -> u32;
+
+    const OFN_OVERWRITEPROMPT: u32 = 0x0000_0002;
+    const OFN_NOCHANGEDIR: u32 = 0x0000_0008;
+    const OFN_PATHMUSTEXIST: u32 = 0x0000_0800;
+    const OFN_EXPLORER: u32 = 0x0008_0000;
+    const OFN_DONTADDTORECENT: u32 = 0x0200_0000;
+
+    let clean_name = mail::sanitize_attachment_filename(default_filename, "application/octet-stream");
+    let ext = clean_name
+        .rsplit_once('.')
+        .map(|(_, e)| e.trim().to_ascii_lowercase())
+        .filter(|e| !e.is_empty() && e.len() <= 16 && e.chars().all(|c| c.is_ascii_alphanumeric()));
+
+    let filter_str = if let Some(ref e) = ext {
+        format!(
+            "{} 文件 (*.{})\0*.{}\0所有文件 (*.*)\0*.*\0\0",
+            e.to_ascii_uppercase(),
+            e,
+            e
+        )
+    } else {
+        "所有文件 (*.*)\0*.*\0\0".to_string()
+    };
+    let filter_u16: Vec<u16> = filter_str.encode_utf16().collect();
+    let def_ext_u16: Option<Vec<u16>> = ext.map(|e| e.encode_utf16().chain(std::iter::once(0)).collect());
+    let title_u16: Vec<u16> = "另存邮件附件为\0".encode_utf16().collect();
+    let init_dir_u16: Option<Vec<u16>> = initial_dir
+        .filter(|p| p.is_dir())
+        .map(|p| p.as_os_str().encode_wide().chain(std::iter::once(0)).collect());
+
+    let run_dialog = |use_init_dir: bool| -> CmdResult<(i32, u32, Vec<u16>)> {
+        let mut file_buf = vec![0u16; 4096];
+        let name_wide: Vec<u16> = std::ffi::OsStr::new(&clean_name).encode_wide().collect();
+        if name_wide.len() + 1 < file_buf.len() {
+            file_buf[..name_wide.len()].copy_from_slice(&name_wide);
+        }
+
+        let mut ofn = OpenFileNameW {
+            l_struct_size: core::mem::size_of::<OpenFileNameW>() as u32,
+            hwnd_owner,
+            h_instance: 0,
+            lpstr_filter: filter_u16.as_ptr(),
+            lpstr_custom_filter: std::ptr::null_mut(),
+            n_max_cust_filter: 0,
+            n_filter_index: 1,
+            lpstr_file: file_buf.as_mut_ptr(),
+            n_max_file: file_buf.len() as u32,
+            lpstr_file_title: std::ptr::null_mut(),
+            n_max_file_title: 0,
+            lpstr_initial_dir: if use_init_dir {
+                init_dir_u16.as_ref().map(|v| v.as_ptr()).unwrap_or(std::ptr::null())
+            } else {
+                std::ptr::null()
+            },
+            lpstr_title: title_u16.as_ptr(),
+            flags: OFN_OVERWRITEPROMPT
+                | OFN_NOCHANGEDIR
+                | OFN_PATHMUSTEXIST
+                | OFN_EXPLORER
+                | OFN_DONTADDTORECENT,
+            n_file_offset: 0,
+            n_file_extension: 0,
+            lpstr_def_ext: def_ext_u16.as_ref().map(|v| v.as_ptr()).unwrap_or(std::ptr::null()),
+            l_cust_data: 0,
+            lpfn_hook: std::ptr::null(),
+            lp_template_name: std::ptr::null(),
+            pv_reserved: std::ptr::null_mut(),
+            dw_reserved: 0,
+            flags_ex: 0,
+        };
+
+        unsafe {
+            let hmod = LoadLibraryA(b"comdlg32.dll\0".as_ptr());
+            if hmod == 0 {
+                return Err("无法加载系统 comdlg32 对话框组件".into());
+            }
+            let proc_ptr = GetProcAddress(hmod, b"GetSaveFileNameW\0".as_ptr());
+            if proc_ptr.is_null() {
+                return Err("无法定位 GetSaveFileNameW 入口".into());
+            }
+            let err_ptr = GetProcAddress(hmod, b"CommDlgExtendedError\0".as_ptr());
+            let save_fn: GetSaveFileNameWFn = core::mem::transmute(proc_ptr);
+            let ok = save_fn(&mut ofn);
+            let dlg_err = if ok == 0 && !err_ptr.is_null() {
+                let err_fn: CommDlgExtendedErrorFn = core::mem::transmute(err_ptr);
+                err_fn()
+            } else {
+                0
+            };
+            Ok((ok, dlg_err, file_buf))
+        }
+    };
+
+    let (mut ok, mut dlg_err, mut file_buf) = run_dialog(true)?;
+    if ok == 0 && dlg_err != 0 {
+        // 若默认下载目录句柄异常导致系统对话框报错，去除初始目录重试一次
+        let retry = run_dialog(false)?;
+        ok = retry.0;
+        dlg_err = retry.1;
+        file_buf = retry.2;
+    }
+    if ok == 0 {
+        if dlg_err != 0 {
+            return Err(format!("打开系统另存为对话框失败 (code 0x{dlg_err:x})"));
+        }
+        return Ok(None);
+    }
+
+    let len = file_buf.iter().position(|&c| c == 0).unwrap_or(file_buf.len());
+    if len == 0 {
+        return Ok(None);
+    }
+    let chosen = std::ffi::OsString::from_wide(&file_buf[..len]);
+    Ok(Some(PathBuf::from(chosen)))
+}
+
+#[cfg(target_os = "macos")]
+fn pick_save_file_path(
+    _hwnd_owner: isize,
+    default_filename: &str,
+    _initial_dir: Option<&std::path::Path>,
+) -> CmdResult<Option<PathBuf>> {
+    let clean_name = mail::sanitize_attachment_filename(default_filename, "application/octet-stream")
+        .replace('\\', "")
+        .replace('"', "");
+    let script = format!(
+        "POSIX path of (choose file name with prompt \"另存邮件附件为\" default name \"{clean_name}\")"
+    );
+    let out = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .map_err(err)?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let path_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if path_str.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(PathBuf::from(path_str)))
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn pick_save_file_path(
+    _hwnd_owner: isize,
+    default_filename: &str,
+    initial_dir: Option<&std::path::Path>,
+) -> CmdResult<Option<PathBuf>> {
+    let clean_name = mail::sanitize_attachment_filename(default_filename, "application/octet-stream");
+    let default_target = initial_dir
+        .filter(|p| p.is_dir())
+        .map(|p| p.join(&clean_name))
+        .unwrap_or_else(|| PathBuf::from(&clean_name));
+    let out = std::process::Command::new("zenity")
+        .args([
+            "--file-selection",
+            "--save",
+            "--confirm-overwrite",
+            "--title=另存邮件附件为",
+            &format!("--filename={}", default_target.to_string_lossy()),
+        ])
+        .output()
+        .map_err(|e| format!("无法调用系统文件保存对话框 (zenity): {e}"))?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let path_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if path_str.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(PathBuf::from(path_str)))
+    }
+}
+
+fn resolve_account_for_locator(state: &AppState, account_email: &str) -> CmdResult<Account> {
+    let acc_opt = if !account_email.is_empty() && account_email != db::UNBOUND_SCOPE {
+        config::hydrated_account_for(&state.db, &state.vault, account_email).map_err(err)?
+    } else {
+        config::hydrated_account(&state.db, &state.vault).map_err(err)?
+    };
+    let acc = acc_opt.ok_or("未找到对应邮箱账号配置，请先连接邮箱账号")?;
+    if acc.imap_host.trim().is_empty() || acc.password.trim().is_empty() {
+        return Err("邮箱账号尚未配置 IMAP 服务器或授权码".into());
+    }
+    Ok(acc)
+}
+
+/// 仅对图片附件按需拉取至内存生成 `data:` 预览 URI（绝不写入本地磁盘，且拒绝一切非图片/可执行文件）
 #[tauri::command]
-fn open_attachment(state: State<AppState>, rel_path: String) -> CmdResult<()> {
-    let full = resolve_safe_attachment_path(&state, &rel_path)?;
+async fn preview_attachment_data_url(
+    state: State<'_, AppState>,
+    message_id: i64,
+    attachment_id: String,
+) -> CmdResult<String> {
+    let loc = state
+        .db
+        .locate_attachment(message_id, &attachment_id)
+        .map_err(err)?
+        .ok_or("找不到该图片附件记录")?;
+
+    if !loc.meta.is_image || is_dangerous_executable_filename(&loc.meta.filename) {
+        return Err("安全限制：仅允许在内存中预览图片类型附件".into());
+    }
+
+    let (bytes, mime_hint) = if !loc.meta.saved_path.is_empty()
+        && std::path::Path::new(&loc.meta.saved_path).is_file()
+    {
+        let b = std::fs::read(&loc.meta.saved_path).map_err(err)?;
+        (b, loc.meta.mime.clone())
+    } else {
+        let acc = resolve_account_for_locator(&state, &loc.account_email)?;
+        let folder = loc.folder.clone();
+        let uid = loc.uid;
+        let rfc_mid = loc.rfc_message_id.clone();
+        let meta = loc.meta.clone();
+        spawn_mail_blocking(move || mail::fetch_attachment_bytes(&acc, &folder, uid, &rfc_mid, &meta))
+            .await?
+    };
+
+    let mime_full = mail::infer_mime_type(&loc.meta.filename, &mime_hint, &bytes);
+    let mime = mime_full
+        .split(';')
+        .next()
+        .unwrap_or("application/octet-stream")
+        .trim();
+    if !mime.starts_with("image/") {
+        return Err("该附件实际内容不是受支持的图片格式".into());
+    }
+    Ok(format!("data:{mime};base64,{}", mail::base64_encode(&bytes)))
+}
+
+/// 用户主动点击“下载 / 另存为”时：先弹出系统文件保存对话框，用户确认目标路径后才从 IMAP 按需拉取并写入该路径
+#[tauri::command]
+async fn save_attachment_as(
+    window: tauri::WebviewWindow,
+    app: AppHandle,
+    state: State<'_, AppState>,
+    message_id: i64,
+    attachment_id: String,
+) -> CmdResult<Option<AttachmentMeta>> {
+    let loc = state
+        .db
+        .locate_attachment(message_id, &attachment_id)
+        .map_err(err)?
+        .ok_or("找不到该附件记录")?;
+
+    #[cfg(target_os = "windows")]
+    let hwnd_owner = window.hwnd().ok().map(|h| h.0 as isize).unwrap_or(0);
+    #[cfg(not(target_os = "windows"))]
+    let hwnd_owner = {
+        let _ = &window;
+        0isize
+    };
+
+    let download_dir = app.path().download_dir().ok();
+    let default_name = loc.meta.filename.clone();
+    let chosen_opt = tokio::task::spawn_blocking(move || {
+        pick_save_file_path(hwnd_owner, &default_name, download_dir.as_deref())
+    })
+    .await
+    .map_err(|e| format!("等待系统保存对话框失败: {e}"))??;
+
+    // 用户取消“另存为”对话框：零网络请求、零磁盘写入
+    let Some(target_path) = chosen_opt else {
+        return Ok(None);
+    };
+
+    let bytes = if !loc.meta.saved_path.is_empty()
+        && std::path::Path::new(&loc.meta.saved_path).is_file()
+    {
+        std::fs::read(&loc.meta.saved_path).map_err(err)?
+    } else {
+        let acc = resolve_account_for_locator(&state, &loc.account_email)?;
+        let folder = loc.folder.clone();
+        let uid = loc.uid;
+        let rfc_mid = loc.rfc_message_id.clone();
+        let meta = loc.meta.clone();
+        let (b, _) = spawn_mail_blocking(move || {
+            mail::fetch_attachment_bytes(&acc, &folder, uid, &rfc_mid, &meta)
+        })
+        .await?;
+        b
+    };
+
+    if let Some(parent) = target_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(err)?;
+        }
+    }
+    std::fs::write(&target_path, &bytes)
+        .map_err(|e| format!("写入目标保存路径失败: {e}"))?;
+
+    let saved_str = target_path.to_string_lossy().to_string();
+    let updated = state
+        .db
+        .record_attachment_saved_path(message_id, &loc.meta.id, &saved_str)
+        .map_err(err)?;
+    Ok(updated)
+}
+
+#[tauri::command]
+fn open_saved_attachment(
+    state: State<AppState>,
+    message_id: i64,
+    attachment_id: String,
+) -> CmdResult<()> {
+    let loc = state
+        .db
+        .locate_attachment(message_id, &attachment_id)
+        .map_err(err)?
+        .ok_or("找不到该附件记录")?;
+
+    if is_dangerous_executable_filename(&loc.meta.filename)
+        || is_dangerous_executable_filename(&loc.meta.saved_path)
+    {
+        return Err(
+            "安全保护：禁止直接启动可执行程序或脚本附件，请在文件夹中核实来源与签名后谨慎处理".into(),
+        );
+    }
+
+    if loc.meta.saved_path.trim().is_empty() {
+        return Err("请先手动下载保存该文件后再打开".into());
+    }
+    let full = PathBuf::from(&loc.meta.saved_path);
+    if !full.is_file() {
+        return Err("已保存的本地文件不存在（可能已被移动或删除），请重新下载保存".into());
+    }
+
     #[cfg(target_os = "windows")]
     {
         win_shell_open(&full.to_string_lossy())
@@ -1891,8 +2506,25 @@ fn open_attachment(state: State<AppState>, rel_path: String) -> CmdResult<()> {
 }
 
 #[tauri::command]
-fn reveal_attachment(state: State<AppState>, rel_path: String) -> CmdResult<()> {
-    let full = resolve_safe_attachment_path(&state, &rel_path)?;
+fn reveal_saved_attachment(
+    state: State<AppState>,
+    message_id: i64,
+    attachment_id: String,
+) -> CmdResult<()> {
+    let loc = state
+        .db
+        .locate_attachment(message_id, &attachment_id)
+        .map_err(err)?
+        .ok_or("找不到该附件记录")?;
+
+    if loc.meta.saved_path.trim().is_empty() {
+        return Err("该附件尚未下载保存".into());
+    }
+    let full = PathBuf::from(&loc.meta.saved_path);
+    if !full.is_file() {
+        return Err("已保存的本地文件不存在（可能已被移动或删除）".into());
+    }
+
     #[cfg(target_os = "windows")]
     {
         std::process::Command::new("explorer.exe")
@@ -1958,17 +2590,27 @@ async fn send_message(
         (p.clone(), vec![p], None, None, false)
     };
 
+    const MAX_SEND_ATT_BYTES: usize = 25 * 1024 * 1024;
     let mut saved_metas: Vec<AttachmentMeta> = Vec::with_capacity(incoming_atts.len());
     let mut outgoing_atts: Vec<mail::OutgoingAttachment> = Vec::with_capacity(incoming_atts.len());
-    for item in incoming_atts {
+    for (idx, item) in incoming_atts.into_iter().enumerate() {
         let bytes = mail::base64_decode(&item.data_base64).map_err(err)?;
-        let meta = mail::save_attachment_bytes(
-            state.db.attachments_dir(),
+        if bytes.is_empty() {
+            return Err("附件内容为空".into());
+        }
+        if bytes.len() > MAX_SEND_ATT_BYTES {
+            return Err("单个附件大小不能超过 25 MB".into());
+        }
+        // 严禁在发信时把附件自动拷贝落盘到应用数据目录！仅构造内存元数据供展示
+        let meta = mail::build_attachment_meta(
             &item.filename,
             &item.mime,
+            bytes.len(),
+            "",
+            "",
+            idx,
             &bytes,
-        )
-        .map_err(err)?;
+        );
         outgoing_atts.push(mail::OutgoingAttachment {
             filename: meta.filename.clone(),
             mime: meta.mime.clone(),
@@ -2146,6 +2788,56 @@ fn set_message_status(state: State<AppState>, id: i64, status: String) -> CmdRes
 #[tauri::command]
 fn move_conversation(state: State<AppState>, peer: String, status: String) -> CmdResult<()> {
     state.db.move_peer(&peer, &status).map_err(err)
+}
+
+#[tauri::command]
+fn set_conversation_pinned(state: State<AppState>, peer: String, pinned: bool) -> CmdResult<()> {
+    state.db.set_peer_pinned(&peer, pinned).map_err(err)
+}
+
+#[tauri::command]
+fn set_conversation_read(
+    state: State<AppState>,
+    peer: String,
+    status: String,
+    read: bool,
+) -> CmdResult<()> {
+    state.db.set_peer_read(&peer, &status, read).map_err(err)
+}
+
+#[tauri::command]
+fn mark_all_read(state: State<AppState>, status: String) -> CmdResult<usize> {
+    state.db.mark_all_read(&status).map_err(err)
+}
+
+#[tauri::command]
+fn set_conversation_muted(state: State<AppState>, peer: String, muted: bool) -> CmdResult<()> {
+    state.db.set_peer_muted(&peer, muted).map_err(err)?;
+    if peer.trim().starts_with("group:") {
+        refresh_disk_toml(&state);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_message(state: State<AppState>, id: i64) -> CmdResult<()> {
+    state.db.delete_message(id).map_err(err)
+}
+
+#[tauri::command]
+fn delete_conversation(
+    state: State<AppState>,
+    peer: String,
+    status: Option<String>,
+) -> CmdResult<usize> {
+    let deleted = state
+        .db
+        .delete_conversation(&peer, status.as_deref())
+        .map_err(err)?;
+    if peer.trim().starts_with("group:") {
+        refresh_disk_toml(&state);
+    }
+    Ok(deleted)
 }
 
 #[tauri::command]
@@ -2345,6 +3037,75 @@ fn open_external_url(url: String) -> CmdResult<()> {
     }
 }
 
+#[tauri::command]
+fn start_screen_snip() -> CmdResult<()> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn LoadLibraryA(lp_lib_file_name: *const u8) -> isize;
+            fn GetProcAddress(h_module: isize, lp_proc_name: *const u8) -> *const core::ffi::c_void;
+        }
+        type ShellExecuteWFn = unsafe extern "system" fn(
+            isize,
+            *const u16,
+            *const u16,
+            *const u16,
+            *const u16,
+            i32,
+        ) -> isize;
+
+        let op: Vec<u16> = std::ffi::OsStr::new("open")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let uri: Vec<u16> = std::ffi::OsStr::new("ms-screenclip:")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let ret = unsafe {
+            let hmod = LoadLibraryA(b"shell32.dll\0".as_ptr());
+            if hmod == 0 {
+                0
+            } else {
+                let proc_ptr = GetProcAddress(hmod, b"ShellExecuteW\0".as_ptr());
+                if proc_ptr.is_null() {
+                    0
+                } else {
+                    let func: ShellExecuteWFn = core::mem::transmute(proc_ptr);
+                    func(0, op.as_ptr(), uri.as_ptr(), std::ptr::null(), std::ptr::null(), 1)
+                }
+            }
+        };
+        if ret <= 32 {
+            std::process::Command::new("SnippingTool.exe")
+                .arg("/clip")
+                .spawn()
+                .map_err(|e| format!("无法启动系统截图工具：{e}"))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("screencapture")
+            .args(["-i", "-c"])
+            .spawn()
+            .map_err(err)?;
+        Ok(())
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("gnome-screenshot")
+            .args(["-a", "-c"])
+            .spawn()
+            .map_err(|e| format!("无法启动系统截图工具：{e}"))?;
+        Ok(())
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn apply_win11_window_style(window: &tauri::WebviewWindow) {
     #[link(name = "kernel32")]
@@ -2432,8 +3193,9 @@ pub fn run() {
 
             let syncing = Arc::new(AtomicBool::new(false));
             let watcher = Arc::new(WatcherControl::new());
+            let app_dir_for_state = dir.clone();
             app.manage(AppState {
-                app_dir: dir,
+                app_dir: app_dir_for_state,
                 db: db.clone(),
                 vault: vault.clone(),
                 syncing: syncing.clone(),
@@ -2442,6 +3204,70 @@ pub fn run() {
             });
 
             let handle = app.handle().clone();
+
+            // 零配置无感沿用：若用户尚未启用/配置任何模型 API Key，且本机 Magpie 路由网关已在线并配好模型，自动在后台沿用接入
+            let should_probe_adopt = db
+                .agent_config()
+                .ok()
+                .map(|ag| {
+                    !ag.enabled
+                        && vault::KNOWN_SECRETS
+                            .iter()
+                            .filter(|(_, _, cat)| *cat == "llm")
+                            .all(|(k, _, _)| vault.get(k).is_none())
+                })
+                .unwrap_or(false);
+            if should_probe_adopt {
+                let handle_adopt = handle.clone();
+                let db_adopt = db.clone();
+                let vault_adopt = vault.clone();
+                let watcher_adopt = watcher.clone();
+                let dir_adopt = dir.clone();
+                tauri::async_runtime::spawn(async move {
+                    let probe = magpie::probe_magpie(None, None).await;
+                    if !probe.gateway_online || probe.models.is_empty() {
+                        return;
+                    }
+                    let Ok(mut cur) = db_adopt.agent_config() else {
+                        return;
+                    };
+                    if cur.enabled {
+                        return;
+                    }
+                    let chosen = if probe.recommended_model.is_empty() {
+                        "auto".to_string()
+                    } else {
+                        probe.recommended_model.clone()
+                    };
+                    cur.preset = "magpie".into();
+                    cur.provider = "openai".into();
+                    cur.base_url = probe.base_url.clone();
+                    cur.model = chosen.clone();
+                    cur.enabled = true;
+                    cur.api_key.clear();
+                    cur.profiles.insert(
+                        "magpie".into(),
+                        ProviderProfile {
+                            base_url: probe.base_url,
+                            api_key: String::new(),
+                            model: chosen,
+                        },
+                    );
+                    if db_adopt.save_agent_config(&cur).is_ok() {
+                        let _ = config::sync_disk_toml(&dir_adopt, &db_adopt);
+                        let _ = handle_adopt.emit(
+                            "mail-updated",
+                            SyncReport {
+                                new_incoming: 0,
+                                agent_processed: 0,
+                                error: None,
+                            },
+                        );
+                        spawn_agent_triage(handle_adopt, db_adopt, vault_adopt, watcher_adopt);
+                    }
+                });
+            }
+
             spawn_agent_triage(handle.clone(), db.clone(), vault.clone(), watcher.clone());
             spawn_realtime_imap_watcher(handle, db, vault, watcher);
             Ok(())
@@ -2460,6 +3286,7 @@ pub fn run() {
             get_agent_session_turns,
             delete_agent_session,
             clear_agent_session_turns,
+            rewind_agent_session,
             switch_active_model,
             list_accounts,
             get_account,
@@ -2471,6 +3298,9 @@ pub fn run() {
             save_agent_config,
             test_agent,
             fetch_models,
+            probe_magpie,
+            start_magpie_gateway,
+            connect_magpie,
             window_action,
             reclassify_messages,
             sync_now,
@@ -2484,12 +3314,19 @@ pub fn run() {
             update_group,
             get_contact_profile,
             save_contact_profile,
-            read_attachment_data_url,
-            open_attachment,
-            reveal_attachment,
+            preview_attachment_data_url,
+            save_attachment_as,
+            open_saved_attachment,
+            reveal_saved_attachment,
             send_message,
             set_message_status,
             move_conversation,
+            set_conversation_pinned,
+            set_conversation_read,
+            mark_all_read,
+            set_conversation_muted,
+            delete_message,
+            delete_conversation,
             block_sender,
             allow_sender,
             list_rules,
@@ -2501,7 +3338,33 @@ pub fn run() {
             load_demo_data,
             clear_demo_data,
             open_external_url,
+            start_screen_snip,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod attachment_security_tests {
+    use super::is_dangerous_executable_filename;
+
+    #[test]
+    fn blocks_executables_scripts_and_windows_trailing_dot_bypasses() {
+        assert!(is_dangerous_executable_filename("JiJiDown_setup.exe"));
+        assert!(is_dangerous_executable_filename("JiJiDown_setup.EXE."));
+        assert!(is_dangerous_executable_filename("JiJiDown_setup.exe   "));
+        assert!(is_dangerous_executable_filename("payload.exe:$DATA"));
+        assert!(is_dangerous_executable_filename("invoice.pdf.scr"));
+        assert!(is_dangerous_executable_filename("install.msi"));
+        assert!(is_dangerous_executable_filename("run.bat"));
+        assert!(is_dangerous_executable_filename("dropper.ps1"));
+        assert!(is_dangerous_executable_filename("shortcut.lnk"));
+        assert!(is_dangerous_executable_filename("archive.iso"));
+
+        assert!(!is_dangerous_executable_filename("派发通知.docx"));
+        assert!(!is_dangerous_executable_filename("核对！.docx"));
+        assert!(!is_dangerous_executable_filename("Horoscope.txt"));
+        assert!(!is_dangerous_executable_filename("image.png"));
+        assert!(!is_dangerous_executable_filename("report.pdf"));
+    }
 }

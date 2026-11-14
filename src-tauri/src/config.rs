@@ -241,9 +241,10 @@ pub fn mail_domain_defaults(email: &str) -> Option<(&'static str, u16, &'static 
 }
 
 /// 主流模型预设默认连接参数：(provider, base_url, default_model)
-/// 首选推荐接入：DeepSeek 官网、OpenCode Go、Ollama 远程订阅（均默认搭载 deepseek-v4.1-flash）
+/// 首选推荐接入：Magpie 本地模型路由（免配直接沿用）、DeepSeek 官网、OpenCode Go、Ollama 远程订阅
 pub fn model_preset_defaults(preset: &str) -> (&'static str, &'static str, &'static str) {
     match preset.trim().to_lowercase().as_str() {
+        "magpie" => ("openai", "http://127.0.0.1:3425/v1", "auto"),
         "deepseek" => ("openai", "https://api.deepseek.com/v1", "deepseek-v4.1-flash"),
         "opencode_go" => ("openai", "https://opencode.ai/inference/go/openai/v1", "deepseek-v4.1-flash"),
         "ollama_cloud" => ("openai", "https://ollama.com/v1", "deepseek-v4.1-flash"),
@@ -372,9 +373,15 @@ pub fn build_spec(db: &Db) -> Result<DeclarativeConfig> {
         .collect();
 
     let ag = db.agent_config()?;
-    let api_key_ref = llm_secret_key(&ag.preset)
-        .map(|k| format!("secret:{k}"))
-        .unwrap_or_else(|| "none (local)".into());
+    let api_key_ref = if ag.preset.trim().eq_ignore_ascii_case("magpie")
+        && (ag.base_url.trim().is_empty() || crate::magpie::is_loopback_url(&ag.base_url))
+    {
+        "none (magpie-local)".into()
+    } else {
+        llm_secret_key(&ag.preset)
+            .map(|k| format!("secret:{k}"))
+            .unwrap_or_else(|| "none (local)".into())
+    };
     let mut profiles = BTreeMap::new();
     for (k, v) in ag.profiles {
         if !v.base_url.is_empty() || !v.model.is_empty() {
@@ -562,6 +569,8 @@ pub fn apply_spec(app_dir: &Path, spec: &DeclarativeConfig, db: &Db, vault: &Vau
     };
     let base_url = if !spec.agent.base_url.trim().is_empty() {
         spec.agent.base_url.trim().to_string()
+    } else if preset == "magpie" {
+        crate::magpie::configured_local_base_url()
     } else {
         def_base.to_string()
     };

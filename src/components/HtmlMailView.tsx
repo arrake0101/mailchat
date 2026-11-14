@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api";
 import type { Status } from "../types";
+import { useContextMenu } from "./ContextMenu";
 
 const QUOTE_CONTAINER_SELECTORS = [
   ".gmail_quote",
@@ -404,16 +405,27 @@ pre { white-space: pre-wrap; word-break: break-word; }
   return { srcDoc, blockedImages };
 }
 
+export interface HtmlMailContextInfo {
+  clientX: number;
+  clientY: number;
+  selectedText: string;
+  linkUrl: string | null;
+}
+
 interface HtmlMailViewProps {
   html: string;
   status: Status;
+  onContextMenuRequest?: (info: HtmlMailContextInfo) => void;
 }
 
-export function HtmlMailView({ html, status }: HtmlMailViewProps) {
+export function HtmlMailView({ html, status, onContextMenuRequest }: HtmlMailViewProps) {
+  const { closeContextMenu } = useContextMenu();
   const [allowRemoteImages, setAllowRemoteImages] = useState(status !== "blocked");
   const [height, setHeight] = useState(96);
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const cleanupRef = useRef<(() => void) | null>(null);
+  const onCtxRef = useRef(onContextMenuRequest);
+  onCtxRef.current = onContextMenuRequest;
 
   useEffect(() => {
     setAllowRemoteImages(status !== "blocked");
@@ -496,7 +508,33 @@ export function HtmlMailView({ html, status }: HtmlMailViewProps) {
       void api.openExternalUrl(rawHref);
     };
 
+    const onPointerDown = () => {
+      closeContextMenu();
+    };
+
+    const onContextMenu = (e: MouseEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const iframeRect = iframe.getBoundingClientRect();
+      const clientX = Math.round(iframeRect.left + e.clientX);
+      const clientY = Math.round(iframeRect.top + e.clientY);
+      const selectedText = doc.getSelection()?.toString().trim() ?? "";
+      const targetEl = e.target as Element | null;
+      const anchor = targetEl?.closest?.("a[href]") as HTMLAnchorElement | null;
+      const rawHref = (anchor?.getAttribute("href") || "").trim();
+      const linkUrl =
+        rawHref && !rawHref.startsWith("#") && isSafeLinkHref(rawHref) ? rawHref : null;
+      onCtxRef.current?.({
+        clientX,
+        clientY,
+        selectedText,
+        linkUrl,
+      });
+    };
+
     doc.addEventListener("click", onClick, true);
+    doc.addEventListener("pointerdown", onPointerDown, true);
+    doc.addEventListener("contextmenu", onContextMenu, true);
 
     const imgs = Array.from(doc.images);
     for (const img of imgs) {
@@ -517,13 +555,15 @@ export function HtmlMailView({ html, status }: HtmlMailViewProps) {
       window.clearTimeout(t1);
       window.clearTimeout(t2);
       doc.removeEventListener("click", onClick, true);
+      doc.removeEventListener("pointerdown", onPointerDown, true);
+      doc.removeEventListener("contextmenu", onContextMenu, true);
       for (const img of imgs) {
         img.removeEventListener("load", scheduleMeasure);
         img.removeEventListener("error", scheduleMeasure);
       }
       innerRo?.disconnect();
     };
-  }, [status]);
+  }, [status, closeContextMenu]);
 
   return (
     <div className="html-mail-surface">

@@ -501,7 +501,7 @@ export function IconSmile(p: IconProps) {
   );
 }
 
-/** 40 · SCISSORS — 屏幕区域截图剪刀 */
+/** 40 · SCISSORS — 剪切剪刀标识 */
 export function IconScissors(p: IconProps) {
   return (
     <Base {...p}>
@@ -528,6 +528,90 @@ export function IconForward(p: IconProps) {
     <Base {...p}>
       <path d="M14.5 7 19.5 11.5 14.5 16" />
       <path d="M19 11.5H7.5V18" />
+    </Base>
+  );
+}
+
+/** 43 · MAIL READ — 标为已读（翻盖开启的几何信封） */
+export function IconMailRead(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M4 9.5 12 4.5 20 9.5V19H4V9.5Z" />
+      <path d="m4.5 10 7.5 4.8L19.5 10" />
+    </Base>
+  );
+}
+
+/** 44 · MAIL UNREAD — 标为未读（闭合信封 + 蓝点未读指示） */
+export function IconMailUnread(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M19.5 10.5V18.5H4V6.5H14" />
+      <path d="m4.5 7 7.5 5.2 3.5-2.4" />
+      <circle cx="18.5" cy="6.5" r="2.2" fill="var(--accent, #3563e9)" stroke="none" />
+    </Base>
+  );
+}
+
+/** 45 · PASTE — 剪贴板粘贴框 */
+export function IconPaste(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M8.5 5.5H5.5V19.5H18.5V5.5H15.5" />
+      <rect x="8.5" y="3.75" width="7" height="3.5" />
+      <path d="M9 11.5H15M9 15H13.5" />
+    </Base>
+  );
+}
+
+/** 46 · SELECT ALL — 全选边界刻度框 */
+export function IconSelectAll(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M4.5 8V4.5H8M16 4.5H19.5V8M19.5 16V19.5H16M8 19.5H4.5V16" />
+      <rect x="8.5" y="8.5" width="7" height="7" />
+    </Base>
+  );
+}
+
+/** 47 · UNMUTE — 恢复提醒扬声器声波切线 */
+export function IconUnmute(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M4.5 9.5H8L12.5 5.5V18.5L8 14.5H4.5V9.5Z" />
+      <path d="M16 9V15M19 7V17" />
+    </Base>
+  );
+}
+
+/** 48 · DOWNLOAD — 手动另存为下载指示器 */
+export function IconDownload(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M12 4.5V14.5" />
+      <path d="M8 11L12 15L16 11" />
+      <path d="M4.5 16.5V19.5H19.5V16.5" />
+    </Base>
+  );
+}
+
+/** 49 · ALERT — 高危可执行附件安全警示 */
+export function IconAlert(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M12 4.2L20.2 18.8H3.8L12 4.2Z" />
+      <path d="M12 9.8V13.8" />
+      <circle cx="12" cy="16.4" r="0.9" fill="currentColor" stroke="none" />
+    </Base>
+  );
+}
+
+/** 50 · UNDO — 对话检查点回退左折回环箭头 */
+export function IconUndo(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M8.5 5.5 4.5 9.5 8.5 13.5" />
+      <path d="M5 9.5H15.5C18 9.5 19.5 11 19.5 13.5C19.5 16 18 17.5 15.5 17.5H10" />
     </Base>
   );
 }

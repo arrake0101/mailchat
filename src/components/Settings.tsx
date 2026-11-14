@@ -5,6 +5,7 @@ import {
   type Account,
   type AccountEntry,
   type AgentConfig,
+  type MagpieProbeReport,
   type ProviderPresetId,
   type Rule,
   type RuleKind,
@@ -31,6 +32,7 @@ export type SettingsTab = "declarative" | "vault" | "visual";
 export interface AccountFormIntent {
   seq: number;
   mode: "add" | "manage";
+  presetDomain?: string;
 }
 
 const EMPTY_ACCOUNT: Account = {
@@ -54,7 +56,7 @@ const RULE_LABEL: Record<RuleKind, string> = {
 };
 
 export function Settings({
-  initialTab = "declarative",
+  initialTab = "visual",
   accountIntent,
   activeAccountEmail,
   hasDemo,
@@ -90,17 +92,17 @@ export function Settings({
       >
         <div>
           <div className="pane-title">配置与隐私中心</div>
-          <div className="pane-subtitle">所有非敏感状态由声明式 config.toml 驱动，多账号密码与密钥独立加密存储</div>
+          <div className="pane-subtitle">支持可视化表单与声明式 config.toml 自由切换，多账号密码与密钥独立加密存储</div>
         </div>
         <div className="pane-header-actions">
           <div className="segmented">
             <button
               type="button"
-              className={tab === "declarative" ? "active" : ""}
-              onClick={() => setTab("declarative")}
+              className={tab === "visual" ? "active" : ""}
+              onClick={() => setTab("visual")}
             >
-              <IconCode size={14} />
-              <span>声明式配置</span>
+              <IconSliders size={14} />
+              <span>可视化表单</span>
             </button>
             <button
               type="button"
@@ -112,11 +114,11 @@ export function Settings({
             </button>
             <button
               type="button"
-              className={tab === "visual" ? "active" : ""}
-              onClick={() => setTab("visual")}
+              className={tab === "declarative" ? "active" : ""}
+              onClick={() => setTab("declarative")}
             >
-              <IconSliders size={14} />
-              <span>可视化表单</span>
+              <IconCode size={14} />
+              <span>config.toml</span>
             </button>
           </div>
 
@@ -430,6 +432,9 @@ function VisualTab({
   const [fetchedModels, setFetchedModels] = useState<string[]>([]);
   const [fetchingModels, setFetchingModels] = useState(false);
   const [showMoreProviders, setShowMoreProviders] = useState(false);
+  const [magpieProbe, setMagpieProbe] = useState<MagpieProbeReport | null>(null);
+  const [probingMagpie, setProbingMagpie] = useState(false);
+  const [connectingMagpie, setConnectingMagpie] = useState(false);
   const emailInputRef = useRef<HTMLInputElement>(null);
 
   const entryToAccount = (entry: AccountEntry): Account => ({
@@ -443,7 +448,7 @@ function VisualTab({
     password: "",
   });
 
-  const reloadAll = async (preferAddMode = false) => {
+  const reloadAll = async (preferAddMode = false, presetDomain?: string) => {
     const [accList, activeAcc, ag, secList, ruleList] = await Promise.all([
       api.listAccounts().catch(() => [] as AccountEntry[]),
       api.getAccount(),
@@ -456,12 +461,48 @@ function VisualTab({
     setSecrets(secList);
     setRules(ruleList);
 
+    api
+      .probeMagpie(ag.preset === "magpie" ? ag.base_url : undefined)
+      .then((rep) => {
+        setMagpieProbe(rep);
+        if (ag.preset === "magpie" && rep.models.length > 0) {
+          setFetchedModels(rep.models);
+        }
+      })
+      .catch(() => {});
+
     if (preferAddMode || accList.length === 0) {
       setFormMode("add");
-      setA(EMPTY_ACCOUNT);
+      const preset = presetDomain ? PRESETS[presetDomain] : undefined;
+      if (preset && presetDomain) {
+        const seedEmail = `yourname@${presetDomain}`;
+        setA({
+          ...EMPTY_ACCOUNT,
+          email: seedEmail,
+          username: seedEmail,
+          imap_host: preset.imap_host,
+          imap_port: preset.imap_port,
+          smtp_host: preset.smtp_host,
+          smtp_port: preset.smtp_port,
+        });
+      } else {
+        setA(EMPTY_ACCOUNT);
+      }
       setSetActiveOnSave(true);
       if (preferAddMode) {
-        requestAnimationFrame(() => emailInputRef.current?.focus());
+        requestAnimationFrame(() => {
+          const input = emailInputRef.current;
+          if (!input) return;
+          input.focus();
+          if (preset && presetDomain) {
+            try {
+              input.setSelectionRange(0, "yourname".length);
+            } catch {
+              // email input 在部分内核不支持局部选区时安全回退为全选
+              input.select();
+            }
+          }
+        });
       }
     } else if (activeAcc) {
       setFormMode("edit");
@@ -475,7 +516,7 @@ function VisualTab({
   };
 
   useEffect(() => {
-    reloadAll(accountIntent?.mode === "add");
+    reloadAll(accountIntent?.mode === "add", accountIntent?.presetDomain);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [accountIntent?.seq]);
 
@@ -666,25 +707,110 @@ function VisualTab({
     }
   };
 
+  const refreshMagpieProbe = async (customBase?: string, silent = false) => {
+    if (probingMagpie) return;
+    setProbingMagpie(true);
+    try {
+      const rep = await api.probeMagpie(customBase);
+      setMagpieProbe(rep);
+      if (rep.models.length > 0) {
+        setFetchedModels(rep.models);
+      }
+      if (!silent) {
+        notify(rep.message, !rep.gateway_online && !rep.cli_installed && !rep.config_found);
+      }
+    } catch (e) {
+      if (!silent) notify(`探测 Magpie 状态失败：${e}`, true);
+    } finally {
+      setProbingMagpie(false);
+    }
+  };
+
+  const handleWakeMagpie = async () => {
+    if (connectingMagpie) return;
+    setConnectingMagpie(true);
+    try {
+      const rep = await api.startMagpieGateway(c?.preset === "magpie" ? c.base_url : undefined);
+      setMagpieProbe(rep);
+      if (rep.models.length > 0) {
+        setFetchedModels(rep.models);
+      }
+      setC((prev) =>
+        prev
+          ? {
+              ...prev,
+              base_url: rep.base_url || prev.base_url,
+              model:
+                !prev.model || prev.model === "auto"
+                  ? rep.recommended_model || "auto"
+                  : prev.model,
+            }
+          : prev,
+      );
+      notify(rep.message);
+    } catch (e) {
+      notify(String(e), true);
+    } finally {
+      setConnectingMagpie(false);
+    }
+  };
+
+  const handleAdoptMagpie = async (preferredModel?: string) => {
+    if (connectingMagpie) return;
+    setConnectingMagpie(true);
+    try {
+      const res = await api.connectMagpie({
+        baseUrl: c?.preset === "magpie" ? c.base_url : undefined,
+        model: preferredModel,
+        autoStart: true,
+      });
+      setMagpieProbe(res.probe);
+      setC(res.agent_config);
+      setSecrets(res.bundle.secrets);
+      if (res.probe.models.length > 0) {
+        setFetchedModels(res.probe.models);
+      }
+      onDataChanged();
+      notify(
+        res.probe.gateway_online
+          ? `已免配接入 Magpie 模型路由 · 当前使用 ${res.agent_config.model}`
+          : `已切换至 Magpie 模型路由（${res.probe.message}）`,
+      );
+    } catch (e) {
+      notify(`接入 Magpie 失败：${e}`, true);
+    } finally {
+      setConnectingMagpie(false);
+    }
+  };
+
   const selectPreset = (id: ProviderPresetId) => {
     const target = MODEL_PRESETS.find((p) => p.id === id);
     if (!target || !c) return;
     setTestVerdict(null);
-    setFetchedModels([]);
+    setFetchedModels(id === "magpie" && magpieProbe?.models ? magpieProbe.models : []);
     const savedProfiles = {
       ...c.profiles,
       [c.preset]: { base_url: c.base_url, api_key: "", model: c.model },
     };
     const restored = savedProfiles[id];
+    const magpieBase = id === "magpie" ? magpieProbe?.base_url || target.baseUrl : target.baseUrl;
+    const magpieModel =
+      id === "magpie"
+        ? restored?.model || magpieProbe?.recommended_model || target.defaultModel
+        : restored?.model || target.defaultModel;
     setC({
       ...c,
       preset: id,
       provider: target.provider,
-      base_url: restored?.base_url ?? target.baseUrl,
+      base_url: restored?.base_url || magpieBase,
       api_key: "",
-      model: restored?.model || target.defaultModel,
+      model: magpieModel,
+      enabled: id === "magpie" ? true : c.enabled,
       profiles: savedProfiles,
     });
+    if (id === "magpie") {
+      refreshMagpieProbe(restored?.base_url || undefined, true);
+    }
   };
 
   const fetchModelList = async () => {
@@ -1091,8 +1217,48 @@ function VisualTab({
             </label>
           </div>
 
+          {c.preset !== "magpie" &&
+            magpieProbe &&
+            (magpieProbe.gateway_online || magpieProbe.cli_installed || magpieProbe.config_found) && (
+              <div className="magpie-detect-banner">
+                <div className="magpie-detect-info">
+                  <div className="magpie-detect-title-row">
+                    <span className={`status-dot ${magpieProbe.gateway_online ? "ok" : "warn"}`} />
+                    <span className="magpie-detect-title">
+                      检测到本机已配置 Magpie 模型路由
+                      {magpieProbe.version ? ` (${magpieProbe.version})` : ""}
+                    </span>
+                    <span className="magpie-detect-tag">
+                      {magpieProbe.gateway_online ? "网关在线 · 免配 Key" : "支持一键唤醒"}
+                    </span>
+                  </div>
+                  <div className="magpie-detect-desc">
+                    {magpieProbe.gateway_online && magpieProbe.models.length > 0
+                      ? `可直接沿用本机已配好的 ${magpieProbe.models.length} 个模型${
+                          magpieProbe.groups.length > 0
+                            ? ` 与 ${magpieProbe.groups.length} 个故障转移路由组`
+                            : ""
+                        }${
+                          magpieProbe.recommended_model && magpieProbe.recommended_model !== "auto"
+                            ? `（推荐：${magpieProbe.recommended_model}）`
+                            : ""
+                        }，无需再次填写 API Key。`
+                      : magpieProbe.message}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  className="primary-btn compact-btn"
+                  disabled={connectingMagpie}
+                  onClick={() => handleAdoptMagpie()}
+                >
+                  {connectingMagpie ? "正在接入…" : "一键沿用 Magpie 配置"}
+                </button>
+              </div>
+            )}
+
           <div className="provider-tier-label">
-            <span>首选推荐接入（默认搭载 deepseek-v4.1-flash）</span>
+            <span>首选推荐接入（支持 Magpie 免配沿用与主流订阅直连）</span>
             <button
               type="button"
               className="text-link"
@@ -1116,7 +1282,13 @@ function VisualTab({
               >
                 <div className="provider-card-main">
                   <span className="provider-name">{p.name}</span>
-                  <span className="provider-sub">{p.defaultModel}</span>
+                  <span className="provider-sub">
+                    {p.id === "magpie"
+                      ? magpieProbe?.gateway_online
+                        ? magpieProbe.recommended_model || "auto (已连本机路由)"
+                        : "127.0.0.1:3425 · auto"
+                      : p.defaultModel}
+                  </span>
                 </div>
                 <span className="provider-badge featured-badge">{p.badge}</span>
               </button>
@@ -1140,6 +1312,102 @@ function VisualTab({
           )}
 
           {currentPreset.hint && <div className="preset-hint">{currentPreset.hint}</div>}
+
+          {c.preset === "magpie" && (
+            <div className="magpie-router-panel">
+              <div className="magpie-router-top">
+                <div className="magpie-router-status">
+                  <span className={`status-dot ${magpieProbe?.gateway_online ? "ok" : "warn"}`} />
+                  <span className="magpie-router-headline">
+                    {magpieProbe?.gateway_online
+                      ? `Magpie 路由网关在线 (:${magpieProbe.port})`
+                      : magpieProbe?.cli_installed || magpieProbe?.config_found
+                        ? `检测到本机 Magpie 配置 (网关未运行)`
+                        : "等待连接 Magpie 路由网关"}
+                  </span>
+                  {magpieProbe?.version && (
+                    <span className="magpie-version-chip">{magpieProbe.version}</span>
+                  )}
+                </div>
+
+                <div className="magpie-router-actions">
+                  {!magpieProbe?.gateway_online &&
+                    (magpieProbe?.cli_installed ||
+                      c.base_url.includes("127.0.0.1") ||
+                      c.base_url.includes("localhost")) && (
+                      <button
+                        type="button"
+                        className="primary-btn compact-btn"
+                        disabled={connectingMagpie}
+                        onClick={handleWakeMagpie}
+                      >
+                        {connectingMagpie ? "唤醒中…" : "启动本机网关"}
+                      </button>
+                    )}
+                  <button
+                    type="button"
+                    className="soft-btn compact-btn"
+                    disabled={probingMagpie || connectingMagpie}
+                    onClick={() => refreshMagpieProbe(c.base_url)}
+                  >
+                    <span className={probingMagpie ? "spin" : ""}>
+                      <IconRefresh size={12} />
+                    </span>
+                    <span>{probingMagpie ? "同步中…" : "同步路由配置"}</span>
+                  </button>
+                  {magpieProbe && !magpieProbe.gateway_online && !magpieProbe.cli_installed && (
+                    <button
+                      type="button"
+                      className="ghost-btn compact-btn"
+                      onClick={() => api.openExternalUrl("https://usemagpie.ai")}
+                    >
+                      了解 Magpie
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {magpieProbe?.message && (
+                <div className="magpie-router-msg">{magpieProbe.message}</div>
+              )}
+
+              <div className="magpie-group-block">
+                <div className="magpie-group-label">快捷沿用策略与路由组（点击即选）</div>
+                <div className="preset-pills">
+                  <button
+                    type="button"
+                    className={`pill-btn group-pill ${c.model === "auto" ? "active-pill" : ""}`}
+                    onClick={() => setC({ ...c, model: "auto" })}
+                    title="每次请求自动选用你在 Magpie 中最新激活的绑定模型或首选路由组"
+                  >
+                    auto（自动跟随 Magpie 首选）
+                  </button>
+                  {magpieProbe?.agent_bindings.map((b) => (
+                    <button
+                      key={`${b.agent}-${b.model}`}
+                      type="button"
+                      className={`pill-btn group-pill ${c.model === b.model ? "active-pill" : ""}`}
+                      onClick={() => setC({ ...c, model: b.model })}
+                      title={`直接沿用你在 ${b.agent} 中绑定的模型`}
+                    >
+                      沿用 {b.agent} · {b.model}
+                    </button>
+                  ))}
+                  {magpieProbe?.groups.map((g) => (
+                    <button
+                      key={g}
+                      type="button"
+                      className={`pill-btn group-pill ${c.model === g ? "active-pill" : ""}`}
+                      onClick={() => setC({ ...c, model: g })}
+                      title="使用 Magpie 故障转移 / 意图路由组"
+                    >
+                      路由组 · {g}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
 
           <div className="field-grid">
             <label>
@@ -1195,9 +1463,13 @@ function VisualTab({
           {(currentPreset.needsKey || currentPreset.optionalKey) && (
             <label>
               <span>
-                API Key{" "}
+                {c.preset === "magpie" ? "Magpie 网关密钥 (Gateway Key)" : "API Key"}{" "}
                 {currentPreset.optionalKey && !activeLlmSecret?.configured && (
-                  <em className="inline-muted">（选填：无鉴权直连可留空；开启反向代理鉴权时填写）</em>
+                  <em className="inline-muted">
+                    {c.preset === "magpie"
+                      ? "（本机 127.0.0.1 直连完全免填；仅连接局域网/远程共享 Magpie 网关时填写）"
+                      : "（选填：无鉴权直连可留空；开启反向代理鉴权时填写）"}
+                  </em>
                 )}
                 {activeLlmSecret?.configured && (
                   <em className="inline-ok">（保险箱已存：{activeLlmSecret.masked}，不修改可留空）</em>
@@ -1208,9 +1480,11 @@ function VisualTab({
                 value={c.api_key}
                 onChange={(e) => setC({ ...c, api_key: e.target.value })}
                 placeholder={
-                  currentPreset.optionalKey
-                    ? "直连免填；如远端配置了 Bearer 密钥可在此录入（加密存入本机保险箱）"
-                    : "输入后仅存入本机 DPAPI 隐私保险箱，不写入 config.toml"
+                  c.preset === "magpie"
+                    ? "本机免填；如连接局域网共享 Magpie 网关可填入 magpie gateway-key 生成的密钥"
+                    : currentPreset.optionalKey
+                      ? "直连免填；如远端配置了 Bearer 密钥可在此录入（加密存入本机保险箱）"
+                      : "输入后仅存入本机 DPAPI 隐私保险箱，不写入 config.toml"
                 }
               />
             </label>

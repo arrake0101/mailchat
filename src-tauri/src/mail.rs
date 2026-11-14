@@ -7,6 +7,9 @@ use crate::db::{
     Rule,
 };
 use anyhow::{anyhow, Context, Result};
+use imap_proto::types::{
+    BodyContentCommon, BodyStructure, ContentEncoding, MessageSection, SectionPath,
+};
 use mail_parser::{Addr, HeaderValue, MessageParser, MimeHeaders, PartType};
 use regex::Regex;
 use std::collections::hash_map::DefaultHasher;
@@ -14,7 +17,6 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -105,6 +107,7 @@ pub struct ParsedMail {
     pub group_id_hdr: Option<String>,
     pub group_name_hdr: Option<String>,
     pub quote_mid_hdr: Option<String>,
+    #[allow(dead_code)]
     pub raw_attachments: Vec<RawAttachment>,
 }
 
@@ -417,6 +420,745 @@ fn mentions_me(body: &str, acc: &Account) -> bool {
     !disp.is_empty() && lower.contains(&format!("@{disp}"))
 }
 
+#[derive(Debug, Clone)]
+struct LeafPartInfo {
+    section_nums: Vec<u32>,
+    part_id: String,
+    is_single_root: bool,
+    ty: String,
+    subtype: String,
+    declared_mime: String,
+    is_explicit_attachment: bool,
+    param_filename: Option<String>,
+    content_id: Option<String>,
+    encoding: String,
+    octets: usize,
+}
+
+#[derive(Debug, Default)]
+struct StructurePlan {
+    body_parts: Vec<LeafPartInfo>,
+    cid_parts: Vec<LeafPartInfo>,
+    att_parts: Vec<LeafPartInfo>,
+}
+
+fn content_encoding_label(enc: &ContentEncoding<'_>) -> String {
+    match enc {
+        ContentEncoding::SevenBit => "7bit".to_string(),
+        ContentEncoding::EightBit => "8bit".to_string(),
+        ContentEncoding::Binary => "binary".to_string(),
+        ContentEncoding::Base64 => "base64".to_string(),
+        ContentEncoding::QuotedPrintable => "quoted-printable".to_string(),
+        ContentEncoding::Other(s) => s.trim().to_ascii_lowercase(),
+    }
+}
+
+fn estimate_decoded_bytes(octets: usize, encoding: &str) -> usize {
+    if octets == 0 {
+        return 0;
+    }
+    if encoding.eq_ignore_ascii_case("base64") {
+        // 标准 MIME Base64 每行 76 字符 + CRLF（78 octets 对应 57 原始字节）
+        if octets >= 78 {
+            (octets * 57) / 78
+        } else {
+            (octets * 3) / 4
+        }
+    } else {
+        octets
+    }
+}
+
+fn find_body_param(
+    params: &Option<Vec<(std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>)>>,
+    keys: &[&str],
+) -> Option<String> {
+    let list = params.as_ref()?;
+    for target in keys {
+        for (k, v) in list {
+            if k.eq_ignore_ascii_case(target) && !v.trim().is_empty() {
+                return Some(v.trim().to_string());
+            }
+        }
+    }
+    // 兼容 RFC 2231 分片参数（如 filename*0 / filename*0* / name*0）
+    let mut chunks: Vec<(usize, String)> = Vec::new();
+    for (k, v) in list {
+        let lower = k.to_ascii_lowercase();
+        for base in ["filename*", "name*"] {
+            if let Some(rest) = lower.strip_prefix(base) {
+                let digits = rest.trim_end_matches('*');
+                if let Ok(idx) = digits.parse::<usize>() {
+                    chunks.push((idx, v.to_string()));
+                }
+            }
+        }
+    }
+    if !chunks.is_empty() {
+        chunks.sort_by_key(|(i, _)| *i);
+        let joined: String = chunks.into_iter().map(|(_, s)| s).collect();
+        if !joined.trim().is_empty() {
+            return Some(joined);
+        }
+    }
+    None
+}
+
+fn extract_bs_raw_filename(common: &BodyContentCommon<'_>) -> Option<String> {
+    if let Some(disp) = &common.disposition {
+        if let Some(name) = find_body_param(&disp.params, &["filename*", "filename"]) {
+            return Some(name);
+        }
+    }
+    find_body_param(&common.ty.params, &["name*", "name", "filename*", "filename"])
+}
+
+fn decode_mime_param_filename(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    // 处理 RFC 2231 形如 UTF-8''%E6%B4%BE%E5%8F%91.docx
+    if let Some(idx) = trimmed.find("''") {
+        let charset = trimmed[..idx].to_ascii_lowercase();
+        let pct_part = &trimmed[idx + 2..];
+        if charset.contains("utf-8") || charset.contains("utf8") {
+            let decoded = percent_decode_bytes(pct_part);
+            if let Ok(s) = String::from_utf8(decoded) {
+                if !s.trim().is_empty() {
+                    return s;
+                }
+            }
+        }
+    }
+    // 借助 mail-parser 解码 RFC 2047（=?UTF-8?B?...?= / =?GB18030?B?...?= 等）
+    if trimmed.contains("=?") {
+        let safe_val = trimmed.replace('"', "");
+        let syn = format!(
+            "Content-Disposition: attachment; filename=\"{safe_val}\"\r\n\r\nx"
+        );
+        if let Some(m) = MessageParser::default().parse(syn.as_bytes()) {
+            if let Some(p) = m.parts.first() {
+                if let Some(decoded) = p.attachment_name() {
+                    if !decoded.trim().is_empty() {
+                        return decoded.to_string();
+                    }
+                }
+            }
+        }
+    }
+    trimmed.to_string()
+}
+
+fn percent_decode_bytes(input: &str) -> Vec<u8> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push(((h << 4) | l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+fn collect_leaf_parts(
+    bs: &BodyStructure<'_>,
+    prefix: &[u32],
+    is_root: bool,
+    out: &mut Vec<LeafPartInfo>,
+) {
+    match bs {
+        BodyStructure::Multipart { bodies, .. } => {
+            for (idx, child) in bodies.iter().enumerate() {
+                let mut next = Vec::with_capacity(prefix.len() + 1);
+                next.extend_from_slice(prefix);
+                next.push((idx + 1) as u32);
+                collect_leaf_parts(child, &next, false, out);
+            }
+        }
+        BodyStructure::Basic { common, other, .. }
+        | BodyStructure::Text { common, other, .. }
+        | BodyStructure::Message { common, other, .. } => {
+            let section_nums = if is_root { vec![1] } else { prefix.to_vec() };
+            let part_id = section_nums
+                .iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(".");
+            let ty = common.ty.ty.trim().to_ascii_lowercase();
+            let subtype = common.ty.subtype.trim().to_ascii_lowercase();
+            let declared_mime = if subtype.is_empty() {
+                ty.clone()
+            } else {
+                format!("{ty}/{subtype}")
+            };
+            let is_explicit_attachment = common
+                .disposition
+                .as_ref()
+                .map(|d| d.ty.eq_ignore_ascii_case("attachment"))
+                .unwrap_or(false);
+            let param_filename = extract_bs_raw_filename(common);
+            let content_id = other
+                .id
+                .as_ref()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let encoding = content_encoding_label(&other.transfer_encoding);
+            let octets = other.octets as usize;
+
+            out.push(LeafPartInfo {
+                section_nums,
+                part_id,
+                is_single_root: is_root,
+                ty,
+                subtype,
+                declared_mime,
+                is_explicit_attachment,
+                param_filename,
+                content_id,
+                encoding,
+                octets,
+            });
+        }
+    }
+}
+
+fn plan_bodystructure(bs: &BodyStructure<'_>) -> StructurePlan {
+    let mut leaves = Vec::new();
+    collect_leaf_parts(bs, &[], true, &mut leaves);
+
+    let has_html_body = leaves.iter().any(|p| {
+        p.ty == "text"
+            && p.subtype == "html"
+            && !p.is_explicit_attachment
+            && p.param_filename.is_none()
+    });
+
+    let mut plan = StructurePlan::default();
+    for p in leaves {
+        let is_body_text = p.ty == "text"
+            && (p.subtype == "plain" || p.subtype == "html")
+            && !p.is_explicit_attachment
+            && p.param_filename.is_none();
+        if is_body_text {
+            if p.octets <= 2_000_000 {
+                plan.body_parts.push(p);
+            }
+            continue;
+        }
+
+        // 富 HTML 中的小尺寸内联 cid: 装饰图标（非 attachment 处置），仅内联进内存 HTML，不列为文件附件
+        let is_inline_cid_decor = has_html_body
+            && p.ty == "image"
+            && p.content_id.is_some()
+            && !p.is_explicit_attachment
+            && p.octets <= 700_000;
+        if is_inline_cid_decor {
+            plan.cid_parts.push(p);
+            continue;
+        }
+
+        if p.octets > 0 {
+            plan.att_parts.push(p);
+        }
+    }
+    plan
+}
+
+fn combine_mime_header_and_body(mime_hdr: &[u8], body_bytes: &[u8], fallback_mime: &str, fallback_enc: &str) -> Vec<u8> {
+    if mime_hdr.is_empty() {
+        let mut syn = format!(
+            "Content-Type: {}\r\nContent-Transfer-Encoding: {}\r\n\r\n",
+            if fallback_mime.is_empty() { "application/octet-stream" } else { fallback_mime },
+            if fallback_enc.is_empty() { "binary" } else { fallback_enc }
+        )
+        .into_bytes();
+        syn.extend_from_slice(body_bytes);
+        return syn;
+    }
+    let mut buf = Vec::with_capacity(mime_hdr.len() + 4 + body_bytes.len());
+    buf.extend_from_slice(mime_hdr);
+    if buf.ends_with(b"\r\n\r\n") || buf.ends_with(b"\n\n") {
+        // 已包含标准空行分隔
+    } else if buf.ends_with(b"\r\n") {
+        buf.extend_from_slice(b"\r\n");
+    } else if buf.ends_with(b"\n") {
+        buf.extend_from_slice(b"\n");
+    } else {
+        buf.extend_from_slice(b"\r\n\r\n");
+    }
+    buf.extend_from_slice(body_bytes);
+    buf
+}
+
+fn decode_transfer_fallback(raw: &[u8], encoding: &str) -> Vec<u8> {
+    if encoding.eq_ignore_ascii_case("base64") {
+        if let Ok(s) = std::str::from_utf8(raw) {
+            if let Ok(decoded) = base64_decode(s) {
+                return decoded;
+            }
+        }
+        // 容错逐字节过滤非 Base64 字符
+        let filtered: String = raw
+            .iter()
+            .copied()
+            .filter(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'-' | b'_' | b'='))
+            .map(|b| b as char)
+            .collect();
+        if let Ok(decoded) = base64_decode(&filtered) {
+            return decoded;
+        }
+    } else if encoding.eq_ignore_ascii_case("quoted-printable") {
+        return quoted_printable_decode(raw);
+    }
+    raw.to_vec()
+}
+
+fn quoted_printable_decode(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == b'=' {
+            if i + 2 < raw.len() && raw[i + 1] == b'\r' && raw[i + 2] == b'\n' {
+                i += 3;
+                continue;
+            }
+            if i + 1 < raw.len() && raw[i + 1] == b'\n' {
+                i += 2;
+                continue;
+            }
+            if i + 2 < raw.len() {
+                let hi = (raw[i + 1] as char).to_digit(16);
+                let lo = (raw[i + 2] as char).to_digit(16);
+                if let (Some(h), Some(l)) = (hi, lo) {
+                    out.push(((h << 4) | l) as u8);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(raw[i]);
+        i += 1;
+    }
+    out
+}
+
+fn decode_binary_section(mime_hdr: &[u8], raw_body: &[u8], fallback_mime: &str, fallback_enc: &str) -> Vec<u8> {
+    let combined = combine_mime_header_and_body(mime_hdr, raw_body, fallback_mime, fallback_enc);
+    if let Some(msg) = MessageParser::default().parse(&combined) {
+        for p in &msg.parts {
+            match &p.body {
+                PartType::Binary(b) | PartType::InlineBinary(b) if !b.is_empty() => {
+                    return b.to_vec();
+                }
+                PartType::Text(t) | PartType::Html(t) if !t.is_empty() => {
+                    return t.as_bytes().to_vec();
+                }
+                _ => {}
+            }
+        }
+    }
+    decode_transfer_fallback(raw_body, fallback_enc)
+}
+
+fn decode_text_section(mime_hdr: &[u8], raw_body: &[u8], subtype: &str, encoding: &str) -> String {
+    let fallback_mime = format!("text/{subtype}; charset=utf-8");
+    let combined = combine_mime_header_and_body(mime_hdr, raw_body, &fallback_mime, encoding);
+    if let Some(msg) = MessageParser::default().parse(&combined) {
+        if subtype == "html" {
+            if let Some(h) = msg.body_html(0) {
+                return h.into_owned();
+            }
+        }
+        if let Some(t) = msg.body_text(0) {
+            return t.into_owned();
+        }
+        for p in &msg.parts {
+            match &p.body {
+                PartType::Html(h) if subtype == "html" => return h.to_string(),
+                PartType::Text(t) => return t.to_string(),
+                _ => {}
+            }
+        }
+    }
+    let bytes = decode_transfer_fallback(raw_body, encoding);
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// 仅拉取邮件头、正文文本分段与附件的 ~150B MIME 头（绝不拉取附件二进制内容，绝不写入本地磁盘）
+fn fetch_partial_mail_without_attachments<S: Read + Write>(
+    session: &mut imap::Session<S>,
+    uid: u32,
+    cached_header: Option<&[u8]>,
+    plan: &StructurePlan,
+    folder: &str,
+    validity: u32,
+) -> Result<Option<ParsedMail>> {
+    const MAX_ATT_COUNT: usize = 12;
+
+    let mut items: Vec<String> = vec!["UID".to_string()];
+    if cached_header.is_none() {
+        items.push("BODY.PEEK[HEADER]".to_string());
+    }
+    for bp in &plan.body_parts {
+        if !bp.is_single_root {
+            items.push(format!("BODY.PEEK[{}.MIME]", bp.part_id));
+        }
+        items.push(format!("BODY.PEEK[{}]", bp.part_id));
+    }
+    for cp in &plan.cid_parts {
+        if !cp.is_single_root {
+            items.push(format!("BODY.PEEK[{}.MIME]", cp.part_id));
+        }
+        items.push(format!("BODY.PEEK[{}]", cp.part_id));
+    }
+    for ap in plan.att_parts.iter().take(MAX_ATT_COUNT) {
+        if !ap.is_single_root {
+            items.push(format!("BODY.PEEK[{}.MIME]", ap.part_id));
+        }
+    }
+
+    let need_fetch = items.len() > 1;
+    let fetches_opt = if need_fetch {
+        let query = format!("({})", items.join(" "));
+        Some(session.uid_fetch(uid.to_string(), &query)?)
+    } else {
+        None
+    };
+    let fetch_ref = fetches_opt.as_ref().and_then(|fs| fs.iter().next());
+
+    let hdr_bytes: &[u8] = match cached_header.or_else(|| fetch_ref.and_then(|f| f.header())) {
+        Some(h) if !h.is_empty() => h,
+        _ => return Ok(None),
+    };
+
+    // 确保顶层邮件头末尾带空行以便 mail-parser 解析信封字段
+    let hdr_block = combine_mime_header_and_body(hdr_bytes, b"", "text/plain", "7bit");
+    let Some(hdr_msg) = MessageParser::default().parse(&hdr_block) else {
+        return Ok(None);
+    };
+
+    let from = hdr_msg.from().and_then(|a| a.first());
+    let from_addr = from
+        .and_then(|a| a.address())
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
+    if from_addr.is_empty() {
+        return Ok(None);
+    }
+    let from_name = from.and_then(|a| a.name()).unwrap_or("").trim().to_string();
+    let (to_addrs, to_members) = collect_addrs(hdr_msg.to());
+    let (cc_addrs, cc_members) = collect_addrs(hdr_msg.cc());
+
+    let mut participants = Vec::with_capacity(1 + to_members.len() + cc_members.len());
+    participants.push(GroupMember {
+        email: from_addr.clone(),
+        name: from_name.clone(),
+    });
+    participants.extend(to_members);
+    participants.extend(cc_members);
+
+    let message_id = hdr_msg
+        .message_id()
+        .map(|s| s.trim_matches(&['<', '>', ' '][..]).to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("local-{validity}-{uid}@{folder}"));
+
+    let in_reply_ids = header_ids(hdr_msg.in_reply_to());
+    let reference_ids = header_ids(hdr_msg.references());
+    let mut ref_ids = reference_ids.clone();
+    for id in &in_reply_ids {
+        if !ref_ids.contains(id) {
+            ref_ids.push(id.clone());
+        }
+    }
+
+    let group_id_hdr = header_text(&hdr_msg, "Chat-Group-ID")
+        .or_else(|| header_text(&hdr_msg, "X-MailChat-Group-Id"));
+    let group_name_hdr = header_text(&hdr_msg, "Chat-Group-Name")
+        .or_else(|| header_text(&hdr_msg, "X-MailChat-Group-Name"));
+    let quote_mid_hdr = header_text(&hdr_msg, "X-MailChat-Quote-Id");
+
+    let mut plain_chunks: Vec<String> = Vec::new();
+    let mut html_chunks: Vec<String> = Vec::new();
+    if let Some(f) = fetch_ref {
+        for bp in &plan.body_parts {
+            let body_sp = SectionPath::Part(bp.section_nums.clone(), None);
+            let Some(raw_part) = f.section(&body_sp) else {
+                continue;
+            };
+            let mime_hdr = if bp.is_single_root {
+                hdr_bytes
+            } else {
+                let mime_sp = SectionPath::Part(bp.section_nums.clone(), Some(MessageSection::Mime));
+                f.section(&mime_sp).unwrap_or(b"")
+            };
+            let text = decode_text_section(mime_hdr, raw_part, &bp.subtype, &bp.encoding);
+            if !text.trim().is_empty() {
+                if bp.subtype == "html" {
+                    html_chunks.push(text);
+                } else {
+                    plain_chunks.push(text);
+                }
+            }
+        }
+    }
+
+    let mut body_html = html_chunks.join("\n").trim().to_string();
+    if body_html.len() > 1_500_000 {
+        body_html.clear();
+    } else if !body_html.is_empty() && !plan.cid_parts.is_empty() {
+        let has_cid_ref = body_html
+            .as_bytes()
+            .windows(4)
+            .any(|w| w.eq_ignore_ascii_case(b"cid:"));
+        if has_cid_ref {
+            if let Some(f) = fetch_ref {
+                let mut cid_assets: Vec<(String, String, Vec<u8>)> = Vec::new();
+                for cp in &plan.cid_parts {
+                    let Some(raw_cid) = &cp.content_id else { continue };
+                    let body_sp = SectionPath::Part(cp.section_nums.clone(), None);
+                    let Some(raw_part) = f.section(&body_sp) else { continue };
+                    let mime_hdr = if cp.is_single_root {
+                        hdr_bytes
+                    } else {
+                        let mime_sp = SectionPath::Part(cp.section_nums.clone(), Some(MessageSection::Mime));
+                        f.section(&mime_sp).unwrap_or(b"")
+                    };
+                    let decoded = decode_binary_section(mime_hdr, raw_part, &cp.declared_mime, &cp.encoding);
+                    if !decoded.is_empty() {
+                        cid_assets.push((raw_cid.clone(), cp.declared_mime.clone(), decoded));
+                    }
+                }
+                body_html = inline_cid_assets_into_html(body_html, &cid_assets);
+            }
+        }
+    }
+
+    // 仅从附件的 ~150B MIME 头或 BODYSTRUCTURE 元数据构建附件清单（零磁盘写入、零附件载荷传输）
+    let mut attachments: Vec<AttachmentMeta> = Vec::new();
+    for (idx, ap) in plan.att_parts.iter().take(MAX_ATT_COUNT).enumerate() {
+        let mut resolved_name = String::new();
+        let mut resolved_mime = ap.declared_mime.clone();
+
+        let att_mime_hdr: Option<&[u8]> = if ap.is_single_root {
+            Some(hdr_bytes)
+        } else {
+            fetch_ref.and_then(|f| {
+                let sp = SectionPath::Part(ap.section_nums.clone(), Some(MessageSection::Mime));
+                f.section(&sp)
+            })
+        };
+
+        if let Some(mh) = att_mime_hdr.filter(|b| !b.is_empty()) {
+            let syn = combine_mime_header_and_body(mh, b"x", &ap.declared_mime, "7bit");
+            if let Some(pm) = MessageParser::default().parse(&syn) {
+                if let Some(p0) = pm.parts.first() {
+                    if let Some(n) = p0.attachment_name() {
+                        if !n.trim().is_empty() {
+                            resolved_name = n.trim().to_string();
+                        }
+                    }
+                    if let Some(ct) = p0.content_type() {
+                        resolved_mime = match &ct.c_subtype {
+                            Some(sub) => format!("{}/{}", ct.c_type, sub),
+                            None => ct.c_type.to_string(),
+                        };
+                    }
+                }
+            }
+        }
+
+        if resolved_name.is_empty() {
+            if let Some(raw_fn) = &ap.param_filename {
+                resolved_name = decode_mime_param_filename(raw_fn);
+            }
+        }
+
+        let est_size = estimate_decoded_bytes(ap.octets, &ap.encoding);
+        attachments.push(build_attachment_meta(
+            &resolved_name,
+            &resolved_mime,
+            est_size,
+            &ap.part_id,
+            &ap.encoding,
+            idx,
+            &[],
+        ));
+    }
+
+    let plain = plain_chunks.join("\n");
+    let raw_body = if !plain.trim().is_empty() {
+        plain
+    } else if !body_html.is_empty() {
+        html_to_text(&body_html)
+    } else {
+        String::new()
+    };
+
+    let body_full = normalize_raw_body(&raw_body);
+    let body = clean_body(&body_full);
+    let subject = hdr_msg.subject().unwrap_or("").to_string();
+    let extracted_code = extract_verification_code(&subject, &body_full).unwrap_or_default();
+    let date = hdr_msg
+        .date()
+        .map(|d| d.to_timestamp())
+        .unwrap_or_else(|| chrono::Utc::now().timestamp());
+
+    Ok(Some(ParsedMail {
+        msg: NewMessage {
+            folder: folder.to_string(),
+            uid,
+            message_id,
+            in_reply_to: in_reply_ids.join(" "),
+            references: reference_ids
+                .into_iter()
+                .map(|r| format!("<{r}>"))
+                .collect::<Vec<_>>()
+                .join(" "),
+            from_addr,
+            from_name,
+            to_addrs,
+            cc_addrs,
+            subject,
+            body,
+            body_full,
+            body_html,
+            date,
+            outgoing: false,
+            peer: String::new(),
+            status: "inbox".into(),
+            category: String::new(),
+            summary: String::new(),
+            reason: String::new(),
+            extracted_code,
+            suggested_reply: String::new(),
+            read: false,
+            agent_done: false,
+            attachments,
+            reply_to: None,
+        },
+        participants,
+        ref_ids,
+        group_id_hdr,
+        group_name_hdr,
+        quote_mid_hdr,
+        raw_attachments: Vec::new(),
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ingest_parsed_mail(
+    parsed: ParsedMail,
+    seen: bool,
+    is_sent: bool,
+    last: u32,
+    me: &str,
+    acc: &Account,
+    db: &Db,
+    rules: &[Rule],
+    agent_enabled: bool,
+) -> Result<bool> {
+    let mut nm = parsed.msg;
+    nm.outgoing = is_sent || nm.from_addr == me;
+    let others = normalize_members(&parsed.participants, me);
+
+    // 判断归属群聊还是单聊：
+    // 1. 优先识别 Chat-Group-ID / X-MailChat-Group-Id 协议头
+    // 2. 其次沿用 In-Reply-To / References 关联的已有群聊（中途增减抄送人也不裂变）
+    // 3. 若除自己外参与人数 >= 2，则自动聚合为多人邮件群聊
+    let group_peer = if let Some(gid) = &parsed.group_id_hdr {
+        let clean = gid.trim_start_matches("group:");
+        Some(format!("group:{clean}"))
+    } else if let Some(existing_grp) = db.find_group_by_refs_for(me, &parsed.ref_ids)? {
+        Some(existing_grp)
+    } else if others.len() >= 2 {
+        Some(participant_group_key(&others))
+    } else {
+        None
+    };
+
+    let mut group_muted = false;
+    if let Some(gp) = group_peer {
+        let title = parsed
+            .group_name_hdr
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| default_group_title(&nm.subject, &others));
+        let grp = db.upsert_group_for(me, &gp, &title, &others, me, false)?;
+        group_muted = grp.muted;
+        nm.peer = gp;
+        if nm.category.is_empty() {
+            nm.category = "群聊".into();
+        }
+    } else if nm.outgoing {
+        match nm.to_addrs.split(',').next().filter(|s| !s.is_empty()) {
+            Some(p) => nm.peer = p.to_string(),
+            None => return Ok(false),
+        }
+    } else {
+        nm.peer = nm.from_addr.clone();
+    }
+
+    nm.read = seen || nm.outgoing;
+    // 严禁在同步阶段将任何邮件附件自动写入本地磁盘！仅保留轻量元数据，供用户手动点击“另存为”时按需拉取
+    nm.reply_to = db
+        .find_reply_quote_for(me, &nm.peer, parsed.quote_mid_hdr.as_deref(), &nm.in_reply_to)
+        .unwrap_or(None);
+
+    let contact_muted = !nm.outgoing
+        && !nm.peer.starts_with("group:")
+        && db.is_contact_muted_for(me, &nm.peer).unwrap_or(false);
+
+    // 分流逻辑：发出的邮件 / 群免打扰（支持 @我 穿透提醒）/ 单聊联系人免打扰 / 规则引擎 / 已建立聊天跳过逐条 AI 分析 / 陌生新来信异步分拣
+    if nm.outgoing {
+        nm.agent_done = true;
+    } else if group_muted {
+        if mentions_me(&nm.body, acc) {
+            nm.status = "inbox".into();
+            nm.reason = "群聊开启免打扰，但此消息 @提及了你".into();
+            nm.agent_done = true;
+        } else {
+            nm.status = "archived".into();
+            nm.reason = "群聊已开启免打扰，自动折叠至通知".into();
+            nm.agent_done = true;
+        }
+    } else if contact_muted {
+        nm.status = "archived".into();
+        nm.reason = "已对该联系人开启免打扰，自动折叠至通知".into();
+        nm.agent_done = true;
+    } else if let Some(hit) = apply_rules(rules, &nm.from_addr, &nm.subject, &nm.body_full) {
+        nm.status = hit.status.into();
+        nm.reason = hit.reason;
+        nm.agent_done = true;
+    } else if nm.extracted_code.is_empty()
+        && db.is_established_chat_for(me, &nm.peer, &parsed.ref_ids).unwrap_or(false)
+    {
+        // 已建立双向沟通的熟人聊天：直接留在收件箱，不再每条消息调用大模型生成冗余复读摘要
+        nm.status = "inbox".into();
+        nm.agent_done = true;
+    } else if agent_enabled && !(last == 0 && seen) {
+        // 新邮件立即在收件箱可见，避免因等待远程大模型响应导致收信延迟；后台异步完成智能分拣与摘要补充
+        nm.status = "inbox".into();
+        nm.agent_done = false;
+    } else {
+        nm.agent_done = true;
+    }
+
+    Ok(db.insert_message_for(me, &nm)?.is_some() && !nm.outgoing)
+}
+
 pub(crate) fn sync_folder_on<S: Read + Write>(
     session: &mut imap::Session<S>,
     folder: &str,
@@ -466,114 +1208,85 @@ pub(crate) fn sync_folder_on<S: Read + Write>(
     let mut new_incoming = 0;
     for chunk in uids.chunks(50) {
         let set = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
-        let fetches = session.uid_fetch(&set, "(UID FLAGS BODY.PEEK[])")?;
-        for f in fetches.iter() {
-            let uid = f.uid.unwrap_or(0);
-            max_uid = max_uid.max(uid);
-            let Some(raw) = f.body() else { continue };
-            let seen = f.flags().iter().any(|fl| matches!(fl, imap::types::Flag::Seen));
-            let Some(parsed) = parse_full(raw, folder, uid, validity) else { continue };
-            let mut nm = parsed.msg;
+        // 第一步：仅查询轻量结构元数据与信封头，识别含附件邮件以彻底跳过附件内容下载
+        match session.uid_fetch(&set, "(UID FLAGS RFC822.SIZE BODYSTRUCTURE BODY.PEEK[HEADER])") {
+            Ok(meta_fetches) => {
+                let mut full_fetch_uids: Vec<(u32, bool)> = Vec::new();
+                for f in meta_fetches.iter() {
+                    let uid = f.uid.unwrap_or(0);
+                    if uid == 0 {
+                        continue;
+                    }
+                    max_uid = max_uid.max(uid);
+                    let seen = f.flags().iter().any(|fl| matches!(fl, imap::types::Flag::Seen));
 
-            nm.outgoing = is_sent || nm.from_addr == me;
-            let others = normalize_members(&parsed.participants, &me);
+                    // 兼容直接返回 BODY[] 的极简测试桩或代理服务端
+                    if let Some(raw) = f.body() {
+                        if let Some(parsed) = parse_full(raw, folder, uid, validity) {
+                            if ingest_parsed_mail(parsed, seen, is_sent, last, &me, acc, db, rules, agent_enabled)? {
+                                new_incoming += 1;
+                            }
+                        }
+                        continue;
+                    }
 
-            // 判断归属群聊还是单聊：
-            // 1. 优先识别 Chat-Group-ID / X-MailChat-Group-Id 协议头
-            // 2. 其次沿用 In-Reply-To / References 关联的已有群聊（中途增减抄送人也不裂变）
-            // 3. 若除自己外参与人数 >= 2，则自动聚合为多人邮件群聊
-            let group_peer = if let Some(gid) = &parsed.group_id_hdr {
-                let clean = gid.trim_start_matches("group:");
-                Some(format!("group:{clean}"))
-            } else if let Some(existing_grp) = db.find_group_by_refs_for(&me, &parsed.ref_ids)? {
-                Some(existing_grp)
-            } else if others.len() >= 2 {
-                Some(participant_group_key(&others))
-            } else {
-                None
-            };
-
-            let mut group_muted = false;
-            if let Some(gp) = group_peer {
-                let title = parsed
-                    .group_name_hdr
-                    .as_deref()
-                    .filter(|s| !s.trim().is_empty())
-                    .map(|s| s.trim().to_string())
-                    .unwrap_or_else(|| default_group_title(&nm.subject, &others));
-                let grp = db.upsert_group_for(&me, &gp, &title, &others, &me, false)?;
-                group_muted = grp.muted;
-                nm.peer = gp;
-                if nm.category.is_empty() {
-                    nm.category = "群聊".into();
+                    if let Some(bs) = f.bodystructure() {
+                        let plan = plan_bodystructure(bs);
+                        let msg_size = f.size.unwrap_or(0) as usize;
+                        if plan.att_parts.is_empty() && msg_size <= 2_000_000 {
+                            full_fetch_uids.push((uid, seen));
+                        } else if let Some(parsed) = fetch_partial_mail_without_attachments(
+                            session,
+                            uid,
+                            f.header(),
+                            &plan,
+                            folder,
+                            validity,
+                        )? {
+                            if ingest_parsed_mail(parsed, seen, is_sent, last, &me, acc, db, rules, agent_enabled)? {
+                                new_incoming += 1;
+                            }
+                        }
+                    } else {
+                        full_fetch_uids.push((uid, seen));
+                    }
                 }
-            } else if nm.outgoing {
-                match nm.to_addrs.split(',').next().filter(|s| !s.is_empty()) {
-                    Some(p) => nm.peer = p.to_string(),
-                    None => continue,
-                }
-            } else {
-                nm.peer = nm.from_addr.clone();
-            }
 
-            nm.read = seen || nm.outgoing;
-            if !parsed.raw_attachments.is_empty() {
-                for raw_att in &parsed.raw_attachments {
-                    if let Ok(meta) = save_attachment_bytes(
-                        db.attachments_dir(),
-                        &raw_att.filename,
-                        &raw_att.mime,
-                        &raw_att.bytes,
-                    ) {
-                        nm.attachments.push(meta);
+                if !full_fetch_uids.is_empty() {
+                    let seen_map: HashMap<u32, bool> = full_fetch_uids.iter().copied().collect();
+                    let full_set = full_fetch_uids
+                        .iter()
+                        .map(|(u, _)| u.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let fetches = session.uid_fetch(&full_set, "(UID FLAGS BODY.PEEK[])")?;
+                    for f in fetches.iter() {
+                        let uid = f.uid.unwrap_or(0);
+                        max_uid = max_uid.max(uid);
+                        let Some(raw) = f.body() else { continue };
+                        let seen = seen_map.get(&uid).copied().unwrap_or_else(|| {
+                            f.flags().iter().any(|fl| matches!(fl, imap::types::Flag::Seen))
+                        });
+                        let Some(parsed) = parse_full(raw, folder, uid, validity) else { continue };
+                        if ingest_parsed_mail(parsed, seen, is_sent, last, &me, acc, db, rules, agent_enabled)? {
+                            new_incoming += 1;
+                        }
                     }
                 }
             }
-            nm.reply_to = db
-                .find_reply_quote_for(&me, &nm.peer, parsed.quote_mid_hdr.as_deref(), &nm.in_reply_to)
-                .unwrap_or(None);
-
-            let contact_muted = !nm.outgoing
-                && !nm.peer.starts_with("group:")
-                && db.is_contact_muted_for(&me, &nm.peer).unwrap_or(false);
-
-            // 分流逻辑：发出的邮件 / 群免打扰（支持 @我 穿透提醒）/ 单聊联系人免打扰 / 规则引擎 / 已建立聊天跳过逐条 AI 分析 / 陌生新来信异步分拣
-            if nm.outgoing {
-                nm.agent_done = true;
-            } else if group_muted {
-                if mentions_me(&nm.body, acc) {
-                    nm.status = "inbox".into();
-                    nm.reason = "群聊开启免打扰，但此消息 @提及了你".into();
-                    nm.agent_done = true;
-                } else {
-                    nm.status = "archived".into();
-                    nm.reason = "群聊已开启免打扰，自动折叠至通知".into();
-                    nm.agent_done = true;
+            Err(_) => {
+                // 当少数旧式邮件在 BODYSTRUCTURE 中混入非 UTF-8 原始字节触发解析异常时平滑降级（仍严禁任何磁盘落盘）
+                let fetches = session.uid_fetch(&set, "(UID FLAGS BODY.PEEK[])")?;
+                for f in fetches.iter() {
+                    let uid = f.uid.unwrap_or(0);
+                    max_uid = max_uid.max(uid);
+                    let Some(raw) = f.body() else { continue };
+                    let seen = f.flags().iter().any(|fl| matches!(fl, imap::types::Flag::Seen));
+                    let Some(parsed) = parse_full(raw, folder, uid, validity) else { continue };
+                    if ingest_parsed_mail(parsed, seen, is_sent, last, &me, acc, db, rules, agent_enabled)? {
+                        new_incoming += 1;
+                    }
                 }
-            } else if contact_muted {
-                nm.status = "archived".into();
-                nm.reason = "已对该联系人开启免打扰，自动折叠至通知".into();
-                nm.agent_done = true;
-            } else if let Some(hit) = apply_rules(rules, &nm.from_addr, &nm.subject, &nm.body_full) {
-                nm.status = hit.status.into();
-                nm.reason = hit.reason;
-                nm.agent_done = true;
-            } else if nm.extracted_code.is_empty()
-                && db.is_established_chat_for(&me, &nm.peer, &parsed.ref_ids).unwrap_or(false)
-            {
-                // 已建立双向沟通的熟人聊天：直接留在收件箱，不再每条消息调用大模型生成冗余复读摘要
-                nm.status = "inbox".into();
-                nm.agent_done = true;
-            } else if agent_enabled && !(last == 0 && seen) {
-                // 新邮件立即在收件箱可见，避免因等待远程大模型响应导致收信延迟；后台异步完成智能分拣与摘要补充
-                nm.status = "inbox".into();
-                nm.agent_done = false;
-            } else {
-                nm.agent_done = true;
-            }
-
-            if db.insert_message_for(&me, &nm)?.is_some() && !nm.outgoing {
-                new_incoming += 1;
             }
         }
     }
@@ -635,19 +1348,77 @@ pub(crate) fn backfill_html_on<S: Read + Write>(
                 .collect::<Vec<_>>()
                 .join(",");
 
-            let fetches = session.uid_fetch(&set, "(UID BODY.PEEK[])")?;
             let mut html_by_id: HashMap<i64, String> = HashMap::new();
-            for f in fetches.iter() {
-                let Some(uid) = f.uid else { continue };
-                let Some(raw) = f.body() else { continue };
-                let Some(msg) = MessageParser::default().parse(raw) else {
-                    continue;
-                };
-                let html = extract_html_with_cid(&msg);
-                if !html.is_empty() {
-                    if let Some(target_ids) = uid_to_ids.get(&uid) {
-                        for &id in target_ids {
-                            html_by_id.insert(id, html.clone());
+            match session.uid_fetch(&set, "(UID RFC822.SIZE BODYSTRUCTURE)") {
+                Ok(meta_fetches) => {
+                    let mut full_uids: Vec<u32> = Vec::new();
+                    for f in meta_fetches.iter() {
+                        let Some(uid) = f.uid else { continue };
+                        if let Some(bs) = f.bodystructure() {
+                            let plan = plan_bodystructure(bs);
+                            let has_html = plan.body_parts.iter().any(|p| p.subtype == "html");
+                            if !has_html {
+                                continue;
+                            }
+                            if plan.att_parts.is_empty() && f.size.unwrap_or(0) <= 2_000_000 {
+                                full_uids.push(uid);
+                            } else if let Ok(Some(pm)) = fetch_partial_mail_without_attachments(
+                                session,
+                                uid,
+                                None,
+                                &plan,
+                                &folder,
+                                0,
+                            ) {
+                                if !pm.msg.body_html.is_empty() {
+                                    if let Some(target_ids) = uid_to_ids.get(&uid) {
+                                        for &id in target_ids {
+                                            html_by_id.insert(id, pm.msg.body_html.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            full_uids.push(uid);
+                        }
+                    }
+                    if !full_uids.is_empty() {
+                        let full_set = full_uids
+                            .iter()
+                            .map(|u| u.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        if let Ok(fetches) = session.uid_fetch(&full_set, "(UID BODY.PEEK[])") {
+                            for f in fetches.iter() {
+                                let Some(uid) = f.uid else { continue };
+                                let Some(raw) = f.body() else { continue };
+                                let Some(msg) = MessageParser::default().parse(raw) else { continue };
+                                let html = extract_html_with_cid(&msg);
+                                if !html.is_empty() {
+                                    if let Some(target_ids) = uid_to_ids.get(&uid) {
+                                        for &id in target_ids {
+                                            html_by_id.insert(id, html.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    if let Ok(fetches) = session.uid_fetch(&set, "(UID BODY.PEEK[])") {
+                        for f in fetches.iter() {
+                            let Some(uid) = f.uid else { continue };
+                            let Some(raw) = f.body() else { continue };
+                            let Some(msg) = MessageParser::default().parse(raw) else { continue };
+                            let html = extract_html_with_cid(&msg);
+                            if !html.is_empty() {
+                                if let Some(target_ids) = uid_to_ids.get(&uid) {
+                                    for &id in target_ids {
+                                        html_by_id.insert(id, html.clone());
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -754,6 +1525,7 @@ pub fn infer_mime_type(filename: &str, declared_mime: &str, bytes: &[u8]) -> Str
         "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         "ppt" => "application/vnd.ms-powerpoint",
         "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "exe" | "msi" | "dll" | "scr" | "com" => "application/x-msdownload",
         _ => "application/octet-stream",
     }
     .to_string()
@@ -798,20 +1570,17 @@ pub fn sanitize_attachment_filename(raw: &str, fallback_mime: &str) -> String {
     }
 }
 
-pub fn save_attachment_bytes(
-    attachments_dir: &Path,
+/// 仅构造纯内存附件元数据（严禁自动落盘写入本地文件系统）
+pub fn build_attachment_meta(
     filename: &str,
     declared_mime: &str,
-    bytes: &[u8],
-) -> Result<AttachmentMeta> {
-    const MAX_ATT_BYTES: usize = 25 * 1024 * 1024;
-    if bytes.is_empty() {
-        anyhow::bail!("附件内容为空");
-    }
-    if bytes.len() > MAX_ATT_BYTES {
-        anyhow::bail!("单个附件大小不能超过 25 MB");
-    }
-    let mime_full = infer_mime_type(filename, declared_mime, bytes);
+    size: usize,
+    part_id: &str,
+    encoding: &str,
+    att_index: usize,
+    sample_bytes: &[u8],
+) -> AttachmentMeta {
+    let mime_full = infer_mime_type(filename, declared_mime, sample_bytes);
     let mime_base = mime_full
         .split(';')
         .next()
@@ -822,19 +1591,285 @@ pub fn save_attachment_bytes(
     let is_image = mime_base.starts_with("image/");
     let uuid_hex = uuid::Uuid::new_v4().simple().to_string();
     let id = format!("att-{}", &uuid_hex[..16]);
-    let rel_path = format!("{}_{}", &uuid_hex[..12], safe_name);
 
-    std::fs::create_dir_all(attachments_dir).context("创建本地附件目录失败")?;
-    std::fs::write(attachments_dir.join(&rel_path), bytes).context("写入本地附件文件失败")?;
-
-    Ok(AttachmentMeta {
+    AttachmentMeta {
         id,
         filename: safe_name,
         mime: mime_base,
-        size: bytes.len(),
-        rel_path,
+        size,
+        rel_path: String::new(),
         is_image,
-    })
+        part_id: part_id.trim().to_string(),
+        encoding: encoding.trim().to_ascii_lowercase(),
+        att_index,
+        saved_path: String::new(),
+    }
+}
+
+fn parse_section_nums(part_id: &str) -> Option<Vec<u32>> {
+    let trimmed = part_id.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut nums = Vec::new();
+    for seg in trimmed.split('.') {
+        let n = seg.parse::<u32>().ok()?;
+        if n == 0 {
+            return None;
+        }
+        nums.push(n);
+    }
+    if nums.is_empty() {
+        None
+    } else {
+        Some(nums)
+    }
+}
+
+fn fetch_single_section_attachment_on<S: Read + Write>(
+    session: &mut imap::Session<S>,
+    uid: u32,
+    part_id: &str,
+    declared_mime: &str,
+    encoding: &str,
+    filename: &str,
+) -> Result<Option<(Vec<u8>, String)>> {
+    const MAX_DOWNLOAD_BYTES: usize = 50 * 1024 * 1024;
+    let Some(section_nums) = parse_section_nums(part_id) else {
+        return Ok(None);
+    };
+
+    let fetches = if section_nums == [1] {
+        match session.uid_fetch(
+            uid.to_string(),
+            "(UID BODY.PEEK[HEADER] BODY.PEEK[1.MIME] BODY.PEEK[1])",
+        ) {
+            Ok(fs) => fs,
+            Err(_) => session.uid_fetch(uid.to_string(), "(UID BODY.PEEK[HEADER] BODY.PEEK[1])")?,
+        }
+    } else {
+        let query = format!("(UID BODY.PEEK[{part_id}.MIME] BODY.PEEK[{part_id}])");
+        session.uid_fetch(uid.to_string(), &query)?
+    };
+
+    let Some(f) = fetches.iter().next() else {
+        return Ok(None);
+    };
+    let body_sp = SectionPath::Part(section_nums.clone(), None);
+    let Some(raw_part) = f.section(&body_sp) else {
+        return Ok(None);
+    };
+    if raw_part.len() > (MAX_DOWNLOAD_BYTES / 3) * 4 + 4096 {
+        anyhow::bail!("附件体积超过 50 MB 安全限制");
+    }
+
+    let mime_sp = SectionPath::Part(section_nums.clone(), Some(MessageSection::Mime));
+    let mime_hdr = f
+        .section(&mime_sp)
+        .filter(|b| !b.is_empty())
+        .or_else(|| if section_nums == [1] { f.header() } else { None })
+        .unwrap_or(b"");
+
+    let bytes = decode_binary_section(mime_hdr, raw_part, declared_mime, encoding);
+    if bytes.is_empty() {
+        anyhow::bail!("远程邮件附件内容为空");
+    }
+    if bytes.len() > MAX_DOWNLOAD_BYTES {
+        anyhow::bail!("附件体积超过 50 MB 安全限制");
+    }
+
+    let mime_full = infer_mime_type(filename, declared_mime, &bytes);
+    let mime_base = mime_full
+        .split(';')
+        .next()
+        .unwrap_or("application/octet-stream")
+        .trim()
+        .to_string();
+    Ok(Some((bytes, mime_base)))
+}
+
+fn fetch_uid_attachment_on<S: Read + Write>(
+    session: &mut imap::Session<S>,
+    uid: u32,
+    meta: &AttachmentMeta,
+) -> Result<Option<(Vec<u8>, String)>> {
+    const MAX_DOWNLOAD_BYTES: usize = 50 * 1024 * 1024;
+
+    if !meta.part_id.trim().is_empty() {
+        if let Some(found) = fetch_single_section_attachment_on(
+            session,
+            uid,
+            meta.part_id.trim(),
+            &meta.mime,
+            &meta.encoding,
+            &meta.filename,
+        )? {
+            return Ok(Some(found));
+        }
+    }
+
+    // 对无 part_id 的历史记录或本地刚发出的已归档邮件，优先通过 BODYSTRUCTURE 定位单个 MIME 分段按需拉取
+    if let Ok(meta_fetches) = session.uid_fetch(uid.to_string(), "(UID BODYSTRUCTURE)") {
+        if let Some(f) = meta_fetches.iter().next() {
+            if let Some(bs) = f.bodystructure() {
+                let plan = plan_bodystructure(bs);
+                let matched = plan
+                    .att_parts
+                    .get(meta.att_index)
+                    .filter(|ap| {
+                        ap.param_filename
+                            .as_deref()
+                            .map(decode_mime_param_filename)
+                            .map(|n| sanitize_attachment_filename(&n, &ap.declared_mime) == meta.filename)
+                            .unwrap_or(true)
+                    })
+                    .or_else(|| {
+                        plan.att_parts.iter().find(|ap| {
+                            ap.param_filename
+                                .as_deref()
+                                .map(decode_mime_param_filename)
+                                .map(|n| sanitize_attachment_filename(&n, &ap.declared_mime) == meta.filename)
+                                .unwrap_or(false)
+                        })
+                    })
+                    .or_else(|| plan.att_parts.get(meta.att_index));
+
+                if let Some(ap) = matched {
+                    let decl = if meta.mime.trim().is_empty() {
+                        &ap.declared_mime
+                    } else {
+                        &meta.mime
+                    };
+                    if let Some(found) = fetch_single_section_attachment_on(
+                        session,
+                        uid,
+                        &ap.part_id,
+                        decl,
+                        &ap.encoding,
+                        &meta.filename,
+                    )? {
+                        return Ok(Some(found));
+                    }
+                }
+            }
+        }
+    }
+
+    // 兜底：若极少数旧式邮件服务器 BODYSTRUCTURE 无法解析，仅在内存中解析整封邮件提取目标附件（严禁落盘）
+    let fetches = session.uid_fetch(uid.to_string(), "(UID BODY.PEEK[])")?;
+    let Some(f) = fetches.iter().next() else {
+        return Ok(None);
+    };
+    let Some(raw) = f.body() else {
+        return Ok(None);
+    };
+    let Some(msg) = MessageParser::default().parse(raw) else {
+        return Ok(None);
+    };
+    let has_rich_html = !extract_html_with_cid(&msg).is_empty();
+    let raw_atts = extract_incoming_attachments(&msg, has_rich_html);
+    let chosen = raw_atts
+        .get(meta.att_index)
+        .filter(|a| a.filename == meta.filename)
+        .or_else(|| raw_atts.iter().find(|a| a.filename == meta.filename))
+        .or_else(|| raw_atts.get(meta.att_index));
+
+    let Some(att) = chosen else {
+        return Ok(None);
+    };
+    if att.bytes.len() > MAX_DOWNLOAD_BYTES {
+        anyhow::bail!("附件体积超过 50 MB 安全限制");
+    }
+    let mime_base = att
+        .mime
+        .split(';')
+        .next()
+        .unwrap_or("application/octet-stream")
+        .trim()
+        .to_string();
+    Ok(Some((att.bytes.clone(), mime_base)))
+}
+
+pub(crate) fn fetch_attachment_bytes_on<S: Read + Write>(
+    session: &mut imap::Session<S>,
+    folder: &str,
+    uid: u32,
+    rfc_message_id: &str,
+    meta: &AttachmentMeta,
+) -> Result<(Vec<u8>, String)> {
+    if folder.eq_ignore_ascii_case("demo") {
+        anyhow::bail!("演示示例邮件不包含远程附件数据");
+    }
+
+    if uid > 0 && !folder.is_empty() && !folder.eq_ignore_ascii_case("local") {
+        if session.select(folder).is_ok() {
+            if let Some(found) = fetch_uid_attachment_on(session, uid, meta)? {
+                return Ok(found);
+            }
+        }
+    }
+
+    let clean_mid = rfc_message_id
+        .trim()
+        .trim_matches(&['<', '>', ' ', '"'][..]);
+    if !clean_mid.is_empty()
+        && !clean_mid.starts_with("local-")
+        && !clean_mid.chars().any(|c| c.is_control() || c == '"' || c == '\\')
+    {
+        let mut candidate_folders: Vec<String> = Vec::new();
+        if let Some(sent) = find_sent_folder(session) {
+            candidate_folders.push(sent);
+        }
+        if !folder.is_empty()
+            && !folder.eq_ignore_ascii_case("local")
+            && !candidate_folders.iter().any(|f| f.eq_ignore_ascii_case(folder))
+        {
+            candidate_folders.push(folder.to_string());
+        }
+        if !candidate_folders.iter().any(|f| f.eq_ignore_ascii_case("INBOX")) {
+            candidate_folders.push("INBOX".to_string());
+        }
+
+        for cand in candidate_folders {
+            if session.select(&cand).is_err() {
+                continue;
+            }
+            let found_uid = session
+                .uid_search(format!("HEADER Message-ID \"<{clean_mid}>\""))
+                .ok()
+                .and_then(|s| s.into_iter().max())
+                .or_else(|| {
+                    session
+                        .uid_search(format!("HEADER Message-ID \"{clean_mid}\""))
+                        .ok()
+                        .and_then(|s| s.into_iter().max())
+                });
+            if let Some(u) = found_uid {
+                if let Some(found) = fetch_uid_attachment_on(session, u, meta)? {
+                    return Ok(found);
+                }
+            }
+        }
+    }
+
+    if folder.eq_ignore_ascii_case("local") {
+        anyhow::bail!("该邮件刚发送不久，服务端“已发送”文件夹尚未完成归档，请稍后再试");
+    }
+    anyhow::bail!("在邮件服务器上未找到该附件所属的原邮件（可能已被删除或移动）")
+}
+
+/// 仅在用户主动触发“另存为”或点击查看图片预览时，按需从 IMAP 服务端拉取单个附件至内存
+pub fn fetch_attachment_bytes(
+    acc: &Account,
+    folder: &str,
+    uid: u32,
+    rfc_message_id: &str,
+    meta: &AttachmentMeta,
+) -> Result<(Vec<u8>, String)> {
+    let mut session = connect(acc)?;
+    let res = fetch_attachment_bytes_on(&mut session, folder, uid, rfc_message_id, meta);
+    let _ = session.logout();
+    res
 }
 
 fn sniff_image_mime(declared: Option<(&str, &str)>, bytes: &[u8]) -> Option<&'static str> {
@@ -865,53 +1900,13 @@ fn sniff_image_mime(declared: Option<(&str, &str)>, bytes: &[u8]) -> Option<&'st
     }
 }
 
-/// 提取真实存在的 `text/html` MIME 正文（排除 `mail-parser` 为纯文本邮件合成的伪 HTML），并将小尺寸内联 `cid:` 图片解析为 `data:` URI。
-pub fn extract_html_with_cid(msg: &mail_parser::Message) -> String {
+fn inline_cid_assets_into_html(mut html: String, assets: &[(String, String, Vec<u8>)]) -> String {
     const MAX_HTML_BYTES: usize = 1_500_000;
     const MAX_SINGLE_CID_IMAGE: usize = 512 * 1024;
     const MAX_TOTAL_CID_BYTES: usize = 1024 * 1024;
 
-    let mut html_chunks: Vec<&str> = msg
-        .html_bodies()
-        .filter_map(|p| match &p.body {
-            PartType::Html(h) if !h.trim().is_empty() => Some(h.as_ref()),
-            _ => None,
-        })
-        .collect();
-
-    if html_chunks.is_empty() {
-        html_chunks = msg
-            .parts
-            .iter()
-            .filter_map(|p| match &p.body {
-                PartType::Html(h) if !h.trim().is_empty() => Some(h.as_ref()),
-                _ => None,
-            })
-            .collect();
-    }
-
-    if html_chunks.is_empty() {
-        return String::new();
-    }
-
-    let mut html = html_chunks.join("\n").trim().to_string();
-    if html.is_empty() || html.len() > MAX_HTML_BYTES {
-        return String::new();
-    }
-
-    let has_cid_ref = html
-        .as_bytes()
-        .windows(4)
-        .any(|w| w.eq_ignore_ascii_case(b"cid:"));
-    if !has_cid_ref {
-        return html;
-    }
-
     let mut used_bytes = 0usize;
-    for part in &msg.parts {
-        let Some(raw_cid) = part.content_id() else {
-            continue;
-        };
+    for (raw_cid, declared_mime, bytes) in assets {
         let cid = raw_cid
             .trim()
             .trim_matches(&['<', '>', '"', '\''][..])
@@ -919,23 +1914,20 @@ pub fn extract_html_with_cid(msg: &mail_parser::Message) -> String {
         if cid.is_empty() {
             continue;
         }
-        let (PartType::Binary(bytes) | PartType::InlineBinary(bytes)) = &part.body else {
-            continue;
-        };
         if bytes.is_empty()
             || bytes.len() > MAX_SINGLE_CID_IMAGE
             || used_bytes + bytes.len() > MAX_TOTAL_CID_BYTES
         {
             continue;
         }
-        let declared = part
-            .content_type()
-            .and_then(|ct| Some((ct.c_type.as_ref(), ct.c_subtype.as_deref()?)));
-        let Some(mime) = sniff_image_mime(declared, bytes.as_ref()) else {
+        let declared = declared_mime
+            .split_once('/')
+            .map(|(t, s)| (t.trim(), s.split(';').next().unwrap_or("").trim()));
+        let Some(mime) = sniff_image_mime(declared, bytes) else {
             continue;
         };
 
-        let data_uri = format!("data:{mime};base64,{}", base64_encode(bytes.as_ref()));
+        let data_uri = format!("data:{mime};base64,{}", base64_encode(bytes));
         let pattern = if cid.contains('@') {
             format!(
                 r#"(?i)cid:(?:{}|{})(["'\s>)])"#,
@@ -961,6 +1953,68 @@ pub fn extract_html_with_cid(msg: &mail_parser::Message) -> String {
     } else {
         html
     }
+}
+
+/// 提取真实存在的 `text/html` MIME 正文（排除 `mail-parser` 为纯文本邮件合成的伪 HTML），并将小尺寸内联 `cid:` 图片解析为 `data:` URI。
+pub fn extract_html_with_cid(msg: &mail_parser::Message) -> String {
+    const MAX_HTML_BYTES: usize = 1_500_000;
+    const MAX_SINGLE_CID_IMAGE: usize = 512 * 1024;
+
+    let mut html_chunks: Vec<&str> = msg
+        .html_bodies()
+        .filter_map(|p| match &p.body {
+            PartType::Html(h) if !h.trim().is_empty() => Some(h.as_ref()),
+            _ => None,
+        })
+        .collect();
+
+    if html_chunks.is_empty() {
+        html_chunks = msg
+            .parts
+            .iter()
+            .filter_map(|p| match &p.body {
+                PartType::Html(h) if !h.trim().is_empty() => Some(h.as_ref()),
+                _ => None,
+            })
+            .collect();
+    }
+
+    if html_chunks.is_empty() {
+        return String::new();
+    }
+
+    let html = html_chunks.join("\n").trim().to_string();
+    if html.is_empty() || html.len() > MAX_HTML_BYTES {
+        return String::new();
+    }
+
+    let has_cid_ref = html
+        .as_bytes()
+        .windows(4)
+        .any(|w| w.eq_ignore_ascii_case(b"cid:"));
+    if !has_cid_ref {
+        return html;
+    }
+
+    let mut assets: Vec<(String, String, Vec<u8>)> = Vec::new();
+    for part in &msg.parts {
+        let Some(raw_cid) = part.content_id() else {
+            continue;
+        };
+        let (PartType::Binary(bytes) | PartType::InlineBinary(bytes)) = &part.body else {
+            continue;
+        };
+        if bytes.is_empty() || bytes.len() > MAX_SINGLE_CID_IMAGE {
+            continue;
+        }
+        let declared_mime = part
+            .content_type()
+            .and_then(|ct| Some(format!("{}/{}", ct.c_type, ct.c_subtype.as_deref()?)))
+            .unwrap_or_default();
+        assets.push((raw_cid.to_string(), declared_mime, bytes.to_vec()));
+    }
+
+    inline_cid_assets_into_html(html, &assets)
 }
 
 fn header_ids(v: &HeaderValue) -> Vec<String> {
@@ -1052,6 +2106,21 @@ pub fn parse_full(raw: &[u8], folder: &str, uid: u32, validity: u32) -> Option<P
 
     let body_html = extract_html_with_cid(&msg);
     let raw_attachments = extract_incoming_attachments(&msg, !body_html.is_empty());
+    let attachments: Vec<AttachmentMeta> = raw_attachments
+        .iter()
+        .enumerate()
+        .map(|(idx, raw_att)| {
+            build_attachment_meta(
+                &raw_att.filename,
+                &raw_att.mime,
+                raw_att.bytes.len(),
+                "",
+                "",
+                idx,
+                &raw_att.bytes,
+            )
+        })
+        .collect();
     let plain = msg.body_text(0).map(|s| s.into_owned()).unwrap_or_default();
     let raw_body = if !plain.trim().is_empty() {
         plain
@@ -1102,7 +2171,7 @@ pub fn parse_full(raw: &[u8], folder: &str, uid: u32, validity: u32) -> Option<P
             suggested_reply: String::new(),
             read: false,
             agent_done: false,
-            attachments: Vec::new(),
+            attachments,
             reply_to: None,
         },
         participants,
@@ -1780,41 +2849,61 @@ mod tests {
             assert!(line.starts_with("a6 UID SEARCH UID 11:*"));
             stream.write_all(b"* SEARCH 11\r\na6 OK SEARCH completed\r\n").unwrap();
 
-            // a7 UID FETCH 11 (UID FLAGS BODY.PEEK[])
+            // a7 UID FETCH 11 (UID FLAGS RFC822.SIZE BODYSTRUCTURE BODY.PEEK[HEADER])
             line.clear();
             reader.read_line(&mut line).unwrap();
             assert!(line.starts_with("a7 UID FETCH 11"));
-            let raw_mail = concat!(
+            assert!(!line.contains("BODY.PEEK[]"));
+            let top_hdr = concat!(
                 "From: Alice <alice@example.com>\r\n",
                 "To: me@example.com\r\n",
                 "Subject: 实时推送测试\r\n",
                 "Message-ID: <push-11@example.com>\r\n",
-                "Content-Type: text/plain; charset=utf-8\r\n\r\n",
-                "您的登录验证码是 839201\r\n"
+                "Content-Type: text/plain; charset=utf-8\r\n\r\n"
             );
-            let header = format!(
-                "* 2 FETCH (UID 11 FLAGS () BODY[] {{{}}})\r\n",
-                raw_mail.as_bytes().len()
+            let body_part = "您的登录验证码是 839201\r\n";
+            let bs = format!(
+                r#"("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "8BIT" {} 1 NIL NIL NIL NIL)"#,
+                body_part.len()
             );
-            stream.write_all(header.as_bytes()).unwrap();
-            stream.write_all(raw_mail.as_bytes()).unwrap();
+            let resp_a7 = format!(
+                "* 2 FETCH (UID 11 FLAGS () RFC822.SIZE {} BODYSTRUCTURE {} BODY[HEADER] {{{}}}\r\n",
+                top_hdr.len() + body_part.len(),
+                bs,
+                top_hdr.len()
+            );
+            stream.write_all(resp_a7.as_bytes()).unwrap();
+            stream.write_all(top_hdr.as_bytes()).unwrap();
             stream.write_all(b")\r\na7 OK FETCH completed\r\n").unwrap();
 
-            // a8 SELECT "INBOX"（再次检查时 UIDNEXT 仍为 12，客户端应直接短路跳过 UID SEARCH！）
+            // a8 UID FETCH 11 (UID FLAGS BODY.PEEK[])（纯文本无附件小邮件批量拉取正文）
             line.clear();
             reader.read_line(&mut line).unwrap();
-            assert!(line.starts_with("a8 SELECT"));
+            assert!(line.starts_with("a8 UID FETCH 11"));
+            let raw_mail = format!("{top_hdr}{body_part}");
+            let resp_a8 = format!(
+                "* 2 FETCH (UID 11 FLAGS () BODY[] {{{}}}\r\n",
+                raw_mail.len()
+            );
+            stream.write_all(resp_a8.as_bytes()).unwrap();
+            stream.write_all(raw_mail.as_bytes()).unwrap();
+            stream.write_all(b")\r\na8 OK FETCH completed\r\n").unwrap();
+
+            // a9 SELECT "INBOX"（再次检查时 UIDNEXT 仍为 12，客户端应直接短路跳过 UID SEARCH！）
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.starts_with("a9 SELECT"));
             stream
                 .write_all(
-                    b"* 2 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 77] ok\r\n* OK [UIDNEXT 12] next\r\na8 OK [READ-WRITE] SELECT completed\r\n",
+                    b"* 2 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 77] ok\r\n* OK [UIDNEXT 12] next\r\na9 OK [READ-WRITE] SELECT completed\r\n",
                 )
                 .unwrap();
 
-            // a9 LOGOUT
+            // a10 LOGOUT
             line.clear();
             reader.read_line(&mut line).unwrap();
-            assert!(line.starts_with("a9 LOGOUT"));
-            stream.write_all(b"* BYE bye\r\na9 OK LOGOUT\r\n").unwrap();
+            assert!(line.starts_with("a10 LOGOUT"));
+            stream.write_all(b"* BYE bye\r\na10 OK LOGOUT\r\n").unwrap();
         });
 
         let tmp = std::env::temp_dir().join(format!("mailchat_idle_test_{}.db", uuid::Uuid::new_v4()));
@@ -1974,6 +3063,232 @@ mod tests {
         assert_eq!(parsed.raw_attachments[0].filename, "screenshot.png");
         assert_eq!(parsed.raw_attachments[0].mime, "image/png");
         assert_eq!(parsed.raw_attachments[1].filename, "notes.txt");
-        assert_eq!(parsed.raw_attachments[1].bytes, b"Hello attachment!\r\n");
+        assert_eq!(parsed.raw_attachments[1].bytes, b"Hello attachment!");
+        assert_eq!(parsed.msg.attachments.len(), 2);
+        assert!(parsed.msg.attachments[0].rel_path.is_empty());
+        assert!(parsed.msg.attachments[0].saved_path.is_empty());
+    }
+
+    #[test]
+    fn sync_never_downloads_or_saves_attachments_and_fetches_only_requested_part_on_demand() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let docx_payload = b"PK\x03\x04mock_docx_binary_payload";
+        let docx_b64 = base64_encode(docx_payload);
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.write_all(b"* OK IMAP4rev1 Ready\r\n").unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+
+            // a1 LOGIN
+            reader.read_line(&mut line).unwrap();
+            assert!(line.starts_with("a1 LOGIN"));
+            stream.write_all(b"a1 OK LOGIN completed\r\n").unwrap();
+
+            // a2 SELECT "INBOX"
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.starts_with("a2 SELECT"));
+            stream
+                .write_all(
+                    b"* 1 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 88] ok\r\na2 OK [READ-WRITE] SELECT completed\r\n",
+                )
+                .unwrap();
+
+            // a3 UID SEARCH ALL
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.starts_with("a3 UID SEARCH"));
+            stream.write_all(b"* SEARCH 5\r\na3 OK SEARCH completed\r\n").unwrap();
+
+            // a4 UID FETCH 5 (UID FLAGS RFC822.SIZE BODYSTRUCTURE BODY.PEEK[HEADER])
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.starts_with("a4 UID FETCH 5"));
+            assert!(line.contains("BODYSTRUCTURE"));
+            assert!(!line.contains("BODY.PEEK[]"));
+
+            let top_hdr = concat!(
+                "From: Sender <sender@example.com>\r\n",
+                "To: me@example.com\r\n",
+                "Subject: 文件通知\r\n",
+                "Message-ID: <sec-5@example.com>\r\n",
+                "MIME-Version: 1.0\r\n",
+                "Content-Type: multipart/mixed; boundary=\"mix_b\"\r\n\r\n"
+            );
+            let bs = concat!(
+                "(",
+                "(\"TEXT\" \"PLAIN\" (\"CHARSET\" \"utf-8\") NIL NIL \"8BIT\" 18 1 NIL NIL NIL NIL)",
+                "(\"APPLICATION\" \"OCTET-STREAM\" (\"NAME\" \"JiJiDown_setup.exe\") NIL NIL \"BASE64\" 2088960 NIL (\"ATTACHMENT\" (\"FILENAME\" \"JiJiDown_setup.exe\")) NIL NIL)",
+                "(\"APPLICATION\" \"VND.OPENXMLFORMATS-OFFICEDOCUMENT.WORDPROCESSINGML.DOCUMENT\" NIL NIL NIL \"BASE64\" 40 NIL (\"ATTACHMENT\" (\"FILENAME*\" \"UTF-8''%E6%B4%BE%E5%8F%91%E9%80%9A%E7%9F%A5.docx\")) NIL NIL)",
+                " \"MIXED\" (\"BOUNDARY\" \"mix_b\") NIL NIL NIL)"
+            );
+            let resp_a4 = format!(
+                "* 1 FETCH (UID 5 FLAGS () RFC822.SIZE 2095000 BODYSTRUCTURE {bs} BODY[HEADER] {{{}}})\r\n",
+                top_hdr.len()
+            );
+            // 注意 IMAP literal 后还有闭合括号
+            let resp_a4_open = format!(
+                "* 1 FETCH (UID 5 FLAGS () RFC822.SIZE 2095000 BODYSTRUCTURE {bs} BODY[HEADER] {{{}}}\r\n",
+                top_hdr.len()
+            );
+            let _ = resp_a4;
+            stream.write_all(resp_a4_open.as_bytes()).unwrap();
+            stream.write_all(top_hdr.as_bytes()).unwrap();
+            stream.write_all(b")\r\na4 OK FETCH completed\r\n").unwrap();
+
+            // a5 部分分段拉取：仅拉取正文 1 与附件 2.MIME / 3.MIME，严禁请求 BODY.PEEK[2] 或 BODY.PEEK[3]！
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.starts_with("a5 UID FETCH 5"));
+            assert!(line.contains("BODY.PEEK[1]"));
+            assert!(line.contains("BODY.PEEK[2.MIME]"));
+            assert!(line.contains("BODY.PEEK[3.MIME]"));
+            assert!(
+                !line.contains("BODY.PEEK[2]"),
+                "严禁在同步阶段拉取 .exe 附件内容: {line}"
+            );
+            assert!(
+                !line.contains("BODY.PEEK[3]"),
+                "严禁在同步阶段拉取 .docx 附件内容: {line}"
+            );
+            assert!(!line.contains("BODY.PEEK[]"));
+
+            let m1 = b"Content-Type: text/plain; charset=utf-8\r\n\r\n";
+            let b1 = "请查收通知文档\r\n".as_bytes();
+            let m2 = b"Content-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"JiJiDown_setup.exe\"\r\nContent-Transfer-Encoding: base64\r\n\r\n";
+            let m3 = b"Content-Type: application/vnd.openxmlformats-officedocument.wordprocessingml.document\r\nContent-Disposition: attachment; filename*=UTF-8''%E6%B4%BE%E5%8F%91%E9%80%9A%E7%9F%A5.docx\r\nContent-Transfer-Encoding: base64\r\n\r\n";
+
+            stream.write_all(b"* 1 FETCH (UID 5 ").unwrap();
+            stream
+                .write_all(format!("BODY[1.MIME] {{{}}}\r\n", m1.len()).as_bytes())
+                .unwrap();
+            stream.write_all(m1).unwrap();
+            stream
+                .write_all(format!(" BODY[1] {{{}}}\r\n", b1.len()).as_bytes())
+                .unwrap();
+            stream.write_all(b1).unwrap();
+            stream
+                .write_all(format!(" BODY[2.MIME] {{{}}}\r\n", m2.len()).as_bytes())
+                .unwrap();
+            stream.write_all(m2).unwrap();
+            stream
+                .write_all(format!(" BODY[3.MIME] {{{}}}\r\n", m3.len()).as_bytes())
+                .unwrap();
+            stream.write_all(m3).unwrap();
+            stream.write_all(b")\r\na5 OK FETCH completed\r\n").unwrap();
+
+            // 用户稍后主动在 UI 上仅对“派发通知.docx”（part 3）确认另存为：
+            // a6 SELECT "INBOX"
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.starts_with("a6 SELECT"));
+            stream
+                .write_all(
+                    b"* 1 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 88] ok\r\na6 OK [READ-WRITE] SELECT completed\r\n",
+                )
+                .unwrap();
+
+            // a7 UID FETCH 5 (UID BODY.PEEK[3.MIME] BODY.PEEK[3]) —— 绝不触碰第 2 段 .exe！
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.starts_with("a7 UID FETCH 5"));
+            assert!(line.contains("BODY.PEEK[3.MIME]"));
+            assert!(line.contains("BODY.PEEK[3]"));
+            assert!(!line.contains("BODY.PEEK[2]"));
+
+            let b3 = format!("{docx_b64}\r\n");
+            stream.write_all(b"* 1 FETCH (UID 5 ").unwrap();
+            stream
+                .write_all(format!("BODY[3.MIME] {{{}}}\r\n", m3.len()).as_bytes())
+                .unwrap();
+            stream.write_all(m3).unwrap();
+            stream
+                .write_all(format!(" BODY[3] {{{}}}\r\n", b3.len()).as_bytes())
+                .unwrap();
+            stream.write_all(b3.as_bytes()).unwrap();
+            stream.write_all(b")\r\na7 OK FETCH completed\r\n").unwrap();
+
+            // a8 LOGOUT
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            stream.write_all(b"* BYE bye\r\na8 OK LOGOUT\r\n").unwrap();
+        });
+
+        let tmp_dir = std::env::temp_dir().join(format!("mailchat_no_autodl_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        // 模拟遗留的旧版自动下载目录与高危文件：Db::open 启动时必须立即清除！
+        let legacy_att_dir = tmp_dir.join("attachments");
+        std::fs::create_dir_all(&legacy_att_dir).unwrap();
+        std::fs::write(legacy_att_dir.join("0ab39625c7d8_JiJiDown_setup.exe"), b"legacy_exe").unwrap();
+        assert!(legacy_att_dir.exists());
+
+        let db_path = tmp_dir.join("mailchat.db");
+        let db = Db::open(&db_path).unwrap();
+        assert!(
+            !db.attachments_dir().exists(),
+            "启动 Db::open 时必须自动清理遗留的自动下载附件目录"
+        );
+
+        let acc = Account {
+            email: "me@example.com".into(),
+            ..Default::default()
+        };
+        db.save_account(&acc).unwrap();
+
+        let tcp = TcpStream::connect(addr).unwrap();
+        let mut client = imap::Client::new(tcp);
+        client.read_greeting().unwrap();
+        let mut session = client.login("me@example.com", "secret").map_err(|(e, _)| e).unwrap();
+
+        let added = sync_folder_on(&mut session, "INBOX", false, &acc, &db, &[], false).unwrap();
+        assert_eq!(added, 1);
+        assert!(
+            !db.attachments_dir().exists(),
+            "同步邮件后严禁在磁盘上创建 attachments 目录或写入任何文件"
+        );
+
+        let msgs = db.messages("sender@example.com", "inbox").unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].body, "请查收通知文档");
+        assert_eq!(msgs[0].attachments.len(), 2);
+        assert_eq!(msgs[0].attachments[0].filename, "JiJiDown_setup.exe");
+        assert_eq!(msgs[0].attachments[0].part_id, "2");
+        assert!(msgs[0].attachments[0].saved_path.is_empty());
+        assert!(msgs[0].attachments[0].rel_path.is_empty());
+
+        assert_eq!(msgs[0].attachments[1].filename, "派发通知.docx");
+        assert_eq!(msgs[0].attachments[1].part_id, "3");
+        assert!(msgs[0].attachments[1].saved_path.is_empty());
+
+        // 用户主动下载第 2 个附件（派发通知.docx）
+        let loc = db
+            .locate_attachment(msgs[0].id, &msgs[0].attachments[1].id)
+            .unwrap()
+            .unwrap();
+        let (downloaded, mime) = fetch_attachment_bytes_on(
+            &mut session,
+            &loc.folder,
+            loc.uid,
+            &loc.rfc_message_id,
+            &loc.meta,
+        )
+        .unwrap();
+        assert_eq!(downloaded, docx_payload);
+        assert_eq!(
+            mime,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        );
+        assert!(
+            !db.attachments_dir().exists(),
+            "按需拉取到内存后仍不得在应用数据目录自动落盘"
+        );
+
+        session.logout().unwrap();
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

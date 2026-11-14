@@ -6,6 +6,7 @@ import type {
   AgentConfig,
   AgentSessionSummary,
   AgentTurnRecord,
+  AttachmentMeta,
   ChatTurn,
   ContactProfile,
   Conversation,
@@ -13,11 +14,14 @@ import type {
   DeclarativeConfigSpec,
   GroupInfo,
   GroupMember,
+  MagpieConnectResult,
+  MagpieProbeReport,
   MailboxStats,
   Message,
   ModelSwitchResult,
   ProviderPresetId,
   ProviderProtocol,
+  RewindAgentResponse,
   Rule,
   RuleKind,
   SecretSaveResult,
@@ -61,6 +65,12 @@ export const api = {
     invoke<AgentSessionSummary[]>("delete_agent_session", { sessionId }),
   clearAgentSessionTurns: (sessionId: string) =>
     invoke<AgentSessionSummary[]>("clear_agent_session_turns", { sessionId }),
+  rewindAgentSession: (sessionId: string, fromTurnId: number, restoreConfig: boolean) =>
+    invoke<RewindAgentResponse>("rewind_agent_session", {
+      sessionId,
+      fromTurnId,
+      restoreConfig,
+    }),
   switchActiveModel: (preset: string, model?: string) =>
     invoke<ModelSwitchResult>("switch_active_model", {
       preset,
@@ -78,6 +88,20 @@ export const api = {
   saveAgentConfig: (config: AgentConfig) => invoke<void>("save_agent_config", { config }),
   testAgent: (config: AgentConfig) => invoke<Verdict>("test_agent", { config }),
   fetchModels: (config: AgentConfig) => invoke<string[]>("fetch_models", { config }),
+  probeMagpie: (baseUrl?: string) =>
+    invoke<MagpieProbeReport>("probe_magpie", {
+      baseUrl: baseUrl?.trim() ? baseUrl.trim() : null,
+    }),
+  startMagpieGateway: (baseUrl?: string) =>
+    invoke<MagpieProbeReport>("start_magpie_gateway", {
+      baseUrl: baseUrl?.trim() ? baseUrl.trim() : null,
+    }),
+  connectMagpie: (opts?: { baseUrl?: string; model?: string; autoStart?: boolean }) =>
+    invoke<MagpieConnectResult>("connect_magpie", {
+      baseUrl: opts?.baseUrl?.trim() ? opts.baseUrl.trim() : null,
+      model: opts?.model?.trim() ? opts.model.trim() : null,
+      autoStart: opts?.autoStart ?? true,
+    }),
   windowAction: (action: WindowAction) => invoke<boolean>("window_action", { action }),
   reclassifyMessages: (all: boolean) => invoke<number>("reclassify_messages", { all }),
   syncNow: () => invoke<SyncReport>("sync_now"),
@@ -93,10 +117,14 @@ export const api = {
   getContactProfile: (email: string) => invoke<ContactProfile>("get_contact_profile", { email }),
   saveContactProfile: (profile: ContactProfile) =>
     invoke<ContactProfile>("save_contact_profile", { profile }),
-  readAttachmentDataUrl: (relPath: string) =>
-    invoke<string>("read_attachment_data_url", { relPath }),
-  openAttachment: (relPath: string) => invoke<void>("open_attachment", { relPath }),
-  revealAttachment: (relPath: string) => invoke<void>("reveal_attachment", { relPath }),
+  previewAttachmentDataUrl: (messageId: number, attachmentId: string) =>
+    invoke<string>("preview_attachment_data_url", { messageId, attachmentId }),
+  saveAttachmentAs: (messageId: number, attachmentId: string) =>
+    invoke<AttachmentMeta | null>("save_attachment_as", { messageId, attachmentId }),
+  openSavedAttachment: (messageId: number, attachmentId: string) =>
+    invoke<void>("open_saved_attachment", { messageId, attachmentId }),
+  revealSavedAttachment: (messageId: number, attachmentId: string) =>
+    invoke<void>("reveal_saved_attachment", { messageId, attachmentId }),
   sendMessage: (
     peer: string,
     body: string,
@@ -113,6 +141,16 @@ export const api = {
     }),
   setMessageStatus: (id: number, status: Status) => invoke<void>("set_message_status", { id, status }),
   moveConversation: (peer: string, status: Status) => invoke<void>("move_conversation", { peer, status }),
+  setConversationPinned: (peer: string, pinned: boolean) =>
+    invoke<void>("set_conversation_pinned", { peer, pinned }),
+  setConversationRead: (peer: string, status: Status, read: boolean) =>
+    invoke<void>("set_conversation_read", { peer, status, read }),
+  markAllRead: (status: Status) => invoke<number>("mark_all_read", { status }),
+  setConversationMuted: (peer: string, muted: boolean) =>
+    invoke<void>("set_conversation_muted", { peer, muted }),
+  deleteMessage: (id: number) => invoke<void>("delete_message", { id }),
+  deleteConversation: (peer: string, status?: Status) =>
+    invoke<number>("delete_conversation", { peer, status: status ?? null }),
   blockSender: (peer: string) => invoke<void>("block_sender", { peer }),
   allowSender: (peer: string) => invoke<void>("allow_sender", { peer }),
   listRules: () => invoke<Rule[]>("list_rules"),
@@ -132,6 +170,7 @@ export const api = {
       window.open(url, "_blank", "noopener,noreferrer");
     }
   },
+  startScreenSnip: () => invoke<void>("start_screen_snip"),
 };
 
 /** 常见邮箱的服务器预设 */
@@ -190,8 +229,22 @@ export interface ModelPreset {
   hint: string;
 }
 
-/** 可一键切换的模型预设：优先推荐 DeepSeek 官网、OpenCode Go 与 Ollama 远程订阅（均默认搭载 deepseek-v4.1-flash） */
+/** 可一键切换的模型预设：支持免配置直接沿用本机 Magpie 模型路由，以及 DeepSeek 官网、OpenCode Go 与 Ollama 远程订阅 */
 export const MODEL_PRESETS: ModelPreset[] = [
+  {
+    id: "magpie",
+    name: "Magpie 模型路由",
+    badge: "免配沿用",
+    featured: true,
+    provider: "openai",
+    baseUrl: "http://127.0.0.1:3425/v1",
+    defaultModel: "auto",
+    models: ["auto"],
+    needsKey: false,
+    optionalKey: true,
+    supportsModelFetch: true,
+    hint: "自动发现并复用本机 Magpie (usemagpie.ai) 已配好的全部模型、OAuth 订阅与故障转移路由组（group/* / auto/*）；本机直连无需再配置任何 API Key，设 auto 即可动态跟随你在 Magpie 中的激活路由。",
+  },
   {
     id: "deepseek",
     name: "DeepSeek 官网",

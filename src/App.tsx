@@ -13,8 +13,23 @@ import type {
 } from "./types";
 import { AgentWorkspace } from "./components/AgentWorkspace";
 import { ChatView } from "./components/ChatView";
-import { ConversationList } from "./components/ConversationList";
-import { BrandAppIcon, IconBell, IconChat, IconShield, IconSliders, IconSparkles } from "./components/Icons";
+import { ContextMenuProvider, useContextMenu } from "./components/ContextMenu";
+import { type ComposePanelIntent, ConversationList } from "./components/ConversationList";
+import { FirstScreenWorkspace } from "./components/FirstScreenWorkspace";
+import {
+  BrandAppIcon,
+  IconBell,
+  IconChat,
+  IconCode,
+  IconLock,
+  IconMailRead,
+  IconPlus,
+  IconRefresh,
+  IconShield,
+  IconSliders,
+  IconSparkles,
+  IconTriage,
+} from "./components/Icons";
 import { Settings, type AccountFormIntent, type SettingsTab } from "./components/Settings";
 import { startWindowDrag, toggleWindowMaximize, WindowControls } from "./components/WindowControls";
 
@@ -34,7 +49,15 @@ const EMPTY_STATS: MailboxStats = {
   has_demo: false,
 };
 
-export default function App() {
+function AppContent({
+  notify,
+  toast,
+}: {
+  notify: (text: string, error?: boolean) => void;
+  toast: { text: string; error: boolean } | null;
+}) {
+  const { openContextMenu } = useContextMenu();
+  const [hydrated, setHydrated] = useState(false);
   const [view, setView] = useState<View>("inbox");
   const [account, setAccount] = useState<Account | null>(null);
   const [accounts, setAccounts] = useState<AccountEntry[]>([]);
@@ -47,51 +70,55 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [syncing, setSyncing] = useState(false);
   const [triaging, setTriaging] = useState(false);
-  const [settingsTab, setSettingsTab] = useState<SettingsTab>("declarative");
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>("visual");
   const [accountIntent, setAccountIntent] = useState<AccountFormIntent>({
     seq: 0,
     mode: "manage",
   });
-  const [toast, setToast] = useState<{ text: string; error: boolean } | null>(null);
-  const toastTimer = useRef<number>();
+  const [composeIntent, setComposeIntent] = useState<ComposePanelIntent>({
+    seq: 0,
+    mode: "direct",
+  });
+  const [openDrawerReq, setOpenDrawerReq] = useState<{ peer: string; seq: number }>({
+    peer: "",
+    seq: 0,
+  });
 
   const cur = useRef({ view, selected, draftConv });
   cur.current = { view, selected, draftConv };
 
-  const notify = useCallback((text: string, error = false) => {
-    setToast({ text, error });
-    window.clearTimeout(toastTimer.current);
-    toastTimer.current = window.setTimeout(() => setToast(null), error ? 5500 : 3000);
-  }, []);
-
   const refresh = useCallback(async () => {
-    const { view, selected, draftConv } = cur.current;
-    const [acc, accList, st] = await Promise.all([
-      api.getAccount(),
-      api.listAccounts().catch(() => [] as AccountEntry[]),
-      api.getStats(),
-    ]);
-    setAccount(acc);
-    setAccounts(accList);
-    setStats(st);
-
-    if (view === "settings" || view === "assistant") return;
-    const list = await api.listConversations(view);
-    setConvs(list);
-    if (selected && list.some((c) => c.peer === selected)) {
-      setDraftConv(null);
-      setMessages(await api.listMessages(selected, view));
-      const [freshSt, freshAccounts] = await Promise.all([
+    try {
+      const { view, selected, draftConv } = cur.current;
+      const [acc, accList, st] = await Promise.all([
+        api.getAccount(),
+        api.listAccounts().catch(() => [] as AccountEntry[]),
         api.getStats(),
-        api.listAccounts().catch(() => accList),
       ]);
-      setStats(freshSt);
-      setAccounts(freshAccounts);
-    } else if (selected && draftConv && draftConv.peer === selected) {
-      setMessages([]);
-    } else if (selected) {
-      setSelected(null);
-      setMessages([]);
+      setAccount(acc);
+      setAccounts(accList);
+      setStats(st);
+
+      if (view === "settings" || view === "assistant") return;
+      const list = await api.listConversations(view);
+      setConvs(list);
+      if (selected && list.some((c) => c.peer === selected)) {
+        setDraftConv(null);
+        setMessages(await api.listMessages(selected, view));
+        const [freshSt, freshAccounts] = await Promise.all([
+          api.getStats(),
+          api.listAccounts().catch(() => accList),
+        ]);
+        setStats(freshSt);
+        setAccounts(freshAccounts);
+      } else if (selected && draftConv && draftConv.peer === selected) {
+        setMessages([]);
+      } else if (selected) {
+        setSelected(null);
+        setMessages([]);
+      }
+    } finally {
+      setHydrated(true);
     }
   }, []);
 
@@ -178,42 +205,72 @@ export default function App() {
     };
   }, []);
 
-  const select = async (peer: string) => {
-    if (view === "settings" || view === "assistant") return;
-    setDraftConv(null);
-    setSelected(peer);
-    setMessages(await api.listMessages(peer, view));
-    refresh();
-  };
+  const select = useCallback(
+    async (peer: string) => {
+      const targetView =
+        cur.current.view === "settings" || cur.current.view === "assistant"
+          ? "inbox"
+          : cur.current.view;
+      if (cur.current.view !== targetView) {
+        setView(targetView);
+      }
+      setDraftConv(null);
+      setSelected(peer);
+      setMessages(await api.listMessages(peer, targetView));
+      void refresh();
+    },
+    [refresh],
+  );
 
-  const startNewChat = (email: string, name?: string) => {
-    const peer = email.trim().toLowerCase();
-    if (!peer.includes("@")) {
-      notify("请输入格式正确的邮箱地址", true);
-      return;
-    }
-    setView("inbox");
-    const existing = convs.find((c) => c.peer === peer);
-    if (existing) {
-      select(peer);
-      return;
-    }
-    const created: Conversation = {
-      peer,
-      name: name?.trim() || peer.split("@")[0],
-      preview: "新会话",
-      last_date: Math.floor(Date.now() / 1000),
-      unread: 0,
-      count: 0,
-      category: "",
-      is_group: false,
-      members: [],
-      muted: false,
+  const openDrawerForPeer = useCallback(
+    async (peer: string) => {
+      await select(peer);
+      setOpenDrawerReq((prev) => ({ peer, seq: prev.seq + 1 }));
+    },
+    [select],
+  );
+
+  const startNewChat = useCallback(
+    (email: string, name?: string) => {
+      const peer = email.trim().toLowerCase();
+      if (!peer.includes("@")) {
+        notify("请输入格式正确的邮箱地址", true);
+        return;
+      }
+      setView("inbox");
+      const existing = convs.find((c) => c.peer === peer);
+      if (existing) {
+        void select(peer);
+        return;
+      }
+      const created: Conversation = {
+        peer,
+        name: name?.trim() || peer.split("@")[0],
+        preview: "新会话",
+        last_date: Math.floor(Date.now() / 1000),
+        unread: 0,
+        count: 0,
+        category: "",
+        is_group: false,
+        members: [],
+        muted: false,
+      };
+      setDraftConv(created);
+      setSelected(peer);
+      setMessages([]);
+    },
+    [convs, notify, select],
+  );
+
+  // 支持从全局右键菜单（如选中任意文本邮箱点击“发起单聊”）呼起对话
+  useEffect(() => {
+    const onGlobalStartChat = (ev: Event) => {
+      const email = (ev as CustomEvent<string>).detail;
+      if (email) startNewChat(email);
     };
-    setDraftConv(created);
-    setSelected(peer);
-    setMessages([]);
-  };
+    window.addEventListener("mailchat-start-chat", onGlobalStartChat);
+    return () => window.removeEventListener("mailchat-start-chat", onGlobalStartChat);
+  }, [startNewChat]);
 
   const createGroup = async (name: string, members: GroupMember[]) => {
     try {
@@ -279,13 +336,46 @@ export default function App() {
     setView("settings");
   };
 
-  const openAccountForm = (mode: "add" | "manage") => {
+  const openAccountForm = (mode: "add" | "manage", presetDomain?: string) => {
     setSettingsTab("visual");
-    setAccountIntent((prev) => ({ seq: prev.seq + 1, mode }));
+    setAccountIntent((prev) => ({ seq: prev.seq + 1, mode, presetDomain }));
     setView("settings");
   };
 
+  const openComposePanel = (mode: "direct" | "group") => {
+    if (view === "assistant" || view === "settings") {
+      setView("inbox");
+    }
+    setComposeIntent((prev) => ({ seq: prev.seq + 1, mode }));
+  };
+
+  const goFirstScreen = useCallback(() => {
+    cur.current = { view: "inbox", selected: null, draftConv: null };
+    setSelected(null);
+    setDraftConv(null);
+    setMessages([]);
+    setComposeIntent((prev) => ({ seq: prev.seq + 1, mode: "none" }));
+    if (view !== "inbox") {
+      setView("inbox");
+    } else {
+      void refresh();
+    }
+  }, [view, refresh]);
+
   const switchNav = (target: View) => {
+    if (target === view && target !== "assistant" && target !== "settings" && selected !== null) {
+      // 再次点击当前所处的「消息/通知/拦截」导航图标时，返回对应视图总览台
+      cur.current = { ...cur.current, selected: null, draftConv: null };
+      setSelected(null);
+      setDraftConv(null);
+      setMessages([]);
+      return;
+    }
+    cur.current = {
+      view: target,
+      selected: target === "assistant" || target === "settings" ? null : cur.current.selected,
+      draftConv: null,
+    };
     setView(target);
     setDraftConv(null);
     if (target === "assistant" || target === "settings") {
@@ -324,10 +414,12 @@ export default function App() {
     convs.find((c) => c.peer === selected) ??
     (draftConv && draftConv.peer === selected ? draftConv : undefined);
   const mailMeta = MAIL_VIEWS.find((v) => v.key === view);
+  const isAtFirstScreen = view === "inbox" && !activeConv;
 
   return (
     <div className="app-shell">
       <WindowControls
+        hydrated={hydrated}
         accountEmail={account?.email}
         accountName={account?.display_name}
         accounts={accounts}
@@ -339,6 +431,8 @@ export default function App() {
         onReorderAccounts={handleReorderAccounts}
         onAddAccount={() => openAccountForm("add")}
         onManageAccounts={() => openAccountForm("manage")}
+        onSyncNow={syncNow}
+        notify={notify}
       />
 
       <div
@@ -348,9 +442,51 @@ export default function App() {
         }}
       >
         <nav className="rail" onMouseDown={startWindowDrag} onDoubleClick={toggleWindowMaximize}>
-          <div className="rail-brand" title="MailChat（按住空白处可拖动窗口）">
+          <button
+            type="button"
+            className={`rail-brand no-drag ${isAtFirstScreen ? "is-home" : ""}`}
+            aria-label="切换回第一屏"
+            title={
+              isAtFirstScreen
+                ? "当前已在第一屏信箱总览 · 右键快捷操作"
+                : "点击切换回第一屏信箱总览 · 右键快捷操作"
+            }
+            onClick={goFirstScreen}
+            onContextMenu={(e) => {
+              openContextMenu(e, [
+                {
+                  kind: "header",
+                  label: "MailChat 第一屏",
+                  badge: isAtFirstScreen ? "当前所在" : undefined,
+                },
+                {
+                  label: "切换回第一屏信箱总览",
+                  icon: <IconChat size={14} />,
+                  accent: true,
+                  onSelect: goFirstScreen,
+                },
+                {
+                  label: syncing ? "正在同步收信…" : "立即同步收信",
+                  icon: <IconRefresh size={14} />,
+                  disabled: syncing,
+                  onSelect: syncNow,
+                },
+                { kind: "divider" },
+                {
+                  label: "AI 助手对话编排",
+                  icon: <IconSparkles size={14} />,
+                  onSelect: () => switchNav("assistant"),
+                },
+                {
+                  label: "多账号与系统设置",
+                  icon: <IconSliders size={14} />,
+                  onSelect: () => openAccountForm("manage"),
+                },
+              ]);
+            }}
+          >
             <BrandAppIcon size={38} />
-          </div>
+          </button>
 
           <div className="rail-group">
             {MAIL_VIEWS.map((v) => {
@@ -367,7 +503,50 @@ export default function App() {
                   type="button"
                   className={`rail-btn ${view === v.key ? "active" : ""}`}
                   onClick={() => switchNav(v.key)}
-                  title={v.label}
+                  onContextMenu={(e) => {
+                    openContextMenu(e, [
+                      { kind: "header", label: `${v.label}视图` },
+                      {
+                        label: view === v.key && selected !== null ? "返回信箱总览第一屏" : `切换至「${v.label}」`,
+                        icon: <Icon size={14} />,
+                        accent: true,
+                        onSelect: () => switchNav(v.key),
+                      },
+                      v.key !== "blocked" && badge > 0
+                        ? {
+                            label: `将「${v.label}」全部标为已读 (${badge})`,
+                            icon: <IconMailRead size={14} />,
+                            onSelect: async () => {
+                              try {
+                                await api.markAllRead(v.key);
+                                await refresh();
+                                notify(`已将「${v.label}」全部标为已读`);
+                              } catch (err) {
+                                notify(`操作失败：${err}`, true);
+                              }
+                            },
+                          }
+                        : null,
+                      { kind: "divider" },
+                      {
+                        label: syncing ? "正在同步…" : "立即同步收信",
+                        icon: <IconRefresh size={14} />,
+                        disabled: syncing,
+                        onSelect: syncNow,
+                      },
+                      {
+                        label: triaging ? "正在重分拣…" : "AI 重新分拣现有邮件",
+                        icon: <IconTriage size={14} />,
+                        disabled: triaging,
+                        onSelect: runAgentTriage,
+                      },
+                    ]);
+                  }}
+                  title={
+                    view === v.key && selected !== null
+                      ? `${v.label}（再次点击返回信箱总览）`
+                      : `${v.label} · 右键快捷操作`
+                  }
                 >
                   <Icon size={19} />
                   <span className="rail-label">{v.label}</span>
@@ -384,6 +563,22 @@ export default function App() {
               type="button"
               className={`rail-btn agent-rail-btn ${view === "assistant" ? "active" : ""}`}
               onClick={() => switchNav("assistant")}
+              onContextMenu={(e) => {
+                openContextMenu(e, [
+                  { kind: "header", label: "声明式配置助手" },
+                  {
+                    label: "打开 AI 对话编排工作台",
+                    icon: <IconSparkles size={14} />,
+                    accent: true,
+                    onSelect: () => switchNav("assistant"),
+                  },
+                  {
+                    label: "直接查看 config.toml 清单",
+                    icon: <IconCode size={14} />,
+                    onSelect: () => openSettings("declarative"),
+                  },
+                ]);
+              }}
               title="配置助手（仅用于编排 config.toml 声明式配置文件，不读邮件正文、不代写发信）"
             >
               <IconSparkles size={19} />
@@ -396,7 +591,34 @@ export default function App() {
               type="button"
               className={`rail-btn ${view === "settings" ? "active" : ""}`}
               onClick={() => switchNav("settings")}
-              title="声明式配置与隐私凭据保险箱"
+              onContextMenu={(e) => {
+                openContextMenu(e, [
+                  { kind: "header", label: "配置与隐私中心" },
+                  {
+                    label: "声明式配置 (config.toml)",
+                    icon: <IconCode size={14} />,
+                    onSelect: () => openSettings("declarative"),
+                  },
+                  {
+                    label: "隐私凭据保险箱 (DPAPI)",
+                    icon: <IconLock size={14} />,
+                    onSelect: () => openSettings("vault"),
+                  },
+                  {
+                    label: "可视化表单与多账号管理",
+                    icon: <IconSliders size={14} />,
+                    onSelect: () => openAccountForm("manage"),
+                  },
+                  { kind: "divider" },
+                  {
+                    label: "接入新邮箱账号…",
+                    icon: <IconPlus size={14} />,
+                    accent: true,
+                    onSelect: () => openAccountForm("add"),
+                  },
+                ]);
+              }}
+              title="声明式配置与隐私凭据保险箱 · 右键直达子页面"
             >
               <IconSliders size={18} />
               <span className="rail-label">配置</span>
@@ -407,6 +629,7 @@ export default function App() {
         {view === "assistant" ? (
           <AgentWorkspace
             activeAccountEmail={account?.email}
+            onSwitchAccount={handleSwitchAccount}
             notify={notify}
             onDataChanged={refresh}
             onOpenSettings={(tab) => openSettings(tab)}
@@ -432,14 +655,29 @@ export default function App() {
           <>
             <ConversationList
               title={mailMeta?.label ?? "消息"}
+              status={view}
+              hydrated={hydrated}
+              hasAccount={Boolean(account) || accounts.length > 0}
+              hasDemo={stats.has_demo}
               items={convs}
               drafts={scopedDrafts}
               selected={selected}
+              composeIntent={composeIntent}
               onSelect={select}
+              onDeselect={() => {
+                setSelected(null);
+                setDraftConv(null);
+                setMessages([]);
+              }}
+              onOpenDrawer={openDrawerForPeer}
               onNewChat={startNewChat}
               onCreateGroup={createGroup}
               onRefresh={syncNow}
               onRunTriage={runAgentTriage}
+              onDataChanged={refresh}
+              onBindAccount={() => openAccountForm("add")}
+              onLoadDemo={loadDemo}
+              notify={notify}
               syncing={syncing}
               triaging={triaging}
               emptyHint={mailMeta?.empty ?? ""}
@@ -453,7 +691,9 @@ export default function App() {
                 status={view}
                 messages={messages}
                 initialDraft={draftTexts[`${activeScope}::${activeConv.peer}`] ?? ""}
+                openDrawerSeq={openDrawerReq.peer === activeConv.peer ? openDrawerReq.seq : 0}
                 onDraftChange={(val) => updatePeerDraft(activeConv.peer, val)}
+                onStartDirectChat={startNewChat}
                 onSent={(m) => {
                   updatePeerDraft(activeConv.peer, "");
                   setDraftConv(null);
@@ -472,37 +712,29 @@ export default function App() {
                 notify={notify}
               />
             ) : (
-              <section
-                className="chat-workspace placeholder"
-                onMouseDown={startWindowDrag}
-                onDoubleClick={toggleWindowMaximize}
-              >
-                {!account && convs.length === 0 && !stats.has_demo ? (
-                  <div className="welcome-card">
-                    <div className="welcome-emblem">
-                      <BrandAppIcon size={52} />
-                    </div>
-                    <h2>像聊天一样收发与管理邮件</h2>
-                    <p>
-                      兼容任意标准 IMAP / SMTP 单聊与多人全员群聊。通过内置助手即可一句话完成声明式配置与过滤编排，密码与密钥全程本机独立加密隔离。
-                    </p>
-                    <div className="welcome-actions">
-                      <button type="button" className="primary-btn large" onClick={() => setView("assistant")}>
-                        <IconSparkles size={15} />
-                        <span>通过 AI 助手对话式配置</span>
-                      </button>
-                      <button type="button" className="soft-btn large" onClick={loadDemo}>
-                        载入演示会话与 4 人群聊
-                      </button>
-                      <button type="button" className="text-link" onClick={() => openSettings("declarative")}>
-                        查看 config.toml 声明式配置与隐私保险箱
-                      </button>
-                    </div>
-                  </div>
-                ) : (
-                  <div className="empty-canvas-hint">选择左侧会话开始沟通，或通过「助手」用自然语言调整规则与配置</div>
-                )}
-              </section>
+              <FirstScreenWorkspace
+                hydrated={hydrated}
+                status={view}
+                account={account}
+                accounts={accounts}
+                stats={stats}
+                conversations={convs}
+                syncing={syncing}
+                triaging={triaging}
+                onSwitchStatus={(st) => switchNav(st)}
+                onSelectConversation={select}
+                onOpenConversationDrawer={openDrawerForPeer}
+                onOpenComposePanel={openComposePanel}
+                onConnectAccount={(presetDomain) => openAccountForm("add", presetDomain)}
+                onManageAccounts={() => openAccountForm("manage")}
+                onOpenAssistant={() => switchNav("assistant")}
+                onOpenSettings={openSettings}
+                onSyncNow={syncNow}
+                onRunTriage={runAgentTriage}
+                onLoadDemo={loadDemo}
+                onDataChanged={refresh}
+                notify={notify}
+              />
             )}
           </>
         )}
@@ -510,5 +742,26 @@ export default function App() {
 
       {toast && <div className={`toast ${toast.error ? "error" : ""}`}>{toast.text}</div>}
     </div>
+  );
+}
+
+export default function App() {
+  const [toast, setToast] = useState<{ text: string; error: boolean } | null>(null);
+  const toastTimer = useRef<number>();
+
+  const notify = useCallback((text: string, error = false) => {
+    setToast({ text, error });
+    window.clearTimeout(toastTimer.current);
+    toastTimer.current = window.setTimeout(() => setToast(null), error ? 5500 : 3000);
+  }, []);
+
+  const handleStartChatFromGlobal = useCallback((email: string) => {
+    window.dispatchEvent(new CustomEvent("mailchat-start-chat", { detail: email }));
+  }, []);
+
+  return (
+    <ContextMenuProvider notify={notify} onStartChatWithEmail={handleStartChatFromGlobal}>
+      <AppContent notify={notify} toast={toast} />
+    </ContextMenuProvider>
   );
 }

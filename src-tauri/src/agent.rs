@@ -308,6 +308,7 @@ fn intercept_raw_secret(input: &str, active_preset: &str) -> Option<(String, Str
 
 fn preset_display_label(preset: &str) -> &'static str {
     match preset.trim().to_lowercase().as_str() {
+        "magpie" => "Magpie 模型路由",
         "deepseek" => "DeepSeek 官网",
         "opencode_go" => "OpenCode Go 订阅",
         "ollama_cloud" => "Ollama 远程订阅",
@@ -324,7 +325,7 @@ fn preset_display_label(preset: &str) -> &'static str {
 }
 
 fn can_call_llm(cfg: &AgentConfig) -> bool {
-    if cfg.model.trim().is_empty() {
+    if cfg.model.trim().is_empty() && !crate::llm::is_magpie_cfg(cfg) {
         return false;
     }
     if cfg.provider != "anthropic" && cfg.provider != "gemini" {
@@ -596,7 +597,7 @@ const CONFIG_ONLY_SYSTEM_PROMPT: &str = r#"你是 MailChat 的「config.toml 专
 
 ## 常用预设参考
 - 邮箱域名默认参数：`qq.com`/`foxmail.com` (`imap.qq.com:993`, `smtp.qq.com:465`)、`163.com` (`imap.163.com:993`, `smtp.163.com:465`)、`126.com`、`gmail.com` (`imap.gmail.com:993`, `smtp.gmail.com:465`)、`outlook.com` (`outlook.office365.com:993`, `smtp.office365.com:587`)、`icloud.com`、`aliyun.com`。
-- 模型 preset：`deepseek` (`https://api.deepseek.com/v1`, `deepseek-v4.1-flash`)、`opencode_go` (`https://opencode.ai/inference/go/openai/v1`, `deepseek-v4.1-flash`)、`ollama_cloud` (`https://ollama.com/v1`, `deepseek-v4.1-flash`)、`ollama_remote` (局域网算力免密)、`ollama` (`http://localhost:11434/v1` 免密)、`qwen`、`openai`、`anthropic`、`gemini`、`kimi`、`siliconflow`、`custom`。
+- 模型 preset：`magpie` (`http://127.0.0.1:3425/v1`，模型填 `auto` 或 `group/*`，本机免配 Key 直接沿用已配置模型与订阅路由)、`deepseek` (`https://api.deepseek.com/v1`, `deepseek-v4.1-flash`)、`opencode_go` (`https://opencode.ai/inference/go/openai/v1`, `deepseek-v4.1-flash`)、`ollama_cloud` (`https://ollama.com/v1`, `deepseek-v4.1-flash`)、`ollama_remote` (局域网算力免密)、`ollama` (`http://localhost:11434/v1` 免密)、`qwen`、`openai`、`anthropic`、`gemini`、`kimi`、`siliconflow`、`custom`。
 - 规则优先级：`allow_senders`（白名单最高） > `block_senders` / `block_domains` / `block_keywords`（拦截） > `archive_senders` / `archive_keywords`（折叠进通知）。"#;
 
 fn build_config_tools() -> Vec<Tool> {
@@ -635,11 +636,11 @@ fn build_config_tools() -> Vec<Tool> {
                 "properties": {
                     "preset": {
                         "type": "string",
-                        "description": "预设标识：deepseek | opencode_go | ollama_cloud | ollama_remote | ollama | qwen | openai | anthropic | gemini | kimi | siliconflow | custom"
+                        "description": "预设标识：magpie | deepseek | opencode_go | ollama_cloud | ollama_remote | ollama | qwen | openai | anthropic | gemini | kimi | siliconflow | custom"
                     },
                     "provider": { "type": "string", "enum": ["openai", "anthropic", "gemini"] },
                     "base_url": { "type": "string", "description": "接口 Base URL，切换标准 preset 时可留空使用官方默认" },
-                    "model": { "type": "string", "description": "模型名称，如 deepseek-v4.1-flash" },
+                    "model": { "type": "string", "description": "模型名称，如 auto（Magpie 自动沿用）、group/opus-anywhere 或 deepseek-v4.1-flash" },
                     "enabled": { "type": "boolean", "description": "是否开启新邮件 AI 自动分拣" },
                     "auto_draft": { "type": "boolean", "description": "是否为需回复邮件自动起草快捷回复建议" },
                     "auto_block_sender": { "type": "boolean", "description": "AI 判定诈骗/垃圾邮件时是否自动拉黑发件人" },
@@ -711,7 +712,7 @@ fn build_config_tools() -> Vec<Tool> {
                 "properties": {
                     "secret_key": {
                         "type": "string",
-                        "description": "要唤起录入卡的凭据键名：mail_pwd:<邮箱地址> | llm_deepseek | llm_opencode_go | llm_ollama_cloud | llm_ollama_remote | llm_qwen | llm_openai | llm_anthropic | llm_gemini | llm_kimi | llm_siliconflow | llm_custom"
+                        "description": "要唤起录入卡的凭据键名：mail_pwd:<邮箱地址> | llm_magpie | llm_deepseek | llm_opencode_go | llm_ollama_cloud | llm_ollama_remote | llm_qwen | llm_openai | llm_anthropic | llm_gemini | llm_kimi | llm_siliconflow | llm_custom"
                     },
                     "operation": {
                         "type": "string",
@@ -1016,12 +1017,17 @@ fn execute_config_tool(
                     let saved_prof = spec.agent.profiles.get(&p).cloned();
                     spec.agent.preset = p.clone();
                     spec.agent.provider = def_prov.to_string();
-                    if !def_base.is_empty() {
+                    let fallback_base = if p == "magpie" {
+                        crate::magpie::configured_local_base_url()
+                    } else {
+                        def_base.to_string()
+                    };
+                    if !fallback_base.is_empty() {
                         spec.agent.base_url = saved_prof
                             .as_ref()
                             .map(|pr| pr.base_url.trim())
                             .filter(|s| !s.is_empty())
-                            .unwrap_or(def_base)
+                            .unwrap_or(&fallback_base)
                             .to_string();
                     }
                     if !def_model.is_empty() {
@@ -1032,9 +1038,16 @@ fn execute_config_tool(
                             .unwrap_or(def_model)
                             .to_string();
                     }
-                    spec.agent.api_key_ref = llm_secret_key(&p)
-                        .map(|sk| format!("secret:{sk}"))
-                        .unwrap_or_else(|| "none (local)".into());
+                    spec.agent.api_key_ref = if p == "magpie"
+                        && (spec.agent.base_url.is_empty()
+                            || crate::magpie::is_loopback_url(&spec.agent.base_url))
+                    {
+                        "none (magpie-local)".into()
+                    } else {
+                        llm_secret_key(&p)
+                            .map(|sk| format!("secret:{sk}"))
+                            .unwrap_or_else(|| "none (local)".into())
+                    };
                     touched.push(format!("切换服务商为 {}", preset_display_label(&p)));
                 }
             }
@@ -1086,7 +1099,10 @@ fn execute_config_tool(
             }
             *dirty = true;
 
-            let key_optional = matches!(spec.agent.preset.as_str(), "ollama" | "ollama_remote" | "custom");
+            let key_optional = matches!(spec.agent.preset.as_str(), "ollama" | "ollama_remote" | "custom")
+                || (spec.agent.preset == "magpie"
+                    && (spec.agent.base_url.trim().is_empty()
+                        || crate::magpie::is_loopback_url(&spec.agent.base_url)));
             let active_sk = llm_secret_key(&spec.agent.preset);
             let ask_key = args
                 .get("prompt_api_key")
@@ -1569,7 +1585,10 @@ fn build_contextual_suggestions(
         }
     }
 
-    let key_optional = matches!(spec.agent.preset.as_str(), "ollama" | "ollama_remote" | "custom");
+    let key_optional = matches!(spec.agent.preset.as_str(), "ollama" | "ollama_remote" | "custom")
+        || (spec.agent.preset == "magpie"
+            && (spec.agent.base_url.trim().is_empty()
+                || crate::magpie::is_loopback_url(&spec.agent.base_url)));
     if !key_optional {
         if let Some(sk) = llm_secret_key(&spec.agent.preset) {
             if !is_configured(sk) {
@@ -1605,6 +1624,7 @@ fn try_non_config_redirect(
         "放通知", "白名单", "信任", "绑定", "连接", "解绑", "切换", "接入", "授权码", "密码",
         "密钥", "key", "模型", "预设", "preset", "自动起草", "自动分拣", "分拣", "建群", "创建群",
         "免打扰", "演示", "demo", "同步", "收信", "刷新邮件", "imap", "smtp", "ollama",
+        "magpie", "喜鹊", "模型路由", "路由组",
         "deepseek", "opencode", "qwen", "千问", "openai", "claude", "anthropic", "gemini", "kimi",
         "硅基", "silicon", "状态", "instructions", "偏好",
     ]
@@ -1703,7 +1723,10 @@ fn build_status_markdown(
     };
 
     let preset_label = preset_display_label(&spec.agent.preset);
-    let key_optional = matches!(spec.agent.preset.as_str(), "ollama" | "ollama_remote" | "custom");
+    let key_optional = matches!(spec.agent.preset.as_str(), "ollama" | "ollama_remote" | "custom")
+        || (spec.agent.preset == "magpie"
+            && (spec.agent.base_url.trim().is_empty()
+                || crate::magpie::is_loopback_url(&spec.agent.base_url)));
     let active_sk = llm_secret_key(&spec.agent.preset);
     let key_state = if key_optional {
         "免密直连就绪"
@@ -1780,7 +1803,10 @@ fn try_actionable_local_intent(
 
     if lower.contains("重分拣") || lower.contains("重新分拣") || lower.contains("重新分类") || lower.contains("ai 分拣") || lower.contains("ai分拣") {
         let active_sk = llm_secret_key(&spec.agent.preset);
-        let key_optional = matches!(spec.agent.preset.as_str(), "ollama" | "ollama_remote" | "custom");
+        let key_optional = matches!(spec.agent.preset.as_str(), "ollama" | "ollama_remote" | "custom")
+            || (spec.agent.preset == "magpie"
+                && (spec.agent.base_url.trim().is_empty()
+                    || crate::magpie::is_loopback_url(&spec.agent.base_url)));
         if !key_optional && active_sk.map(|k| !is_configured(k)).unwrap_or(false) {
             if let Some(sk) = active_sk {
                 request_secrets.push(sk.into());
@@ -1815,7 +1841,13 @@ fn try_actionable_local_intent(
         || lower.contains("算力机")
         || is_remote_url;
 
-    let detected_preset = if lower.contains("opencode") || lower.contains("open code") {
+    let detected_preset = if lower.contains("magpie")
+        || lower.contains("喜鹊")
+        || lower.contains("模型路由")
+        || custom_url.as_deref().map(|u| u.contains(":3425")).unwrap_or(false)
+    {
+        Some(("magpie", "Magpie 模型路由"))
+    } else if lower.contains("opencode") || lower.contains("open code") {
         Some(("opencode_go", "OpenCode Go 订阅"))
     } else if (lower.contains("ollama") && wants_self_hosted_ollama)
         || (!lower.contains("邮箱")
@@ -1862,16 +1894,31 @@ fn try_actionable_local_intent(
 
     if let Some((preset_id, label)) = detected_preset {
         let (prov, def_base, def_model) = model_preset_defaults(preset_id);
-        let final_base = match &custom_url {
-            Some(u) if is_remote_url => normalize_openai_base(u, preset_id),
-            _ => def_base.to_string(),
+        let final_base = if preset_id == "magpie" {
+            match &custom_url {
+                Some(u) => normalize_openai_base(u, "magpie"),
+                None => crate::magpie::configured_local_base_url(),
+            }
+        } else {
+            match &custom_url {
+                Some(u) if is_remote_url => normalize_openai_base(u, preset_id),
+                _ => def_base.to_string(),
+            }
         };
         next.agent.preset = preset_id.into();
         next.agent.provider = prov.into();
         next.agent.base_url = final_base.clone();
         next.agent.model = def_model.into();
         next.agent.enabled = true;
-        if let Some(sk) = llm_secret_key(preset_id) {
+        if preset_id == "magpie" && crate::magpie::is_loopback_url(&final_base) {
+            next.agent.api_key_ref = "none (magpie-local)".into();
+            let user_asked_key = lower.contains("key") || lower.contains("密钥");
+            if user_asked_key {
+                if let Some(sk) = llm_secret_key(preset_id) {
+                    request_secrets.push(sk.into());
+                }
+            }
+        } else if let Some(sk) = llm_secret_key(preset_id) {
             next.agent.api_key_ref = format!("secret:{sk}");
             let key_optional = matches!(preset_id, "ollama_remote" | "custom");
             let user_asked_key = lower.contains("key") || lower.contains("密钥");
@@ -1882,7 +1929,11 @@ fn try_actionable_local_intent(
             next.agent.api_key_ref = "none (local)".into();
         }
         changes.push(format!("切换至 {label}（默认模型 `{def_model}`）"));
-        if preset_id == "ollama_remote" && custom_url.is_none() {
+        if preset_id == "magpie" && request_secrets.is_empty() {
+            notes.push(format!(
+                "已为你切换至 **{label}**（本地网关 `{final_base}`，模式 `{def_model}`），无需重复配置 API Key，将直接沿用你在 Magpie 中已绑定的模型、订阅与故障转移路由组（`group/*`）。"
+            ));
+        } else if preset_id == "ollama_remote" && custom_url.is_none() {
             notes.push(format!(
                 "已将声明式配置切换为 **{label}**（默认地址 `{final_base}`，模型 `{def_model}`）。你可以直接发我算力机地址（例如 `连接内网 Ollama 192.168.31.88:11434`），或在配置页拉取远端模型列表。"
             ));
@@ -2302,7 +2353,10 @@ fn local_config_intent(
     let lower = input.trim().to_lowercase();
     let is_configured = |key: &str| secret_statuses.iter().any(|s| s.key == key && s.configured);
     let active_sk = llm_secret_key(&spec.agent.preset);
-    let key_optional = matches!(spec.agent.preset.as_str(), "ollama" | "ollama_remote" | "custom");
+    let key_optional = matches!(spec.agent.preset.as_str(), "ollama" | "ollama_remote" | "custom")
+        || (spec.agent.preset == "magpie"
+            && (spec.agent.base_url.trim().is_empty()
+                || crate::magpie::is_loopback_url(&spec.agent.base_url)));
     let need_key = !key_optional && active_sk.map(|k| !is_configured(k)).unwrap_or(false);
     let preset_label = preset_display_label(&spec.agent.preset);
 
@@ -2433,7 +2487,9 @@ fn parse_json_object<T: for<'de> Deserialize<'de>>(text: &str) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::apply_toml;
     use crate::llm::{normalize_opencode_model, opencode_session_id, resolve_wire_model};
+    use crate::{Db, Vault};
 
     fn rule(kind: &str, p: &str) -> Rule {
         Rule { id: 0, kind: kind.into(), pattern: p.into() }
@@ -2687,9 +2743,8 @@ mod tests {
 
     #[test]
     fn multi_account_db_migration_and_switching_isolate_data() {
-        use crate::config::{apply_toml, migrate_legacy_secrets};
-        use crate::db::{Account, Db, NewMessage};
-        use crate::vault::Vault;
+        use crate::config::migrate_legacy_secrets;
+        use crate::db::{Account, NewMessage};
 
         let dir = std::env::temp_dir().join(format!("mailchat_multi_acc_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2832,6 +2887,43 @@ mod tests {
         let reapplied = apply_toml(&dir, &exported, &db, &vault).unwrap();
         assert!(reapplied.contains("bob@qq.com"));
         assert_eq!(db.list_accounts().unwrap().len(), 2);
+
+        // 6. 调整账号前后排序后，当前激活账号不变且顺序持久化至 [[accounts]]
+        db.reorder_accounts(&["bob@qq.com".to_string(), "alice@163.com".to_string()])
+            .unwrap();
+        let reordered = db.list_accounts().unwrap();
+        assert_eq!(reordered[0].email, "bob@qq.com");
+        assert_eq!(reordered[1].email, "alice@163.com");
+        assert_eq!(db.account().unwrap().unwrap().email, "alice@163.com");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn magpie_local_router_intent_and_toml_roundtrip_without_key() {
+        let dir = std::env::temp_dir().join(format!("mailchat_magpie_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::db::Db::open(&dir.join("mailchat.db")).unwrap();
+        let vault = crate::vault::Vault::open(&dir).unwrap();
+
+        let spec = crate::config::build_spec(&db).unwrap();
+        let stats = db.stats().unwrap();
+        let plan = local_config_intent(&spec, &stats, &[], "帮我接入 magpie 模型路由");
+
+        assert!(plan.request_secrets.is_empty(), "本机 Magpie 接入不应索要 API Key");
+        let updated = plan.updated_toml.expect("应生成更新后的声明式 TOML");
+        assert!(updated.contains("preset = \"magpie\""));
+        assert!(updated.contains("model = \"auto\""));
+        assert!(updated.contains("none (magpie-local)"));
+
+        crate::config::apply_toml(&dir, &updated, &db, &vault).unwrap();
+        let ag = db.agent_config().unwrap();
+        assert_eq!(ag.preset, "magpie");
+        assert_eq!(ag.model, "auto");
+        assert!(ag.enabled);
+
+        let exported = crate::config::export_toml(&db).unwrap();
+        assert!(exported.contains("api_key_ref = \"none (magpie-local)\""));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
