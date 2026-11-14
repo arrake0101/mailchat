@@ -240,6 +240,11 @@ impl Vault {
             entries,
         };
         std::fs::write(&self.path, serde_json::to_string_pretty(&vf)?)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
+        }
         Ok(())
     }
 }

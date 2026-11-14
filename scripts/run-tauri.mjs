@@ -23,6 +23,11 @@ const env = {
   ...(existsSync("W:\\env\\rust\\rustup\\.rustup") && !process.env.RUSTUP_HOME
     ? { RUSTUP_HOME: "W:\\env\\rust\\rustup\\.rustup" }
     : {}),
+  ...(existsSync("F:\\Scoop\\apps\\mingw\\current\\bin") &&
+  !process.env.RUSTUP_TOOLCHAIN &&
+  !process.env.GITHUB_ACTIONS
+    ? { RUSTUP_TOOLCHAIN: "stable-x86_64-pc-windows-gnu" }
+    : {}),
   NO_PROXY: noProxy,
   no_proxy: noProxy,
 };

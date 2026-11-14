@@ -1,0 +1,222 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build & publish (e.g. v0.2.0)"
+        required: true
+        default: "v0.2.0"
+
+permissions:
+  contents: write
+
+jobs:
+  prepare-release:
+    name: Prepare Draft Release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Resolve tag and version
+        id: meta
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Create or ensure draft GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        shell: bash
+        run: |
+          if ! gh release view "$TAG" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            NOTES=$(cat <<EOF
+          ## MailChat v${VERSION}
+
+          ### Windows (Scoop 声明式安装)
+          \`\`\`powershell
+          scoop bucket add arrake https://github.com/arrake0101/scoop-bucket
+          scoop install arrake/mailchat
+          \`\`\`
+
+          ### 发行包说明
+          - **Windows (x64)**：
+            - \`MailChat_${VERSION}_x64-setup.exe\` — NSIS 标准向导安装包
+            - \`MailChat_${VERSION}_x64-portable.zip\` — 免安装绿色便携包（亦供 Scoop 使用）
+          - **macOS**：
+            - \`MailChat_${VERSION}_aarch64.dmg\` — Apple Silicon (M1 ~ M4)
+            - \`MailChat_${VERSION}_x64.dmg\` — Intel Mac
+            - *(首次打开未签名应用若遇系统拦截，可执行 \`xattr -cr /Applications/MailChat.app\` 后打开)*
+          - **Linux (x64)**：
+            - \`MailChat_${VERSION}_amd64.deb\` — Debian / Ubuntu 安装包
+            - \`MailChat_${VERSION}_amd64.AppImage\` — 通用免安装包
+          - **校验文件**：\`SHA256SUMS.txt\`
+          EOF
+            )
+            gh release create "$TAG" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --target "${GITHUB_SHA}" \
+              --title "MailChat ${TAG}" \
+              --notes "$NOTES" \
+              --draft
+          fi
+
+  build:
+    name: Build (${{ matrix.platform }})
+    needs: prepare-release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: nsis
+          - platform: macos-aarch64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            bundles: dmg
+          - platform: macos-x64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            bundles: dmg
+          - platform: linux-x64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bundles: deb,appimage
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libfuse2 \
+            pkg-config
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Rust stable toolchain (${{ matrix.target }})
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+          shared-key: ${{ matrix.platform }}
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build Tauri release bundles
+        env:
+          CI: "true"
+          NO_STRIP: "true"
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: npx tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+
+      - name: Package Windows portable zip & upload Windows assets
+        if: matrix.platform == 'windows-x64'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare-release.outputs.tag }}
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+        run: |
+          $relDir = "src-tauri/target/${{ matrix.target }}/release"
+          $stageDir = "portable-stage"
+          New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
+          Copy-Item "$relDir/mailchat.exe" -Destination "$stageDir/mailchat.exe"
+          if (Test-Path "$relDir/WebView2Loader.dll") {
+            Copy-Item "$relDir/WebView2Loader.dll" -Destination "$stageDir/WebView2Loader.dll"
+          }
+          Copy-Item "LICENSE" -Destination "$stageDir/LICENSE"
+          $zipName = "MailChat_${env:VERSION}_x64-portable.zip"
+          Compress-Archive -Path "$stageDir/*" -DestinationPath $zipName -Force
+
+          $nsisExe = Get-ChildItem "$relDir/bundle/nsis/*.exe" | Select-Object -First 1
+          if (-not $nsisExe) { throw "NSIS installer not found!" }
+
+          gh release upload "$env:TAG" $nsisExe.FullName $zipName --clobber --repo "${env:GITHUB_REPOSITORY}"
+
+      - name: Upload macOS DMG asset
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare-release.outputs.tag }}
+        run: |
+          shopt -s nullglob
+          DMGS=(src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg)
+          if [ ${#DMGS[@]} -eq 0 ]; then
+            echo "DMG bundle not found!" >&2
+            exit 1
+          fi
+          gh release upload "$TAG" "${DMGS[@]}" --clobber --repo "${GITHUB_REPOSITORY}"
+
+      - name: Upload Linux DEB & AppImage assets
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare-release.outputs.tag }}
+        run: |
+          shopt -s nullglob
+          ASSETS=(
+            src-tauri/target/${{ matrix.target }}/release/bundle/deb/*.deb
+            src-tauri/target/${{ matrix.target }}/release/bundle/appimage/*.AppImage
+          )
+          if [ ${#ASSETS[@]} -eq 0 ]; then
+            echo "Linux bundles not found!" >&2
+            exit 1
+          fi
+          gh release upload "$TAG" "${ASSETS[@]}" --clobber --repo "${GITHUB_REPOSITORY}"
+
+  publish-release:
+    name: Generate SHA256 & Publish Release
+    needs: [prepare-release, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate SHA256SUMS.txt and publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare-release.outputs.tag }}
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          gh release download "$TAG" --dir release-assets --repo "${GITHUB_REPOSITORY}"
+          (
+            cd release-assets
+            rm -f SHA256SUMS.txt
+            sha256sum * > SHA256SUMS.txt
+          )
+          gh release upload "$TAG" release-assets/SHA256SUMS.txt --clobber --repo "${GITHUB_REPOSITORY}"
+          gh release edit "$TAG" --draft=false --latest --repo "${GITHUB_REPOSITORY}"

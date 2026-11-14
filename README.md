@@ -155,14 +155,36 @@ members = [
 
 ---
 
-## 快速开始
+## 安装与快速开始
 
-### 环境准备
+### 方式一：Scoop 声明式安装（Windows 推荐）
+
+```powershell
+scoop bucket add arrake https://github.com/arrake0101/scoop-bucket
+scoop install arrake/mailchat
+```
+
+后续升级只需执行 `scoop update mailchat`（所有配置 `config.toml`、加密凭据保险箱 `secrets.vault.json` 与本地邮件库均保存在用户 `%APPDATA%\com.mailchat.app` 目录，版本升级零损耗）。
+
+### 方式二：下载预编译发行包（Windows / macOS / Linux）
+
+前往 [**GitHub Releases**](https://github.com/arrake0101/mailchat/releases) 下载对应平台安装包：
+
+- **Windows (`x64`)**：`MailChat_*_x64-setup.exe`（标准安装向导）或 `MailChat_*_x64-portable.zip`（免安装绿色包）
+- **macOS**：`MailChat_*_aarch64.dmg`（Apple Silicon M 系列）或 `MailChat_*_x64.dmg`（Intel）
+  - *注：macOS 首次打开未签名开源构建如遇提示，可执行 `xattr -cr /Applications/MailChat.app` 后启动*
+- **Linux (`x64`)**：`MailChat_*_amd64.deb`（Debian / Ubuntu）或 `MailChat_*_amd64.AppImage`（通用免安装）
+
+---
+
+### 方式三：从源码开发构建
+
+#### 环境准备
 - **Node.js** `>= 20` 与 `npm`
 - **Rust** `stable` 工具链（Windows 推荐安装 WebView2 Runtime，Windows 11 默认自带）
 - Tauri v2 系统构建依赖（参考 [Tauri 官方环境指南](https://v2.tauri.app/start/prerequisites/)）
 
-### 安装与开发运行
+#### 安装与开发运行
 
 ```bash
 # 1. 克隆仓库
