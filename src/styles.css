@@ -199,6 +199,13 @@ textarea:focus {
   min-width: 0;
 }
 
+.win-brand-cluster {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
 .win-brand-title {
   font-size: 12px;
   font-weight: 650;
@@ -216,26 +223,56 @@ textarea:focus {
 }
 
 .win-account-pill {
-  height: 21px;
-  padding: 0 8.5px;
+  height: 22px;
+  padding: 0 9px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.62);
+  background: rgba(255, 255, 255, 0.56);
   border: 1px solid rgba(15, 23, 42, 0.055);
   color: var(--ink-secondary);
   font-size: 11.5px;
   font-weight: 500;
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  max-width: 280px;
-  transition: background 0.14s ease, color 0.14s ease, border-color 0.14s ease, box-shadow 0.14s ease;
+  gap: 5.5px;
+  max-width: 240px;
+  min-width: 0;
+  flex-shrink: 0;
+  transition:
+    background 0.14s ease,
+    color 0.14s ease,
+    border-color 0.14s ease,
+    box-shadow 0.14s ease,
+    transform 0.14s ease;
+}
+
+.win-account-pill.is-active {
+  background: #ffffff;
+  color: var(--ink);
+  font-weight: 600;
+  border-color: rgba(53, 99, 233, 0.28);
+  box-shadow: 0 1px 4px rgba(15, 23, 42, 0.06);
+}
+
+.win-account-pill.is-inactive {
+  background: rgba(255, 255, 255, 0.48);
+  color: var(--ink-secondary);
 }
 
 .win-account-pill:hover:not(:disabled) {
   background: #ffffff;
   color: var(--ink);
-  border-color: rgba(53, 99, 233, 0.22);
-  box-shadow: 0 1px 4px rgba(15, 23, 42, 0.045);
+  border-color: rgba(53, 99, 233, 0.24);
+  box-shadow: 0 1px 4px rgba(15, 23, 42, 0.05);
+}
+
+.win-account-pill.is-dragging {
+  background: #ffffff;
+  color: var(--accent-ink);
+  border-color: var(--accent);
+  box-shadow: 0 4px 14px rgba(53, 99, 233, 0.22);
+  transform: translateY(-0.5px) scale(1.02);
+  cursor: grabbing;
+  z-index: 6;
 }
 
 .win-account-text {
@@ -253,6 +290,11 @@ textarea:focus {
 
 .win-status-dot.online {
   background: var(--ok);
+}
+
+.win-status-dot.standby {
+  background: #10b981;
+  opacity: 0.48;
 }
 
 .win-status-dot.syncing {
@@ -4437,12 +4479,19 @@ textarea:focus {
   background: #b91c1c;
 }
 
-/* ---------------- 顶栏多邮箱账号快速切换器 ---------------- */
+/* ---------------- 顶栏多邮箱账号快速切换器（自适应平铺 + 溢出收起 + 拖拽排序） ---------------- */
 
 .win-account-switcher-wrap {
   position: relative;
   display: inline-flex;
   align-items: center;
+  min-width: 0;
+}
+
+.win-account-strip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   min-width: 0;
 }
 
@@ -4457,24 +4506,97 @@ textarea:focus {
   background: #f59e0b;
 }
 
-.win-account-other-badge {
+.win-pill-unread {
   font-size: 10px;
-  font-weight: 600;
+  font-weight: 650;
   line-height: 1;
-  padding: 2px 5.5px;
+  padding: 2px 5px;
   border-radius: 999px;
-  background: rgba(15, 23, 42, 0.07);
-  color: var(--ink-secondary);
+  background: rgba(53, 99, 233, 0.13);
+  color: var(--accent-ink);
+  font-variant-numeric: tabular-nums;
   flex-shrink: 0;
 }
 
-.win-account-other-badge.unread {
+.win-pill-unread.active {
   background: var(--accent);
   color: #ffffff;
 }
 
+.win-account-more-btn {
+  height: 22px;
+  min-width: 22px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.52);
+  border: 1px solid rgba(15, 23, 42, 0.055);
+  color: var(--ink-secondary);
+  font-size: 11px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  flex-shrink: 0;
+  transition:
+    background 0.14s ease,
+    color 0.14s ease,
+    border-color 0.14s ease,
+    box-shadow 0.14s ease;
+}
+
+.win-account-more-btn.has-overflow {
+  padding: 0 8px;
+  background: rgba(255, 255, 255, 0.82);
+  border-color: rgba(53, 99, 233, 0.18);
+  color: var(--ink);
+}
+
+.win-account-more-btn:hover:not(:disabled),
+.win-account-more-btn.open {
+  background: #ffffff;
+  color: var(--ink);
+  border-color: rgba(53, 99, 233, 0.32);
+  box-shadow: 0 2px 8px rgba(53, 99, 233, 0.1);
+}
+
+.win-more-count {
+  font-size: 10.5px;
+  font-weight: 650;
+  line-height: 1;
+  color: var(--accent-ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.win-more-unread-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--accent);
+  box-shadow: 0 0 0 2px rgba(53, 99, 233, 0.18);
+  flex-shrink: 0;
+}
+
+/* 离屏宽度测量行：不可见且不占位，保证平铺与折叠计算精确到像素 */
+.win-account-measure-row {
+  position: fixed;
+  top: -9999px;
+  left: -9999px;
+  visibility: hidden;
+  pointer-events: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  z-index: -1;
+}
+
+.win-account-measure-row .win-account-pill {
+  max-width: 230px;
+}
+
 .win-account-caret {
-  opacity: 0.58;
+  opacity: 0.62;
   flex-shrink: 0;
   transform: rotate(90deg);
   transition: transform 0.15s ease;
@@ -4488,7 +4610,7 @@ textarea:focus {
   position: absolute;
   top: calc(100% + 6px);
   left: 0;
-  width: 316px;
+  width: min(352px, calc(100vw - 36px));
   background: #ffffff;
   border: 1px solid rgba(15, 23, 42, 0.09);
   border-radius: 14px;
@@ -4520,7 +4642,7 @@ textarea:focus {
   display: flex;
   flex-direction: column;
   gap: 3px;
-  max-height: 248px;
+  max-height: 264px;
   overflow-y: auto;
 }
 
@@ -4530,18 +4652,40 @@ textarea:focus {
   align-items: center;
   justify-content: flex-start;
   text-align: left;
-  gap: 9px;
+  gap: 8px;
   padding: 7px 8px;
   border-radius: 10px;
   background: transparent;
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.12s ease;
 }
 
-.win-account-option:hover:not(:disabled) {
+.win-account-option:hover {
   background: #f4f7fc;
+}
+
+.win-account-option:focus-visible {
+  outline: 2px solid rgba(53, 99, 233, 0.35);
+  outline-offset: -2px;
 }
 
 .win-account-option.active {
   background: #f0f5ff;
+}
+
+.win-account-rank {
+  width: 16px;
+  font-size: 10.5px;
+  font-weight: 650;
+  color: var(--ink-muted);
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+.win-account-option.active .win-account-rank {
+  color: var(--accent-ink);
 }
 
 .win-account-avatar {
@@ -4574,7 +4718,7 @@ textarea:focus {
 .win-account-opt-top {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
   min-width: 0;
 }
 
@@ -4585,6 +4729,16 @@ textarea:focus {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.win-account-opt-folded {
+  font-size: 10px;
+  font-weight: 500;
+  padding: 1px 5px;
+  border-radius: 999px;
+  background: #eef2f7;
+  color: var(--ink-secondary);
+  flex-shrink: 0;
 }
 
 .win-account-opt-warn {
@@ -4608,7 +4762,7 @@ textarea:focus {
 .win-account-opt-right {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 4px;
   flex-shrink: 0;
 }
 
@@ -4619,6 +4773,7 @@ textarea:focus {
   border-radius: 999px;
   background: var(--accent);
   color: #ffffff;
+  font-variant-numeric: tabular-nums;
 }
 
 .win-account-opt-current {
@@ -4631,6 +4786,36 @@ textarea:focus {
   border-radius: 999px;
   background: var(--accent-soft);
   color: var(--accent-ink);
+}
+
+.win-account-order-btns {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: 2px;
+}
+
+.win-order-icon-btn {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink-secondary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.win-order-icon-btn:hover:not(:disabled) {
+  background: rgba(53, 99, 233, 0.1);
+  color: var(--accent-ink);
+}
+
+.win-order-icon-btn:disabled {
+  opacity: 0.28;
+  cursor: default;
 }
 
 .win-account-pop-divider {
@@ -4729,9 +4914,30 @@ textarea:focus {
 .account-card-left {
   display: flex;
   align-items: center;
-  gap: 11px;
+  gap: 10px;
   min-width: 0;
   flex: 1;
+}
+
+.account-rank-pill {
+  min-width: 24px;
+  height: 22px;
+  padding: 0 6px;
+  border-radius: 6px;
+  background: rgba(15, 23, 42, 0.05);
+  color: var(--ink-muted);
+  font-size: 11px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.account-card-row.is-active .account-rank-pill {
+  background: rgba(53, 99, 233, 0.12);
+  color: var(--accent-ink);
 }
 
 .account-avatar-badge {
@@ -4801,6 +5007,23 @@ textarea:focus {
   align-items: center;
   gap: 6px;
   flex-shrink: 0;
+}
+
+.account-reorder-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-right: 2px;
+}
+
+.icon-step-btn {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .account-remove-confirm {
@@ -4880,4 +5103,516 @@ textarea:focus {
 
 .compact-switch {
   font-size: 12px !important;
+}
+
+/* ================= 腾讯桌面端 IM 风格输入舱、草稿态、气泡悬浮条与右键菜单 ================= */
+
+.conv-draft-tag {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+/* 气泡悬停快捷操作胶囊（引用 / 复制 / 转发） */
+.bubble-hover-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 9px;
+  background: #ffffff;
+  box-shadow: 0 2px 10px rgba(15, 23, 42, 0.08), 0 0 0 1px rgba(15, 23, 42, 0.05);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(2px);
+  transition: opacity 0.14s ease, transform 0.14s ease;
+  align-self: center;
+  flex-shrink: 0;
+}
+
+.msg-row:hover .bubble-hover-actions {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(0);
+}
+
+.bubble-hover-btn {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border-radius: 6px;
+  color: var(--ink-secondary);
+}
+
+.bubble-hover-btn:hover:not(:disabled) {
+  background: var(--surface-subtle);
+  color: var(--accent-ink);
+}
+
+/* 回到底部悬浮胶囊 */
+.scroll-bottom-pill {
+  position: absolute;
+  right: 24px;
+  bottom: 152px;
+  z-index: 22;
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: #ffffff;
+  color: var(--accent-ink);
+  font-size: 12px;
+  font-weight: 600;
+  box-shadow: 0 6px 20px rgba(15, 23, 42, 0.12), 0 0 0 1px rgba(53, 99, 233, 0.14);
+}
+
+.scroll-bottom-pill:hover:not(:disabled) {
+  background: var(--accent-soft);
+  transform: translateY(-1px);
+}
+
+/* 腾讯桌面端 IM 双层输入舱（上方留白编辑区 + 下方轻量工具栏与发送按钮） */
+.im-composer {
+  position: relative;
+  border-top: 1px solid var(--hairline);
+  background: #ffffff;
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+}
+
+.im-composer-resizer {
+  position: absolute;
+  top: -3px;
+  left: 0;
+  right: 0;
+  height: 6px;
+  cursor: ns-resize;
+  z-index: 12;
+}
+
+.im-composer-resizer::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 2px;
+  transform: translateX(-50%);
+  width: 36px;
+  height: 2px;
+  border-radius: 999px;
+  background: transparent;
+  transition: background 0.15s ease;
+}
+
+.im-composer-resizer:hover::after {
+  background: rgba(53, 99, 233, 0.35);
+}
+
+.im-composer-context {
+  padding: 9px 18px 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.im-composer-stage {
+  display: flex;
+  flex-direction: column;
+  min-height: 106px;
+}
+
+.im-composer-textarea {
+  flex: 1;
+  width: 100%;
+  min-height: 0;
+  resize: none;
+  border: none !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  border-radius: 0 !important;
+  padding: 12px 20px 6px;
+  font-size: 13.8px;
+  line-height: 1.6;
+  color: var(--ink);
+  overflow-y: auto;
+}
+
+.im-composer-textarea::placeholder {
+  color: #a6b0c0;
+}
+
+.im-composer-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 2px 16px 11px 14px;
+  flex-shrink: 0;
+}
+
+.im-composer-tools {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.im-tool-anchor {
+  position: relative;
+  display: inline-flex;
+}
+
+.im-tool-btn {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border-radius: 8px;
+  color: #556277;
+}
+
+.im-tool-btn:hover:not(:disabled) {
+  background: rgba(15, 23, 42, 0.055);
+  color: var(--ink);
+}
+
+.im-tool-btn.active {
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+}
+
+/* 上弹轻量浮层菜单（表情 / AI 帮写 / @群成员 / 发送快捷键） */
+.im-popover {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  z-index: 45;
+  background: #ffffff;
+  border-radius: 13px;
+  padding: 7px;
+  box-shadow: 0 12px 32px rgba(15, 23, 42, 0.13), 0 0 0 1px rgba(15, 23, 42, 0.06);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.im-popover-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--ink-muted);
+  padding: 4px 8px 3px;
+}
+
+.im-popover-sep {
+  height: 1px;
+  background: var(--hairline);
+  margin: 4px 4px;
+}
+
+.im-popover-item {
+  width: 100%;
+  justify-content: flex-start;
+  text-align: left;
+  padding: 7px 10px;
+  border-radius: 8px;
+  font-size: 12.5px;
+  gap: 8px;
+  color: var(--ink);
+}
+
+.im-popover-item:hover:not(:disabled) {
+  background: var(--surface-subtle);
+}
+
+.im-popover-item.selected {
+  color: var(--accent-ink);
+  font-weight: 600;
+}
+
+.im-popover-item-main {
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.im-popover-item-sub {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--ink-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 135px;
+}
+
+.im-popover-check {
+  width: 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent);
+  flex-shrink: 0;
+}
+
+.emoji-popover {
+  width: 268px;
+  padding: 9px;
+}
+
+.emoji-grid {
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  gap: 3px;
+}
+
+.emoji-cell {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border-radius: 7px;
+  font-size: 17px;
+  line-height: 1;
+}
+
+.emoji-cell:hover:not(:disabled) {
+  background: var(--surface-subtle);
+  transform: scale(1.12);
+}
+
+.draft-popover {
+  width: 236px;
+}
+
+.mention-popover {
+  width: 244px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.send-mode-popover {
+  left: auto;
+  right: 0;
+  width: 196px;
+}
+
+.im-composer-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* 收敛轻量的可关闭建议回复胶囊（不再横跨整行） */
+.im-suggest-chip {
+  display: inline-flex;
+  align-items: center;
+  max-width: min(320px, 42vw);
+  height: 28px;
+  padding: 0 4px 0 9px;
+  border-radius: 999px;
+  background: #f3f6fd;
+  border: 1px solid rgba(53, 99, 233, 0.13);
+  gap: 2px;
+}
+
+.im-suggest-fill {
+  padding: 0 4px 0 0;
+  height: 100%;
+  min-width: 0;
+  color: var(--accent-ink);
+  font-size: 12px;
+  gap: 5px;
+}
+
+.im-suggest-fill:hover:not(:disabled) {
+  color: var(--accent-hover);
+}
+
+.im-suggest-label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.im-suggest-close {
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border-radius: 999px;
+  color: var(--ink-muted);
+  flex-shrink: 0;
+}
+
+.im-suggest-close:hover:not(:disabled) {
+  background: rgba(15, 23, 42, 0.08);
+  color: var(--ink);
+}
+
+/* 腾讯风格「发送 | ▾」组合按钮 */
+.im-send-group {
+  position: relative;
+  display: inline-flex;
+  align-items: stretch;
+  height: 30px;
+  border-radius: 8px;
+  background: #eaedf2;
+  transition: background 0.15s ease, box-shadow 0.15s ease;
+  flex-shrink: 0;
+}
+
+.im-send-group.ready {
+  background: var(--accent);
+  box-shadow: 0 2px 8px rgba(53, 99, 233, 0.24);
+}
+
+.im-send-main {
+  padding: 0 15px 0 17px;
+  height: 100%;
+  border-radius: 8px 0 0 8px;
+  font-size: 13px;
+  font-weight: 500;
+  color: #98a2b3;
+  background: transparent;
+}
+
+.im-send-main:disabled {
+  opacity: 1;
+}
+
+.im-send-group.ready .im-send-main {
+  color: #ffffff;
+}
+
+.im-send-group.ready .im-send-main:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.im-send-caret {
+  width: 23px;
+  height: 100%;
+  padding: 0;
+  border-radius: 0 8px 8px 0;
+  border-left: 1px solid rgba(15, 23, 42, 0.07);
+  color: #8b95a7;
+  background: transparent;
+}
+
+.im-send-group.ready .im-send-caret {
+  border-left-color: rgba(255, 255, 255, 0.22);
+  color: rgba(255, 255, 255, 0.92);
+}
+
+.im-send-caret:hover:not(:disabled) {
+  background: rgba(15, 23, 42, 0.05);
+}
+
+.im-send-group.ready .im-send-caret:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.caret-down-glyph {
+  display: inline-flex;
+  transform: rotate(90deg);
+}
+
+/* 消息气泡右键菜单与转发弹窗 */
+.msg-context-menu {
+  position: fixed;
+  z-index: 80;
+  min-width: 156px;
+  padding: 5px;
+  border-radius: 11px;
+  background: #ffffff;
+  box-shadow: 0 12px 28px rgba(15, 23, 42, 0.14), 0 0 0 1px rgba(15, 23, 42, 0.06);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.msg-context-item {
+  width: 100%;
+  justify-content: flex-start;
+  padding: 7px 11px;
+  border-radius: 7px;
+  font-size: 12.5px;
+  gap: 9px;
+  color: var(--ink);
+}
+
+.msg-context-item:hover:not(:disabled) {
+  background: var(--surface-subtle);
+  color: var(--accent-ink);
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 85;
+  background: rgba(15, 23, 42, 0.34);
+  backdrop-filter: blur(2px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+
+.forward-modal {
+  width: min(400px, 92vw);
+  background: #ffffff;
+  border-radius: 16px;
+  padding: 16px;
+  box-shadow: var(--shadow-float);
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+}
+
+.forward-preview {
+  padding: 9px 11px;
+  border-radius: 10px;
+  background: var(--surface-subtle);
+  color: var(--ink-secondary);
+  font-size: 12.2px;
+  line-height: 1.5;
+  max-height: 76px;
+  overflow: hidden;
+}
+
+.forward-conv-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 230px;
+  overflow-y: auto;
+}
+
+.forward-conv-item {
+  width: 100%;
+  justify-content: flex-start;
+  text-align: left;
+  padding: 7px 9px;
+  border-radius: 10px;
+  gap: 10px;
+}
+
+.forward-conv-item:hover:not(:disabled) {
+  background: var(--surface-subtle);
+}
+
+.forward-conv-info {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 1px;
+}
+
+.forward-conv-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.forward-conv-peer {
+  font-size: 11px;
+  color: var(--ink-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }

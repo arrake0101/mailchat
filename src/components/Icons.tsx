@@ -488,3 +488,46 @@ export function IconEdit(p: IconProps) {
     </Base>
   );
 }
+
+/** 39 · SMILE — 表情面板微笑轮廓 */
+export function IconSmile(p: IconProps) {
+  return (
+    <Base {...p}>
+      <circle cx="12" cy="12" r="8" />
+      <circle cx="9.25" cy="10.25" r="0.9" fill="currentColor" stroke="none" />
+      <circle cx="14.75" cy="10.25" r="0.9" fill="currentColor" stroke="none" />
+      <path d="M8.5 14.2C9.4 15.5 10.6 16.1 12 16.1C13.4 16.1 14.6 15.5 15.5 14.2" />
+    </Base>
+  );
+}
+
+/** 40 · SCISSORS — 屏幕区域截图剪刀 */
+export function IconScissors(p: IconProps) {
+  return (
+    <Base {...p}>
+      <circle cx="7" cy="7.5" r="2.5" />
+      <circle cx="7" cy="16.5" r="2.5" />
+      <path d="M9.1 9L19 17.5M19 6.5L9.1 15" />
+    </Base>
+  );
+}
+
+/** 41 · AT — 群聊 @提及标识 */
+export function IconAt(p: IconProps) {
+  return (
+    <Base {...p}>
+      <circle cx="12" cy="12" r="3.2" />
+      <path d="M15.2 12V13.6C15.2 14.9 16.1 15.6 17.1 15.6C18.4 15.6 19.5 14.3 19.5 12C19.5 7.86 16.14 4.5 12 4.5C7.86 4.5 4.5 7.86 4.5 12C4.5 16.14 7.86 19.5 12 19.5C13.8 19.5 15.4 18.95 16.6 18" />
+    </Base>
+  );
+}
+
+/** 42 · FORWARD — 消息转发右向折线箭头 */
+export function IconForward(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M14.5 7 19.5 11.5 14.5 16" />
+      <path d="M19 11.5H7.5V18" />
+    </Base>
+  );
+}

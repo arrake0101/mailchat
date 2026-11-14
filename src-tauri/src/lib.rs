@@ -174,6 +174,7 @@ struct SyncReport {
 struct DeclarativeBundle {
     path: String,
     toml: String,
+    spec: config::DeclarativeConfig,
     secrets: Vec<SecretStatus>,
 }
 
@@ -192,7 +193,9 @@ struct AgentChatResponse {
     thinking_ms: i64,
     tool_steps: Vec<String>,
     changes: Vec<String>,
+    config_diff: Option<config::ConfigDiffReport>,
     toml: String,
+    spec: config::DeclarativeConfig,
     secrets: Vec<SecretStatus>,
     secret_prompts: Vec<SecretPrompt>,
     suggestions: Vec<String>,
@@ -692,24 +695,59 @@ fn refresh_disk_toml(state: &AppState) {
 #[tauri::command]
 fn get_declarative_config(state: State<AppState>) -> CmdResult<DeclarativeBundle> {
     let toml = config::sync_disk_toml(&state.app_dir, &state.db).map_err(err)?;
+    let spec = config::build_spec(&state.db).map_err(err)?;
     Ok(DeclarativeBundle {
         path: config_file_path(&state),
         toml,
+        spec,
         secrets: vault_statuses(&state.db, &state.vault),
     })
 }
 
 #[tauri::command]
 fn apply_declarative_config(state: State<AppState>, toml: String) -> CmdResult<DeclarativeBundle> {
+    let prev_spec = config::build_spec(&state.db).unwrap_or_default();
     let normalized = config::apply_toml(&state.app_dir, &toml, &state.db, &state.vault).map_err(err)?;
     let rules = state.db.rules().map_err(err)?;
     let _ = state.db.scan_existing_with_rules(|from, subject, body| {
         agent::apply_rules(&rules, from, subject, body).map(|h| (h.status, h.reason))
     });
-    state.watcher.reconnect_now();
+    let next_spec = config::build_spec(&state.db).map_err(err)?;
+    let mail_changed = prev_spec.active_account != next_spec.active_account
+        || serde_json::to_string(&prev_spec.accounts).ok() != serde_json::to_string(&next_spec.accounts).ok();
+    if mail_changed {
+        state.watcher.reconnect_now();
+    }
     Ok(DeclarativeBundle {
         path: config_file_path(&state),
         toml: normalized,
+        spec: next_spec,
+        secrets: vault_statuses(&state.db, &state.vault),
+    })
+}
+
+#[tauri::command]
+fn apply_declarative_spec(
+    state: State<AppState>,
+    spec: config::DeclarativeConfig,
+) -> CmdResult<DeclarativeBundle> {
+    let prev_spec = config::build_spec(&state.db).unwrap_or_default();
+    let normalized =
+        config::apply_spec(&state.app_dir, &spec, &state.db, &state.vault).map_err(err)?;
+    let rules = state.db.rules().map_err(err)?;
+    let _ = state.db.scan_existing_with_rules(|from, subject, body| {
+        agent::apply_rules(&rules, from, subject, body).map(|h| (h.status, h.reason))
+    });
+    let next_spec = config::build_spec(&state.db).map_err(err)?;
+    let mail_changed = prev_spec.active_account != next_spec.active_account
+        || serde_json::to_string(&prev_spec.accounts).ok() != serde_json::to_string(&next_spec.accounts).ok();
+    if mail_changed {
+        state.watcher.reconnect_now();
+    }
+    Ok(DeclarativeBundle {
+        path: config_file_path(&state),
+        toml: normalized,
+        spec: next_spec,
         secrets: vault_statuses(&state.db, &state.vault),
     })
 }
@@ -1022,12 +1060,14 @@ fn switch_active_model(
 
     state.db.save_agent_config(&ag).map_err(err)?;
     let toml = config::sync_disk_toml(&state.app_dir, &state.db).map_err(err)?;
+    let spec = config::build_spec(&state.db).map_err(err)?;
 
     Ok(ModelSwitchResult {
         agent_config: ag,
         bundle: DeclarativeBundle {
             path: config_file_path(&state),
             toml,
+            spec,
             secrets: vault_statuses(&state.db, &state.vault),
         },
     })
@@ -1077,6 +1117,7 @@ async fn chat_with_agent(
         thinking_ms: 0,
         tool_steps: &[],
         changes: &[],
+        config_diff: None,
         secret_prompts: &[],
         suggestions: &[],
     });
@@ -1099,6 +1140,8 @@ async fn chat_with_agent(
     let app_for_stream = app.clone();
     let sid_for_stream = sid.clone();
     let rid_for_stream = req_id.clone();
+    let spec_for_stream = spec.clone();
+    let base_toml_for_stream = current_toml.clone();
 
     let mut plan = agent::chat_config_agent_stream(
         &cfg,
@@ -1109,40 +1152,80 @@ async fn chat_with_agent(
         &effective_history,
         &message,
         &cancel_flag,
-        |ev| {
-            let payload = match ev {
-                agent::ConfigAgentStreamEvent::ThinkingDelta { delta, thinking_ms } => {
+        |ev| match ev {
+            agent::ConfigAgentStreamEvent::ThinkingDelta { delta, thinking_ms } => {
+                let _ = app_for_stream.emit(
+                    "agent-chat-stream",
                     AgentStreamPayload {
                         request_id: rid_for_stream.clone(),
                         session_id: sid_for_stream.clone(),
                         kind: "thinking".into(),
                         delta: delta.to_string(),
                         thinking_ms,
-                    }
+                    },
+                );
+            }
+            agent::ConfigAgentStreamEvent::ContentDelta { delta } => {
+                let _ = app_for_stream.emit(
+                    "agent-chat-stream",
+                    AgentStreamPayload {
+                        request_id: rid_for_stream.clone(),
+                        session_id: sid_for_stream.clone(),
+                        kind: "content".into(),
+                        delta: delta.to_string(),
+                        thinking_ms: 0,
+                    },
+                );
+            }
+            agent::ConfigAgentStreamEvent::ToolStep { step } => {
+                let _ = app_for_stream.emit(
+                    "agent-chat-stream",
+                    AgentStreamPayload {
+                        request_id: rid_for_stream.clone(),
+                        session_id: sid_for_stream.clone(),
+                        kind: "tool".into(),
+                        delta: step.to_string(),
+                        thinking_ms: 0,
+                    },
+                );
+            }
+            agent::ConfigAgentStreamEvent::DraftToml {
+                toml,
+                spec: draft_spec,
+            } => {
+                let _ = app_for_stream.emit(
+                    "agent-chat-stream",
+                    AgentStreamPayload {
+                        request_id: rid_for_stream.clone(),
+                        session_id: sid_for_stream.clone(),
+                        kind: "toml".into(),
+                        delta: toml.to_string(),
+                        thinking_ms: 0,
+                    },
+                );
+                let live_diff = config::diff_specs(
+                    &spec_for_stream,
+                    draft_spec,
+                    &base_toml_for_stream,
+                    toml,
+                    None,
+                );
+                if let Ok(preview_json) = serde_json::to_string(&serde_json::json!({
+                    "spec": draft_spec,
+                    "config_diff": live_diff,
+                })) {
+                    let _ = app_for_stream.emit(
+                        "agent-chat-stream",
+                        AgentStreamPayload {
+                            request_id: rid_for_stream.clone(),
+                            session_id: sid_for_stream.clone(),
+                            kind: "spec_preview".into(),
+                            delta: preview_json,
+                            thinking_ms: 0,
+                        },
+                    );
                 }
-                agent::ConfigAgentStreamEvent::ContentDelta { delta } => AgentStreamPayload {
-                    request_id: rid_for_stream.clone(),
-                    session_id: sid_for_stream.clone(),
-                    kind: "content".into(),
-                    delta: delta.to_string(),
-                    thinking_ms: 0,
-                },
-                agent::ConfigAgentStreamEvent::ToolStep { step } => AgentStreamPayload {
-                    request_id: rid_for_stream.clone(),
-                    session_id: sid_for_stream.clone(),
-                    kind: "tool".into(),
-                    delta: step.to_string(),
-                    thinking_ms: 0,
-                },
-                agent::ConfigAgentStreamEvent::DraftToml { toml } => AgentStreamPayload {
-                    request_id: rid_for_stream.clone(),
-                    session_id: sid_for_stream.clone(),
-                    kind: "toml".into(),
-                    delta: toml.to_string(),
-                    thinking_ms: 0,
-                },
-            };
-            let _ = app_for_stream.emit("agent-chat-stream", payload);
+            }
         },
     )
     .await;
@@ -1168,11 +1251,11 @@ async fn chat_with_agent(
             Err(e) => {
                 plan.reply.push_str(&format!("\n\n（注：生成的声明式配置校验未通过：{e:#}，已保留原配置）"));
                 plan.changes.clear();
-                current_toml
+                current_toml.clone()
             }
         }
     } else {
-        current_toml
+        current_toml.clone()
     };
 
     if should_reconnect_mail {
@@ -1235,7 +1318,21 @@ async fn chat_with_agent(
     }
 
     let latest_toml = config::sync_disk_toml(&state.app_dir, &state.db).unwrap_or(final_toml);
+    let latest_spec = config::build_spec(&state.db).unwrap_or_else(|_| spec.clone());
     let latest_secrets = vault_statuses(&state.db, &state.vault);
+
+    let raw_diff = config::diff_specs(
+        &spec,
+        &latest_spec,
+        &current_toml,
+        &latest_toml,
+        plan.intercepted_secret.as_ref().map(|(k, _)| k.as_str()),
+    );
+    let config_diff = if !raw_diff.items.is_empty() || current_toml.trim() != latest_toml.trim() {
+        Some(raw_diff)
+    } else {
+        None
+    };
 
     // 构建本地安全输入提示卡（去重）
     let mut prompt_keys: Vec<String> = Vec::new();
@@ -1271,6 +1368,7 @@ async fn chat_with_agent(
         thinking_ms: plan.thinking_ms as i64,
         tool_steps: &plan.tool_steps,
         changes: &plan.changes,
+        config_diff: config_diff.as_ref(),
         secret_prompts: &secret_prompts,
         suggestions: &plan.suggestions,
     });
@@ -1293,7 +1391,9 @@ async fn chat_with_agent(
         thinking_ms: plan.thinking_ms as i64,
         tool_steps: plan.tool_steps,
         changes: plan.changes,
+        config_diff,
         toml: latest_toml,
+        spec: latest_spec,
         secrets: latest_secrets,
         secret_prompts,
         suggestions: plan.suggestions,
@@ -2173,6 +2273,26 @@ fn clear_demo_data(state: State<AppState>) -> CmdResult<usize> {
 }
 
 #[tauri::command]
+fn start_screen_snip() -> CmdResult<()> {
+    #[cfg(target_os = "windows")]
+    {
+        win_shell_open("ms-screenclip:")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("screencapture")
+            .args(["-i", "-c"])
+            .spawn()
+            .map_err(err)?;
+        Ok(())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Err("当前系统暂不支持快捷截图唤起，请使用系统截图后按 Ctrl+V 粘贴".into())
+    }
+}
+
+#[tauri::command]
 fn open_external_url(url: String) -> CmdResult<()> {
     let trimmed = url.trim();
     let lower = trimmed.to_ascii_lowercase();
@@ -2349,6 +2469,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_declarative_config,
             apply_declarative_config,
+            apply_declarative_spec,
             list_secrets,
             set_secret,
             delete_secret,
@@ -2399,6 +2520,7 @@ pub fn run() {
             summarize_conversation,
             load_demo_data,
             clear_demo_data,
+            start_screen_snip,
             open_external_url,
         ])
         .run(tauri::generate_context!())

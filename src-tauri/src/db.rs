@@ -254,6 +254,8 @@ pub struct AgentTurnRecord {
     pub thinking_ms: i64,
     pub tool_steps: Vec<String>,
     pub changes: Vec<String>,
+    #[serde(default)]
+    pub config_diff: Option<crate::config::ConfigDiffReport>,
     pub secret_prompts: Vec<crate::vault::SecretPrompt>,
     pub suggestions: Vec<String>,
     pub created_at: i64,
@@ -267,6 +269,7 @@ pub struct NewAgentTurn<'a> {
     pub thinking_ms: i64,
     pub tool_steps: &'a [String],
     pub changes: &'a [String],
+    pub config_diff: Option<&'a crate::config::ConfigDiffReport>,
     pub secret_prompts: &'a [crate::vault::SecretPrompt],
     pub suggestions: &'a [String],
 }
@@ -385,6 +388,7 @@ impl Db {
                 thinking_ms INTEGER NOT NULL DEFAULT 0,
                 tool_steps_json TEXT NOT NULL DEFAULT '[]',
                 changes_json TEXT NOT NULL DEFAULT '[]',
+                config_diff_json TEXT NOT NULL DEFAULT '',
                 secret_prompts_json TEXT NOT NULL DEFAULT '[]',
                 suggestions_json TEXT NOT NULL DEFAULT '[]',
                 created_at INTEGER NOT NULL
@@ -402,6 +406,10 @@ impl Db {
             );
             "#,
         )?;
+        let _ = conn.execute(
+            "ALTER TABLE agent_turns ADD COLUMN config_diff_json TEXT NOT NULL DEFAULT ''",
+            [],
+        );
 
         let has_messages_table: bool = conn.query_row(
             "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='messages'",
@@ -2520,7 +2528,7 @@ impl Db {
         let c = self.0.lock().unwrap();
         let mut st = c.prepare(
             "SELECT id, session_id, role, content, thinking, thinking_ms,
-                    tool_steps_json, changes_json, secret_prompts_json, suggestions_json, created_at
+                    tool_steps_json, changes_json, config_diff_json, secret_prompts_json, suggestions_json, created_at
              FROM agent_turns
              WHERE session_id = ?1
              ORDER BY id ASC",
@@ -2528,8 +2536,14 @@ impl Db {
         let rows = st.query_map([session_id], |r| {
             let tool_steps_raw: String = r.get(6)?;
             let changes_raw: String = r.get(7)?;
-            let secret_prompts_raw: String = r.get(8)?;
-            let suggestions_raw: String = r.get(9)?;
+            let config_diff_raw: String = r.get(8)?;
+            let secret_prompts_raw: String = r.get(9)?;
+            let suggestions_raw: String = r.get(10)?;
+            let config_diff = if config_diff_raw.trim().is_empty() {
+                None
+            } else {
+                serde_json::from_str(&config_diff_raw).ok()
+            };
             Ok(AgentTurnRecord {
                 id: r.get(0)?,
                 session_id: r.get(1)?,
@@ -2539,9 +2553,10 @@ impl Db {
                 thinking_ms: r.get(5)?,
                 tool_steps: serde_json::from_str(&tool_steps_raw).unwrap_or_default(),
                 changes: serde_json::from_str(&changes_raw).unwrap_or_default(),
+                config_diff,
                 secret_prompts: serde_json::from_str(&secret_prompts_raw).unwrap_or_default(),
                 suggestions: serde_json::from_str(&suggestions_raw).unwrap_or_default(),
-                created_at: r.get(10)?,
+                created_at: r.get(11)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -2551,6 +2566,10 @@ impl Db {
         let now = chrono::Utc::now().timestamp();
         let tool_steps_json = serde_json::to_string(turn.tool_steps)?;
         let changes_json = serde_json::to_string(turn.changes)?;
+        let config_diff_json = match turn.config_diff {
+            Some(diff) => serde_json::to_string(diff)?,
+            None => String::new(),
+        };
         let secret_prompts_json = serde_json::to_string(turn.secret_prompts)?;
         let suggestions_json = serde_json::to_string(turn.suggestions)?;
 
@@ -2562,8 +2581,8 @@ impl Db {
         c.execute(
             "INSERT INTO agent_turns(
                 session_id, role, content, thinking, thinking_ms,
-                tool_steps_json, changes_json, secret_prompts_json, suggestions_json, created_at
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                tool_steps_json, changes_json, config_diff_json, secret_prompts_json, suggestions_json, created_at
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 turn.session_id,
                 turn.role,
@@ -2572,6 +2591,7 @@ impl Db {
                 turn.thinking_ms,
                 tool_steps_json,
                 changes_json,
+                config_diff_json,
                 secret_prompts_json,
                 suggestions_json,
                 now

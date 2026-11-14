@@ -246,7 +246,10 @@ pub enum ConfigAgentStreamEvent<'a> {
     ThinkingDelta { delta: &'a str, thinking_ms: u64 },
     ContentDelta { delta: &'a str },
     ToolStep { step: &'a str },
-    DraftToml { toml: &'a str },
+    DraftToml {
+        toml: &'a str,
+        spec: &'a DeclarativeConfig,
+    },
 }
 
 /// 写入本地历史记录前对潜在明文 API Key 脱敏，确保 SQLite 永不落盘明文密钥
@@ -471,7 +474,10 @@ where
         );
         on_event(ConfigAgentStreamEvent::ContentDelta { delta: &reply });
         if let Some(ref t) = updated_toml {
-            on_event(ConfigAgentStreamEvent::DraftToml { toml: t });
+            on_event(ConfigAgentStreamEvent::DraftToml {
+                toml: t,
+                spec: &next,
+            });
         }
         return ConfigAgentPlan {
             reply,
@@ -1491,7 +1497,10 @@ where
 
         if dirty {
             if let Ok(preview_toml) = toml::to_string_pretty(&draft_spec) {
-                on_event(ConfigAgentStreamEvent::DraftToml { toml: &preview_toml });
+                on_event(ConfigAgentStreamEvent::DraftToml {
+                    toml: &preview_toml,
+                    spec: &draft_spec,
+                });
             }
         }
 

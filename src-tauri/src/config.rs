@@ -3,11 +3,39 @@
 //! - 密码与 API Key 绝不落入 config.toml，仅通过 `secret:<key>` 引用本地 DPAPI 隐私保险箱。
 
 use crate::db::{Account, AgentConfig, Db, GroupMember, ProviderProfile};
-use crate::vault::{llm_secret_key, mail_secret_key, Vault};
+use crate::vault::{llm_secret_key, mail_secret_key, secret_label, Vault};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ConfigDiffItem {
+    /// 模块标识: "accounts" | "agent" | "triage" | "groups" | "vault"
+    pub section: String,
+    /// 模块中文标题
+    pub section_label: String,
+    /// 可视化表单锚点标识，如 "account:wokao@111.com" / "agent.model" / "triage.block_keywords"
+    pub target_key: String,
+    /// 变更类型: "added" | "modified" | "removed"
+    pub kind: String,
+    /// 具体修改项中文标签
+    pub field_label: String,
+    /// 修改前的值描述
+    pub before: String,
+    /// 修改后的值描述
+    pub after: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ConfigDiffReport {
+    #[serde(default)]
+    pub items: Vec<ConfigDiffItem>,
+    #[serde(default)]
+    pub before_toml: String,
+    #[serde(default)]
+    pub after_toml: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DeclarativeConfig {
@@ -429,7 +457,11 @@ pub fn sync_disk_toml(app_dir: &Path, db: &Db) -> Result<String> {
 pub fn apply_toml(app_dir: &Path, toml_str: &str, db: &Db, vault: &Vault) -> Result<String> {
     let spec: DeclarativeConfig =
         toml::from_str(toml_str).context("声明式 TOML 语法解析失败，请检查括号、引号或字段类型")?;
+    apply_spec(app_dir, &spec, db, vault)
+}
 
+/// 原子应用结构化声明式配置（供可视化表单与 TOML 引擎共用）
+pub fn apply_spec(app_dir: &Path, spec: &DeclarativeConfig, db: &Db, vault: &Vault) -> Result<String> {
     // 1. 多邮箱账号声明（无缝兼容旧版 [account]）
     let raw_accounts = spec.effective_accounts();
     let prev_active = db.active_account_email().unwrap_or_default();
@@ -540,13 +572,13 @@ pub fn apply_toml(app_dir: &Path, toml_str: &str, db: &Db, vault: &Vault) -> Res
     };
 
     let mut profiles = std::collections::HashMap::new();
-    for (k, v) in spec.agent.profiles {
+    for (k, v) in &spec.agent.profiles {
         profiles.insert(
-            k,
+            k.clone(),
             ProviderProfile {
-                base_url: v.base_url,
+                base_url: v.base_url.clone(),
                 api_key: String::new(),
-                model: v.model,
+                model: v.model.clone(),
             },
         );
     }
@@ -628,4 +660,556 @@ pub fn apply_toml(app_dir: &Path, toml_str: &str, db: &Db, vault: &Vault) -> Res
     }
 
     sync_disk_toml(app_dir, db)
+}
+
+fn preset_readable_name(preset: &str) -> &'static str {
+    match preset.trim().to_lowercase().as_str() {
+        "deepseek" => "DeepSeek 官网",
+        "opencode_go" => "OpenCode Go",
+        "ollama_cloud" => "Ollama 远程订阅",
+        "ollama_remote" => "Ollama 自建远程",
+        "ollama" => "本地 Ollama",
+        "qwen" => "通义千问 Qwen",
+        "openai" => "OpenAI",
+        "anthropic" => "Anthropic Claude",
+        "gemini" => "Google Gemini",
+        "kimi" => "Moonshot Kimi",
+        "siliconflow" => "硅基流动",
+        "custom" => "自定义网关",
+        _ => "模型预设",
+    }
+}
+
+fn bool_label(v: bool) -> &'static str {
+    if v {
+        "开启"
+    } else {
+        "关闭"
+    }
+}
+
+fn val_or(s: &str, empty_fallback: &str) -> String {
+    let t = s.trim();
+    if t.is_empty() {
+        empty_fallback.to_string()
+    } else {
+        t.to_string()
+    }
+}
+
+fn short_text(s: &str, max_chars: usize) -> String {
+    let single = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single.is_empty() {
+        return "（空）".to_string();
+    }
+    let count = single.chars().count();
+    if count <= max_chars {
+        single
+    } else {
+        let head: String = single.chars().take(max_chars).collect();
+        format!("{head}…")
+    }
+}
+
+/// 精确计算修改前后两份 `DeclarativeConfig` 的结构化字段差异，供对话变更卡片与可视化表单高亮定位使用
+pub fn diff_specs(
+    before: &DeclarativeConfig,
+    after: &DeclarativeConfig,
+    before_toml: &str,
+    after_toml: &str,
+    intercepted_secret: Option<&str>,
+) -> ConfigDiffReport {
+    let mut items: Vec<ConfigDiffItem> = Vec::new();
+
+    // 0. 本地加密保险箱凭据拦截
+    if let Some(sk) = intercepted_secret.map(str::trim).filter(|s| !s.is_empty()) {
+        items.push(ConfigDiffItem {
+            section: "vault".into(),
+            section_label: "隐私保险箱".into(),
+            target_key: format!("vault:{sk}"),
+            kind: "modified".into(),
+            field_label: secret_label(sk),
+            before: "明文凭据（本地已拦截）".into(),
+            after: format!("已加密存入 secret:{sk}"),
+        });
+    }
+
+    // 1. 邮箱账号对比
+    let b_accs = before.effective_accounts();
+    let a_accs = after.effective_accounts();
+
+    for acc in &a_accs {
+        let em = acc.email.trim().to_lowercase();
+        let target_key = format!("account:{em}");
+        if let Some(prev) = b_accs.iter().find(|x| x.email.trim().eq_ignore_ascii_case(&em)) {
+            if prev.display_name.trim() != acc.display_name.trim() {
+                items.push(ConfigDiffItem {
+                    section: "accounts".into(),
+                    section_label: "邮箱账号".into(),
+                    target_key: target_key.clone(),
+                    kind: "modified".into(),
+                    field_label: format!("{} · 显示昵称", acc.email),
+                    before: val_or(&prev.display_name, "未设置"),
+                    after: val_or(&acc.display_name, "未设置"),
+                });
+            }
+            let prev_user = if prev.username.trim().is_empty() {
+                prev.email.trim()
+            } else {
+                prev.username.trim()
+            };
+            let next_user = if acc.username.trim().is_empty() {
+                acc.email.trim()
+            } else {
+                acc.username.trim()
+            };
+            if prev_user != next_user {
+                items.push(ConfigDiffItem {
+                    section: "accounts".into(),
+                    section_label: "邮箱账号".into(),
+                    target_key: target_key.clone(),
+                    kind: "modified".into(),
+                    field_label: format!("{} · 登录用户名", acc.email),
+                    before: val_or(prev_user, "未设置"),
+                    after: val_or(next_user, "未设置"),
+                });
+            }
+            if prev.imap_host.trim() != acc.imap_host.trim() {
+                items.push(ConfigDiffItem {
+                    section: "accounts".into(),
+                    section_label: "邮箱账号".into(),
+                    target_key: target_key.clone(),
+                    kind: "modified".into(),
+                    field_label: format!("{} · IMAP 服务器", acc.email),
+                    before: val_or(&prev.imap_host, "未填写"),
+                    after: val_or(&acc.imap_host, "未填写"),
+                });
+            }
+            if prev.imap_port != acc.imap_port {
+                items.push(ConfigDiffItem {
+                    section: "accounts".into(),
+                    section_label: "邮箱账号".into(),
+                    target_key: target_key.clone(),
+                    kind: "modified".into(),
+                    field_label: format!("{} · IMAP 端口", acc.email),
+                    before: prev.imap_port.to_string(),
+                    after: acc.imap_port.to_string(),
+                });
+            }
+            if prev.smtp_host.trim() != acc.smtp_host.trim() {
+                items.push(ConfigDiffItem {
+                    section: "accounts".into(),
+                    section_label: "邮箱账号".into(),
+                    target_key: target_key.clone(),
+                    kind: "modified".into(),
+                    field_label: format!("{} · SMTP 服务器", acc.email),
+                    before: val_or(&prev.smtp_host, "未填写"),
+                    after: val_or(&acc.smtp_host, "未填写"),
+                });
+            }
+            if prev.smtp_port != acc.smtp_port {
+                items.push(ConfigDiffItem {
+                    section: "accounts".into(),
+                    section_label: "邮箱账号".into(),
+                    target_key: target_key.clone(),
+                    kind: "modified".into(),
+                    field_label: format!("{} · SMTP 端口", acc.email),
+                    before: prev.smtp_port.to_string(),
+                    after: acc.smtp_port.to_string(),
+                });
+            }
+        } else {
+            let host_desc = if !acc.imap_host.trim().is_empty() || !acc.smtp_host.trim().is_empty() {
+                format!(
+                    "IMAP {}:{} · SMTP {}:{}",
+                    val_or(&acc.imap_host, "未填"),
+                    acc.imap_port,
+                    val_or(&acc.smtp_host, "未填"),
+                    acc.smtp_port
+                )
+            } else {
+                "待补齐 IMAP / SMTP 服务器".to_string()
+            };
+            items.push(ConfigDiffItem {
+                section: "accounts".into(),
+                section_label: "邮箱账号".into(),
+                target_key,
+                kind: "added".into(),
+                field_label: format!("新增邮箱 {}", acc.email),
+                before: String::new(),
+                after: host_desc,
+            });
+        }
+    }
+
+    for prev in &b_accs {
+        let em = prev.email.trim().to_lowercase();
+        if !a_accs.iter().any(|x| x.email.trim().eq_ignore_ascii_case(&em)) {
+            items.push(ConfigDiffItem {
+                section: "accounts".into(),
+                section_label: "邮箱账号".into(),
+                target_key: "accounts".into(),
+                kind: "removed".into(),
+                field_label: format!("解绑邮箱 {}", prev.email),
+                before: format!("IMAP {}:{}", val_or(&prev.imap_host, "未填"), prev.imap_port),
+                after: String::new(),
+            });
+        }
+    }
+
+    // 检查多账号相对顺序变更
+    let b_common: Vec<String> = b_accs
+        .iter()
+        .map(|a| a.email.trim().to_lowercase())
+        .filter(|em| a_accs.iter().any(|x| x.email.trim().eq_ignore_ascii_case(em)))
+        .collect();
+    let a_common: Vec<String> = a_accs
+        .iter()
+        .map(|a| a.email.trim().to_lowercase())
+        .filter(|em| b_accs.iter().any(|x| x.email.trim().eq_ignore_ascii_case(em)))
+        .collect();
+    if b_common.len() >= 2 && b_common != a_common {
+        items.push(ConfigDiffItem {
+            section: "accounts".into(),
+            section_label: "邮箱账号".into(),
+            target_key: "accounts".into(),
+            kind: "modified".into(),
+            field_label: "多邮箱排列顺序".into(),
+            before: b_common.join(" → "),
+            after: a_common.join(" → "),
+        });
+    }
+
+    let b_active = before
+        .primary_account()
+        .map(|a| a.email.trim().to_lowercase())
+        .unwrap_or_default();
+    let a_active = after
+        .primary_account()
+        .map(|a| a.email.trim().to_lowercase())
+        .unwrap_or_default();
+    if b_active != a_active {
+        items.push(ConfigDiffItem {
+            section: "accounts".into(),
+            section_label: "邮箱账号".into(),
+            target_key: if a_active.is_empty() {
+                "accounts".into()
+            } else {
+                format!("account:{a_active}")
+            },
+            kind: "modified".into(),
+            field_label: "当前主用邮箱".into(),
+            before: if b_active.is_empty() {
+                "未绑定".into()
+            } else {
+                b_active
+            },
+            after: if a_active.is_empty() {
+                "无".into()
+            } else {
+                a_active
+            },
+        });
+    }
+
+    // 2. AI 模型与分拣参数对比
+    let ba = &before.agent;
+    let aa = &after.agent;
+    if ba.enabled != aa.enabled {
+        items.push(ConfigDiffItem {
+            section: "agent".into(),
+            section_label: "AI 模型与分拣".into(),
+            target_key: "agent.enabled".into(),
+            kind: "modified".into(),
+            field_label: "新来信 AI 自动分拣".into(),
+            before: bool_label(ba.enabled).into(),
+            after: bool_label(aa.enabled).into(),
+        });
+    }
+    if !ba.preset.trim().eq_ignore_ascii_case(aa.preset.trim()) {
+        items.push(ConfigDiffItem {
+            section: "agent".into(),
+            section_label: "AI 模型与分拣".into(),
+            target_key: "agent.preset".into(),
+            kind: "modified".into(),
+            field_label: "模型服务商".into(),
+            before: format!("{} ({})", preset_readable_name(&ba.preset), val_or(&ba.preset, "未设")),
+            after: format!("{} ({})", preset_readable_name(&aa.preset), val_or(&aa.preset, "未设")),
+        });
+    } else if !ba.provider.trim().eq_ignore_ascii_case(aa.provider.trim()) {
+        items.push(ConfigDiffItem {
+            section: "agent".into(),
+            section_label: "AI 模型与分拣".into(),
+            target_key: "agent.provider".into(),
+            kind: "modified".into(),
+            field_label: "接口协议".into(),
+            before: val_or(&ba.provider, "openai"),
+            after: val_or(&aa.provider, "openai"),
+        });
+    }
+    if ba.model.trim() != aa.model.trim() {
+        items.push(ConfigDiffItem {
+            section: "agent".into(),
+            section_label: "AI 模型与分拣".into(),
+            target_key: "agent.model".into(),
+            kind: "modified".into(),
+            field_label: "模型名称".into(),
+            before: val_or(&ba.model, "默认"),
+            after: val_or(&aa.model, "默认"),
+        });
+    }
+    if ba.base_url.trim() != aa.base_url.trim() {
+        items.push(ConfigDiffItem {
+            section: "agent".into(),
+            section_label: "AI 模型与分拣".into(),
+            target_key: "agent.base_url".into(),
+            kind: "modified".into(),
+            field_label: "接口地址 (Base URL)".into(),
+            before: val_or(&ba.base_url, "默认"),
+            after: val_or(&aa.base_url, "默认"),
+        });
+    }
+    if ba.auto_draft != aa.auto_draft {
+        items.push(ConfigDiffItem {
+            section: "agent".into(),
+            section_label: "AI 模型与分拣".into(),
+            target_key: "agent.auto_draft".into(),
+            kind: "modified".into(),
+            field_label: "自动生成快捷回复建议".into(),
+            before: bool_label(ba.auto_draft).into(),
+            after: bool_label(aa.auto_draft).into(),
+        });
+    }
+    if ba.auto_block_sender != aa.auto_block_sender {
+        items.push(ConfigDiffItem {
+            section: "agent".into(),
+            section_label: "AI 模型与分拣".into(),
+            target_key: "agent.auto_block_sender".into(),
+            kind: "modified".into(),
+            field_label: "垃圾邮件自动拉黑发件人".into(),
+            before: bool_label(ba.auto_block_sender).into(),
+            after: bool_label(aa.auto_block_sender).into(),
+        });
+    }
+    if ba.instructions.trim() != aa.instructions.trim() {
+        items.push(ConfigDiffItem {
+            section: "agent".into(),
+            section_label: "AI 模型与分拣".into(),
+            target_key: "agent.instructions".into(),
+            kind: "modified".into(),
+            field_label: "自然语言分拣偏好".into(),
+            before: short_text(&ba.instructions, 56),
+            after: short_text(&aa.instructions, 56),
+        });
+    }
+
+    // 3. 确定性分流规则对比
+    let rule_pairs: [(&str, &str, &[String], &[String]); 6] = [
+        (
+            "allow_senders",
+            "白名单发件人",
+            &before.triage.allow_senders,
+            &after.triage.allow_senders,
+        ),
+        (
+            "block_senders",
+            "屏蔽发件人",
+            &before.triage.block_senders,
+            &after.triage.block_senders,
+        ),
+        (
+            "block_domains",
+            "屏蔽发件域名",
+            &before.triage.block_domains,
+            &after.triage.block_domains,
+        ),
+        (
+            "block_keywords",
+            "屏蔽关键词",
+            &before.triage.block_keywords,
+            &after.triage.block_keywords,
+        ),
+        (
+            "archive_senders",
+            "折叠发件人（进通知）",
+            &before.triage.archive_senders,
+            &after.triage.archive_senders,
+        ),
+        (
+            "archive_keywords",
+            "折叠关键词（进通知）",
+            &before.triage.archive_keywords,
+            &after.triage.archive_keywords,
+        ),
+    ];
+
+    for (key, label, b_list, a_list) in rule_pairs {
+        let added: Vec<String> = a_list
+            .iter()
+            .filter(|v| !b_list.iter().any(|x| x.trim().eq_ignore_ascii_case(v.trim())))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let removed: Vec<String> = b_list
+            .iter()
+            .filter(|v| !a_list.iter().any(|x| x.trim().eq_ignore_ascii_case(v.trim())))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if !added.is_empty() && removed.is_empty() {
+            items.push(ConfigDiffItem {
+                section: "triage".into(),
+                section_label: "分流规则".into(),
+                target_key: format!("triage.{key}"),
+                kind: "added".into(),
+                field_label: label.into(),
+                before: String::new(),
+                after: added.join("、"),
+            });
+        } else if added.is_empty() && !removed.is_empty() {
+            items.push(ConfigDiffItem {
+                section: "triage".into(),
+                section_label: "分流规则".into(),
+                target_key: format!("triage.{key}"),
+                kind: "removed".into(),
+                field_label: label.into(),
+                before: removed.join("、"),
+                after: String::new(),
+            });
+        } else if !added.is_empty() && !removed.is_empty() {
+            items.push(ConfigDiffItem {
+                section: "triage".into(),
+                section_label: "分流规则".into(),
+                target_key: format!("triage.{key}"),
+                kind: "modified".into(),
+                field_label: label.into(),
+                before: format!("移除 {}", removed.join("、")),
+                after: format!("新增 {}", added.join("、")),
+            });
+        }
+    }
+
+    // 4. 邮件群聊拓扑对比
+    let norm_gid = |id: &str| id.trim().trim_start_matches("group:").to_string();
+    for ag in &after.groups {
+        let gid = norm_gid(&ag.id);
+        let target_key = format!("group:{gid}");
+        if let Some(bg) = before.groups.iter().find(|x| norm_gid(&x.id) == gid) {
+            if bg.name.trim() != ag.name.trim() {
+                items.push(ConfigDiffItem {
+                    section: "groups".into(),
+                    section_label: "邮件群聊".into(),
+                    target_key: target_key.clone(),
+                    kind: "modified".into(),
+                    field_label: "群聊名称".into(),
+                    before: val_or(&bg.name, "未命名"),
+                    after: val_or(&ag.name, "未命名"),
+                });
+            }
+            if bg.muted != ag.muted {
+                items.push(ConfigDiffItem {
+                    section: "groups".into(),
+                    section_label: "邮件群聊".into(),
+                    target_key: target_key.clone(),
+                    kind: "modified".into(),
+                    field_label: format!("群聊「{}」免打扰", ag.name),
+                    before: bool_label(bg.muted).into(),
+                    after: bool_label(ag.muted).into(),
+                });
+            }
+            let added_m: Vec<String> = ag
+                .members
+                .iter()
+                .filter(|m| {
+                    !bg.members
+                        .iter()
+                        .any(|x| x.email.trim().eq_ignore_ascii_case(m.email.trim()))
+                })
+                .map(|m| m.email.trim().to_string())
+                .collect();
+            let removed_m: Vec<String> = bg
+                .members
+                .iter()
+                .filter(|m| {
+                    !ag.members
+                        .iter()
+                        .any(|x| x.email.trim().eq_ignore_ascii_case(m.email.trim()))
+                })
+                .map(|m| m.email.trim().to_string())
+                .collect();
+            if !added_m.is_empty() || !removed_m.is_empty() {
+                let mut parts_b = Vec::new();
+                let mut parts_a = Vec::new();
+                if !removed_m.is_empty() {
+                    parts_b.push(format!("移除 {}", removed_m.join("、")));
+                } else {
+                    parts_b.push(format!("原 {} 人", bg.members.len()));
+                }
+                if !added_m.is_empty() {
+                    parts_a.push(format!("新增 {}", added_m.join("、")));
+                } else {
+                    parts_a.push(format!("现 {} 人", ag.members.len()));
+                }
+                items.push(ConfigDiffItem {
+                    section: "groups".into(),
+                    section_label: "邮件群聊".into(),
+                    target_key,
+                    kind: "modified".into(),
+                    field_label: format!("群聊「{}」成员", ag.name),
+                    before: parts_b.join("；"),
+                    after: parts_a.join("；"),
+                });
+            }
+        } else {
+            let preview_members: Vec<&str> =
+                ag.members.iter().take(3).map(|m| m.email.as_str()).collect();
+            let member_note = if preview_members.is_empty() {
+                format!("{} 位成员", ag.members.len())
+            } else if ag.members.len() > 3 {
+                format!("{} 等 {} 人", preview_members.join("、"), ag.members.len())
+            } else {
+                format!("{}（共 {} 人）", preview_members.join("、"), ag.members.len())
+            };
+            items.push(ConfigDiffItem {
+                section: "groups".into(),
+                section_label: "邮件群聊".into(),
+                target_key,
+                kind: "added".into(),
+                field_label: format!("新建群聊「{}」", ag.name),
+                before: String::new(),
+                after: format!("{member_note}{}", if ag.muted { " · 免打扰" } else { "" }),
+            });
+        }
+    }
+
+    for bg in &before.groups {
+        let gid = norm_gid(&bg.id);
+        if !after.groups.iter().any(|x| norm_gid(&x.id) == gid) {
+            items.push(ConfigDiffItem {
+                section: "groups".into(),
+                section_label: "邮件群聊".into(),
+                target_key: "groups".into(),
+                kind: "removed".into(),
+                field_label: format!("移除群聊「{}」", bg.name),
+                before: format!("{} 位成员", bg.members.len()),
+                after: String::new(),
+            });
+        }
+    }
+
+    let has_toml_change = before_toml.trim() != after_toml.trim();
+    ConfigDiffReport {
+        items,
+        before_toml: if has_toml_change {
+            before_toml.to_string()
+        } else {
+            String::new()
+        },
+        after_toml: if has_toml_change {
+            after_toml.to_string()
+        } else {
+            String::new()
+        },
+    }
 }

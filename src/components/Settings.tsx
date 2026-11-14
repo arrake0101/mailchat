@@ -12,6 +12,8 @@ import {
   type Verdict,
 } from "../types";
 import {
+  IconArrowDown,
+  IconArrowUp,
   IconCheck,
   IconCode,
   IconKey,
@@ -59,6 +61,7 @@ export function Settings({
   notify,
   onAccountSaved,
   onSwitchAccount,
+  onReorderAccounts,
   onDataChanged,
   onGoToAgent,
 }: {
@@ -69,6 +72,7 @@ export function Settings({
   notify: (t: string, isError?: boolean) => void;
   onAccountSaved: () => void;
   onSwitchAccount?: (email: string) => Promise<void> | void;
+  onReorderAccounts?: (emails: string[]) => Promise<void> | void;
   onDataChanged: () => void;
   onGoToAgent: () => void;
 }) {
@@ -146,6 +150,7 @@ export function Settings({
             notify={notify}
             onAccountSaved={onAccountSaved}
             onSwitchAccount={onSwitchAccount}
+            onReorderAccounts={onReorderAccounts}
             onDataChanged={onDataChanged}
           />
         )}
@@ -392,6 +397,7 @@ function VisualTab({
   notify,
   onAccountSaved,
   onSwitchAccount,
+  onReorderAccounts,
   onDataChanged,
 }: {
   accountIntent?: AccountFormIntent;
@@ -400,6 +406,7 @@ function VisualTab({
   notify: (t: string, e?: boolean) => void;
   onAccountSaved: () => void;
   onSwitchAccount?: (email: string) => Promise<void> | void;
+  onReorderAccounts?: (emails: string[]) => Promise<void> | void;
   onDataChanged: () => void;
 }) {
   const [accounts, setAccounts] = useState<AccountEntry[]>([]);
@@ -637,6 +644,28 @@ function VisualTab({
     }
   };
 
+  const handleMoveAccount = async (index: number, delta: -1 | 1) => {
+    const targetIdx = index + delta;
+    if (targetIdx < 0 || targetIdx >= accounts.length) return;
+    const reordered = [...accounts];
+    const [picked] = reordered.splice(index, 1);
+    reordered.splice(targetIdx, 0, picked);
+    setAccounts(reordered);
+    const orderedEmails = reordered.map((x) => x.email);
+    try {
+      if (onReorderAccounts) {
+        await onReorderAccounts(orderedEmails);
+      } else {
+        const nextList = await api.reorderAccounts(orderedEmails);
+        setAccounts(nextList);
+        onDataChanged();
+      }
+    } catch (e) {
+      notify(`调整顺序失败：${e}`, true);
+      api.listAccounts().then(setAccounts).catch(() => {});
+    }
+  };
+
   const selectPreset = (id: ProviderPresetId) => {
     const target = MODEL_PRESETS.find((p) => p.id === id);
     if (!target || !c) return;
@@ -730,7 +759,7 @@ function VisualTab({
           <div>
             <div className="section-title">多邮箱账号与服务器连接 (IMAP / SMTP)</div>
             <div className="section-desc">
-              支持同时接入多个个人或工作邮箱，各账号本地会话、IMAP 同步游标与 DPAPI 授权码完全隔离；亦可随时在窗口顶栏一键切换。
+              支持同时接入多个个人或工作邮箱，上下顺序即顶栏平铺优先级（排在前面的账号优先在顶栏平铺展示，空间不足时自动收起靠后的账号）。
             </div>
           </div>
           {accounts.length > 0 && (
@@ -747,7 +776,7 @@ function VisualTab({
 
         {accounts.length > 0 && (
           <div className="account-list-grid">
-            {accounts.map((entry) => {
+            {accounts.map((entry, idx) => {
               const isEditingThis =
                 formMode === "edit" &&
                 a.email.trim().toLowerCase() === entry.email.toLowerCase();
@@ -760,6 +789,9 @@ function VisualTab({
                 >
                   <div className="account-card-main">
                     <div className="account-card-left">
+                      <span className="account-rank-pill" title={`顶栏平铺优先级 #${idx + 1}`}>
+                        #{idx + 1}
+                      </span>
                       <div className={`account-avatar-badge ${entry.active ? "active" : ""}`}>
                         {initial}
                       </div>
@@ -795,6 +827,28 @@ function VisualTab({
                     </div>
 
                     <div className="account-card-actions">
+                      {accounts.length > 1 && (
+                        <div className="account-reorder-group" aria-label="调整顶栏前后顺序">
+                          <button
+                            type="button"
+                            className="soft-btn icon-step-btn"
+                            disabled={idx === 0}
+                            onClick={() => handleMoveAccount(idx, -1)}
+                            title="前移一位（更优先在顶栏平铺显示）"
+                          >
+                            <IconArrowUp size={13} />
+                          </button>
+                          <button
+                            type="button"
+                            className="soft-btn icon-step-btn"
+                            disabled={idx === accounts.length - 1}
+                            onClick={() => handleMoveAccount(idx, 1)}
+                            title="后移一位（空间不足时优先折叠）"
+                          >
+                            <IconArrowDown size={13} />
+                          </button>
+                        </div>
+                      )}
                       {!entry.active && (
                         <button
                           type="button"

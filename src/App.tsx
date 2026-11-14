@@ -43,6 +43,7 @@ export default function App() {
   const [convs, setConvs] = useState<Conversation[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [draftConv, setDraftConv] = useState<Conversation | null>(null);
+  const [draftTexts, setDraftTexts] = useState<Record<string, string>>({});
   const [messages, setMessages] = useState<Message[]>([]);
   const [syncing, setSyncing] = useState(false);
   const [triaging, setTriaging] = useState(false);
@@ -116,6 +117,32 @@ export default function App() {
       }
     },
     [account?.email, switchingAccount, refresh, notify],
+  );
+
+  const handleReorderAccounts = useCallback(
+    async (orderedEmails: string[]) => {
+      setAccounts((prev) => {
+        const byEmail = new Map(prev.map((a) => [a.email.toLowerCase(), a]));
+        const next: AccountEntry[] = [];
+        for (const raw of orderedEmails) {
+          const hit = byEmail.get(raw.toLowerCase());
+          if (hit) {
+            next.push(hit);
+            byEmail.delete(raw.toLowerCase());
+          }
+        }
+        for (const rest of byEmail.values()) next.push(rest);
+        return next;
+      });
+      try {
+        const updated = await api.reorderAccounts(orderedEmails);
+        setAccounts(updated);
+      } catch (e) {
+        notify(`调整邮箱顺序失败：${e}`, true);
+        refresh();
+      }
+    },
+    [notify, refresh],
   );
 
   useEffect(() => {
@@ -267,6 +294,32 @@ export default function App() {
     }
   };
 
+  const activeScope = (account?.email || "__unbound__").trim().toLowerCase();
+  const scopedDrafts: Record<string, string> = {};
+  const scopePrefix = `${activeScope}::`;
+  for (const [k, v] of Object.entries(draftTexts)) {
+    if (k.startsWith(scopePrefix) && v.trim()) {
+      scopedDrafts[k.slice(scopePrefix.length)] = v;
+    }
+  }
+
+  const updatePeerDraft = useCallback(
+    (peer: string, value: string) => {
+      const key = `${activeScope}::${peer}`;
+      setDraftTexts((prev) => {
+        if (!value) {
+          if (!(key in prev)) return prev;
+          const next = { ...prev };
+          delete next[key];
+          return next;
+        }
+        if (prev[key] === value) return prev;
+        return { ...prev, [key]: value };
+      });
+    },
+    [activeScope],
+  );
+
   const activeConv =
     convs.find((c) => c.peer === selected) ??
     (draftConv && draftConv.peer === selected ? draftConv : undefined);
@@ -283,6 +336,7 @@ export default function App() {
         hasDemo={stats.has_demo}
         onClickAccount={() => openAccountForm("manage")}
         onSwitchAccount={handleSwitchAccount}
+        onReorderAccounts={handleReorderAccounts}
         onAddAccount={() => openAccountForm("add")}
         onManageAccounts={() => openAccountForm("manage")}
       />
@@ -370,6 +424,7 @@ export default function App() {
               refresh();
             }}
             onSwitchAccount={handleSwitchAccount}
+            onReorderAccounts={handleReorderAccounts}
             onDataChanged={refresh}
             onGoToAgent={() => setView("assistant")}
           />
@@ -378,6 +433,7 @@ export default function App() {
             <ConversationList
               title={mailMeta?.label ?? "消息"}
               items={convs}
+              drafts={scopedDrafts}
               selected={selected}
               onSelect={select}
               onNewChat={startNewChat}
@@ -393,9 +449,13 @@ export default function App() {
               <ChatView
                 key={`${account?.email || "__unbound__"}:${activeConv.peer}`}
                 conv={activeConv}
+                conversations={convs}
                 status={view}
                 messages={messages}
+                initialDraft={draftTexts[`${activeScope}::${activeConv.peer}`] ?? ""}
+                onDraftChange={(val) => updatePeerDraft(activeConv.peer, val)}
                 onSent={(m) => {
+                  updatePeerDraft(activeConv.peer, "");
                   setDraftConv(null);
                   const target = activeConv.is_group && activeConv.muted ? "archived" : "inbox";
                   if (view !== target) setView(target);

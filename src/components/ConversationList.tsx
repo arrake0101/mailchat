@@ -8,6 +8,7 @@ import { startWindowDrag, toggleWindowMaximize } from "./WindowControls";
 interface Props {
   title: string;
   items: Conversation[];
+  drafts?: Record<string, string>;
   selected: string | null;
   onSelect: (peer: string) => void;
   onNewChat: (email: string, name?: string) => void;
@@ -22,6 +23,7 @@ interface Props {
 export function ConversationList({
   title,
   items,
+  drafts,
   selected,
   onSelect,
   onNewChat,
@@ -341,7 +343,14 @@ export function ConversationList({
                 <span className="conv-time">{shortTime(c.last_date)}</span>
               </div>
               <div className="conv-row">
-                <span className="conv-preview">{c.preview.replace(/^🔑\s*/, "") || c.peer}</span>
+                {drafts?.[c.peer]?.trim() && selected !== c.peer ? (
+                  <span className="conv-preview">
+                    <span className="conv-draft-tag">[草稿]</span>{" "}
+                    {drafts[c.peer].replace(/\s+/g, " ").trim()}
+                  </span>
+                ) : (
+                  <span className="conv-preview">{c.preview.replace(/^🔑\s*/, "") || c.peer}</span>
+                )}
                 {c.unread > 0 ? (
                   <span className={`badge ${c.muted ? "badge-muted" : ""}`}>
                     {c.unread > 99 ? "99+" : c.unread}

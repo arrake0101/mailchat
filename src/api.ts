@@ -10,6 +10,7 @@ import type {
   ContactProfile,
   Conversation,
   DeclarativeBundle,
+  DeclarativeConfigSpec,
   GroupInfo,
   GroupMember,
   MailboxStats,
@@ -31,6 +32,8 @@ import type {
 export const api = {
   getDeclarativeConfig: () => invoke<DeclarativeBundle>("get_declarative_config"),
   applyDeclarativeConfig: (toml: string) => invoke<DeclarativeBundle>("apply_declarative_config", { toml }),
+  applyDeclarativeSpec: (spec: DeclarativeConfigSpec) =>
+    invoke<DeclarativeBundle>("apply_declarative_spec", { spec }),
   listSecrets: () => invoke<SecretStatus[]>("list_secrets"),
   setSecret: (key: string, value: string, verify = true) =>
     invoke<SecretSaveResult>("set_secret", { key, value, verify }),
@@ -70,6 +73,7 @@ export const api = {
   switchAccount: (email: string) => invoke<AccountEntry[]>("switch_account", { email }),
   removeAccount: (email: string, deleteLocalData = false) =>
     invoke<AccountEntry[]>("remove_account", { email, deleteLocalData }),
+  reorderAccounts: (emails: string[]) => invoke<AccountEntry[]>("reorder_accounts", { emails }),
   getAgentConfig: () => invoke<AgentConfig>("get_agent_config"),
   saveAgentConfig: (config: AgentConfig) => invoke<void>("save_agent_config", { config }),
   testAgent: (config: AgentConfig) => invoke<Verdict>("test_agent", { config }),
@@ -121,6 +125,7 @@ export const api = {
     invoke<string>("summarize_conversation", { peer, title }),
   loadDemoData: () => invoke<number>("load_demo_data"),
   clearDemoData: () => invoke<number>("clear_demo_data"),
+  startScreenSnip: () => invoke<void>("start_screen_snip"),
   openExternalUrl: async (url: string) => {
     try {
       await invoke<void>("open_external_url", { url });

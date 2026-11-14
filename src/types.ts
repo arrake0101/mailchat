@@ -203,9 +203,79 @@ export interface SecretPrompt {
   configured: boolean;
 }
 
+export interface AccountSpec {
+  email: string;
+  display_name: string;
+  username: string;
+  imap_host: string;
+  imap_port: number;
+  smtp_host: string;
+  smtp_port: number;
+  password_ref: string;
+}
+
+export interface ProfileSpec {
+  base_url: string;
+  model: string;
+}
+
+export interface AgentSpec {
+  enabled: boolean;
+  preset: string;
+  provider: string;
+  base_url: string;
+  model: string;
+  api_key_ref: string;
+  auto_draft: boolean;
+  auto_block_sender: boolean;
+  instructions: string;
+  profiles?: Record<string, ProfileSpec>;
+}
+
+export interface TriageSpec {
+  allow_senders: string[];
+  block_senders: string[];
+  block_domains: string[];
+  block_keywords: string[];
+  archive_senders: string[];
+  archive_keywords: string[];
+}
+
+export interface GroupSpec {
+  id: string;
+  name: string;
+  muted: boolean;
+  members: GroupMember[];
+}
+
+export interface DeclarativeConfigSpec {
+  active_account?: string;
+  accounts?: AccountSpec[];
+  agent: AgentSpec;
+  triage: TriageSpec;
+  groups?: GroupSpec[];
+}
+
+export interface ConfigDiffItem {
+  section: "accounts" | "agent" | "triage" | "groups" | "vault" | string;
+  section_label: string;
+  target_key: string;
+  kind: "added" | "modified" | "removed" | string;
+  field_label: string;
+  before: string;
+  after: string;
+}
+
+export interface ConfigDiffReport {
+  items: ConfigDiffItem[];
+  before_toml: string;
+  after_toml: string;
+}
+
 export interface DeclarativeBundle {
   path: string;
   toml: string;
+  spec?: DeclarativeConfigSpec;
   secrets: SecretStatus[];
 }
 
@@ -238,6 +308,7 @@ export interface AgentTurnRecord {
   thinking_ms: number;
   tool_steps: string[];
   changes: string[];
+  config_diff?: ConfigDiffReport | null;
   secret_prompts: SecretPrompt[];
   suggestions: string[];
   created_at: number;
@@ -246,7 +317,7 @@ export interface AgentTurnRecord {
 export interface AgentStreamPayload {
   request_id: string;
   session_id: string;
-  kind: "thinking" | "content" | "tool" | "toml" | string;
+  kind: "thinking" | "content" | "tool" | "toml" | "spec_preview" | string;
   delta: string;
   thinking_ms: number;
 }
@@ -263,7 +334,9 @@ export interface AgentChatResponse {
   thinking_ms: number;
   tool_steps: string[];
   changes: string[];
+  config_diff?: ConfigDiffReport | null;
   toml: string;
+  spec?: DeclarativeConfigSpec;
   secrets: SecretStatus[];
   secret_prompts: SecretPrompt[];
   suggestions: string[];
