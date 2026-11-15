@@ -144,8 +144,8 @@ function stripQuotedDomNodes(root: HTMLElement): void {
  * 判断一封邮件是否属于“富排版/卡片/模板型 HTML 邮件”（如 Google 安全通知、电子账单、系统卡片、周刊等），
  * 排除普通人在网页/客户端回复的一两句纯聊天邮件（即便其引用块里带有表格），避免普通对话气泡退化成笨重网页框。
  */
-export function isRichHtmlEmail(bodyHtml: string | undefined, outgoing: boolean): boolean {
-  if (outgoing || !hasHtmlBody(bodyHtml)) return false;
+export function isRichHtmlEmail(bodyHtml: string | undefined, _outgoing: boolean): boolean {
+  if (!hasHtmlBody(bodyHtml)) return false;
   const raw = bodyHtml!;
   const key = cacheKeyForHtml(raw);
   const cached = RICH_HTML_CACHE.get(key);

@@ -26,9 +26,12 @@
   - [4. Windows DPAPI 系统级隐私凭据保险箱](#4-windows-dpapi-系统级隐私凭据保险箱)
 - [核心特性](#核心特性)
   - [即时通讯体验的单聊与多人全员群聊](#即时通讯体验的单聊与多人全员群聊)
-  - [实时收信双擎与多账号热切换](#实时收信双擎与多账号热切换)
+  - [实时收信双擎、系统托盘常驻与新消息闪烁提醒](#实时收信双擎系统托盘常驻与新消息闪烁提醒)
   - [消息 · 通知 · 拦截三槽分流](#消息--通知--拦截三槽分流)
-  - [Agent 优先的声明式配置 (`config.toml`)](#agent-优先的声明式配置-configtoml)
+  - [统一智能体内核与双实例权限隔离 (`config` & `mail`)](#统一智能体内核与双实例权限隔离-config--mail)
+  - [富文本写信工坊、跨邮箱统一批复与本地盲脱敏/DLP 引擎](#富文本写信工坊跨邮箱统一批复与本地盲脱敏dlp-引擎)
+  - [声明式主题外观系统与外部模板导入 (`[theme]`)](#声明式主题外观系统与外部模板导入-theme)
+  - [Minisign 签名强校验热更新与多渠道升级感知 (`[update]`)](#minisign-签名强校验热更新与多渠道升级感知-update)
   - [免配置沿用 Magpie 本地路由 + 原生多模型引擎 (`genai`)](#免配置沿用-magpie-本地路由--原生多模型引擎-genai)
   - [实验性：Plugin Lab 零信任插件沙盒 (`plugin-lab/`)](#实验性plugin-lab-零信任插件沙盒-plugin-lab)
 - [架构概览](#架构概览)
@@ -88,18 +91,33 @@
 - **群免打扰与 `@我` 穿透**：开启免打扰的群聊默认静默收纳至「通知」，仅当来信正文明确 `@当前用户`（昵称或邮箱）时自动穿透提醒至主消息槽。
 - **高危附件防绕过守卫**：内置针对可执行脚本与伪装后缀的严格阻断（覆盖 `.exe` / `.msi` / `.scr` / `.bat` / `.ps1` / `.lnk` / `.iso` 以及 Windows 尾随点空格与 NTFS ADS 数据流绕过）。
 
-### 实时收信双擎与多账号热切换
+### 实时收信双擎、系统托盘常驻与新消息闪烁提醒
 - **IMAP IDLE 毫秒级推送 + 热轮询双模守护**：优先启用 IMAP IDLE 实时推送（每 `28s` 静默保活防止家用 NAT 或代理超时断流）；遇到不支持 IDLE 的邮件服务端自动降级为复用长连接热轮询（`6s`），系统休眠唤醒或切回前台时自动探活重连。
+- **系统托盘守护与防抖闪烁提醒 (`[window]`)**：支持关闭主窗口最小化至系统托盘继续后台收信；当真正进入「消息 (`inbox`)」槽的未读来信到达时，自动触发右下角消息红点角标等尺寸交替闪烁与任务栏高亮提醒（通知与拦截槽静默收纳不打扰），点击托盘或切回窗口即刻消警。
 - **多邮箱并行管理**：支持主流邮箱（QQ、Foxmail、网易 163/126/Yeah、Gmail、Outlook/Hotmail、iCloud、阿里邮箱）一键预填服务器参数，顶栏胶囊实时汇总各账号未读数并支持拖拽调整展示顺序。
 
 ### 消息 · 通知 · 拦截三槽分流
 - **本地确定性规则前置短路**：白名单发件人、屏蔽发件人/域名/关键词、归档折叠发件人/关键词在本地毫秒级立即判定，零 Token 消耗。
 - **后台并发 AI 智能分拣**：异步后台线程池分拣来信（绝不阻塞收信刷新），自动提取短信/邮件验证码、提炼长邮件一句话摘要，并按场景生成多语气快捷回复草稿（确认收到 / 同步进展 / 礼貌婉拒 / 正式商务润色）。
 
-### Agent 优先的声明式配置 (`config.toml`)
-- **三视图实时同步**：内置「可视化表单 · 变更对比 (Diff) · `config.toml` 源码」三合一检查器，任意一处修改即时双向校验同步。
-- **无 Key 离线兜底引擎**：尚未配置任何大模型密钥时，自动启用内置本地确定性自然语言解析器，零外部依赖即可对话式完成绑号、建群与过滤规则编排。
-- **会话持久化与时光机回退**：完整记录每轮配置修改前后的 `config.toml` 快照，支持随时回退对话轮次并一键还原对应时刻的系统配置。
+### 统一智能体内核与双实例权限隔离 (`config` & `mail`)
+- **同一推理内核 · 双隔离实例 (`kernel.rs`)**：共享 `genai` 流式推理、`<think>` 思考链拆分与工具循环，但按职责拆分为会话、模型状态与工具权限严格隔离的两个实例：
+  - **配置助手实例 (`config`)**：挂载于左侧「助手」页，仅读写脱敏 `config.toml`（内置「可视化表单 · LCS 行级 Diff · TOML 源码」三合一检查器、无 Key 离线解析器与时光机单步回退），绝不接触邮件正文。
+  - **邮件智能体实例 (`mail`)**：可通过 `Ctrl+J` 或右上角按钮随时呼出全局右侧伸缩侧栏，拥有独立的模型状态与受本地盲脱敏约束的写信排版、当前会话纪要、统一批复精修与自动化规则编排能力。
+
+### 富文本写信工坊、跨邮箱统一批复与本地盲脱敏/DLP 引擎
+- **写信与内联 HTML 工坊 (`ComposeWorkspace`)**：支持传统抄送/密送/多附件富文本发信，可由邮件智能体直接撰写带内联 CSS 的商务卡片/周报表格 HTML 邮件并实时双栈预览。
+- **跨邮箱统一批复与自动化规则 (`ReplyHubWorkspace`)**：默认零授权（Opt-in）物理隔离未勾选邮箱，硬性跳过拦截槽与验证码/账单/薪酬等高敏邮件；支持待审草稿批量确认发送与带冷却防死循环保护的 `[[reply_policy.auto_rules]]` 条件回复规则。
+- **本地确定性盲脱敏与出站 DLP 守卫 (`privacy.rs`)**：邮件进入外部大模型前在本地自动将私钥、API Key、连接串、手机号、身份证、银行卡及自定义敏感词替换为 `{{MC_*_N}}` 占位符（写信草稿本地离线盲回填），外发前执行出站 DLP 防泄漏拦截。
+
+### 声明式主题外观系统与外部模板导入 (`[theme]`)
+- **内置与开源社区经典配色**：支持浅色 / 深色 / 跟随系统三态切换、舒适/紧凑密度与字号缩放，内置 5 套官方主题与 8 套精选开源社区主题（Catppuccin Latte/Mocha、Nord、Tokyo Night、Dracula、Solarized、Rosé Pine、Gruvbox）。
+- **多格式外部主题一键导入**：支持直接粘贴或导入 VS Code `*-color-theme.json`、CSS/Shadcn 变量或 MailChat `.toml` / `.json` 主题模板，并持久化至 `config.toml` `[[theme.custom_themes]]`。
+
+### Minisign 签名强校验热更新与多渠道升级感知 (`[update]`)
+- **端到端 Ed25519 公钥签名验证**：基于 Tauri v2 原生更新引擎（`tauri-plugin-updater`），内置编译期 Minisign 公钥校验远端 `latest.json` 清单与二进制补丁签名，支持流式下载进度推送、可选后台静默预下载与一键覆盖重启升级（Windows NSIS 被动更新 `/P /UPDATE /R`、macOS `.app.tar.gz`、Linux `AppImage` / `deb`）。
+- **多安装渠道自动识别**：自动区分 Windows 标准安装版、Scoop 包管理版、Windows 绿色便携包、macOS `.app`、Homebrew Cask 与源码开发态；对包管理或便携版自动避免误跑安装向导造成双份副本，并提供一键复制 `scoop update mailchat` / `brew upgrade --cask mailchat` 命令或对应渠道直链。
+- **声明式更新策略编排**：支持在可视化界面、`config.toml` `[update]` 节或通过配置助手自然语言调整 `auto_check`、`auto_download`、`check_interval_hours`、`channel`（`stable` / `beta`）及企业私有镜像 `custom_endpoint`。
 
 ### 免配置沿用 Magpie 本地路由 + 原生多模型引擎 (`genai`)
 - **一键复用 [Magpie (`usemagpie.ai`)](https://usemagpie.ai) 本地 AI 路由网关**：自动探测 `~/.config/magpie/settings.json`（默认 `http://127.0.0.1:3425/v1`），本机回环免填 API Key（自动使用 `Bearer magpie` 占位令牌，不读取、不复制明文密钥文件），直接沿用你在 Claude Code / Codex / OpenCode 等工具中已配好的模型、OAuth 订阅与故障转移路由组（`auto` / `group/*`）。
@@ -169,6 +187,12 @@ allow_senders = ["zhouming@nebula-studio.cn", "alex.chen@gmail.com"]
 block_domains = ["edm-mall-blast.example"]
 block_keywords = ["退订", "限时特惠"]
 archive_keywords = ["验证码", "电子发票", "账单"]
+
+[update]
+auto_check = true
+auto_download = false
+check_interval_hours = 6
+channel = "stable"
 
 [[groups]]
 id = "group:nebula-v2-core"
@@ -263,24 +287,36 @@ mailchat/
 │   │   ├── FirstScreenWorkspace.tsx  # 第一屏智能信箱总览与新手引导
 │   │   ├── ConversationList.tsx      # 会话列表、筛选标签与快捷建群/单聊
 │   │   ├── ChatView.tsx              # IM 气泡单聊/群聊、附件、引用、搜索与 AI 纪要
-│   │   ├── AgentWorkspace.tsx        # 对话式配置助手与流式思考/回退时间线
+│   │   ├── ComposeWorkspace.tsx      # 传统写信 + 内联 HTML 双栈实时预览工坊
+│   │   ├── ReplyHubWorkspace.tsx     # 跨邮箱统一批复队列、隐私准入与自动化回复规则台
+│   │   ├── AgentWorkspace.tsx        # 对话式配置助手实例宿主
+│   │   ├── GlobalAgentDock.tsx       # 全局右侧可伸缩邮件智能体侧栏 (Ctrl+J)
+│   │   ├── AgentKernelPane.tsx       # 统一智能体内核双实例复用交互面板
 │   │   ├── AgentConfigInspector.tsx  # 可视化表单 / LCS 行级 Diff / TOML 检查器
 │   │   ├── Settings.tsx              # 多账号管理、DPAPI 隐私保险箱与模型路由预设
+│   │   ├── ThemeConfiguratorCard.tsx # 外观主题预设、开源社区配色与外部模板导入卡
+│   │   ├── WindowConfiguratorCard.tsx # 系统托盘常驻与新消息闪烁提醒编排卡
+│   │   ├── UpdateConfiguratorCard.tsx # 签名热更新进度台、多渠道升级引导与 [update] 编排卡
 │   │   ├── HtmlMailView.tsx          # 富文本邮件安全沙盒渲染器
 │   │   └── WindowControls.tsx        # 无边框窗口控制栏与可拖拽多邮箱胶囊栏
+│   ├── theme.ts                # 主题调色板计算引擎与多格式外部模板解析器
 │   ├── api.ts                  # Tauri IPC 类型安全封装与邮箱/模型预设表
 │   ├── types.ts                # 全局领域模型与声明式契约定义
 │   └── styles.css              # 桌面视觉系统样式表
 ├── src-tauri/                  # Tauri v2 + Rust 原生后端
 │   └── src/
 │       ├── lib.rs              # 应用生命周期、IMAP IDLE 实时守护与 IPC 命令集
+│       ├── kernel.rs           # 统一智能体内核与 config / mail 双实例隔离运行时
+│       ├── privacy.rs          # 读取隔离准入、本地确定性 PII/密钥盲脱敏与出站 DLP 守卫
 │       ├── mail.rs             # IMAP/SMTP 协议栈、正文去噪、RFC2047 群聊与附件解析
 │       ├── db.rs               # SQLite 存储引擎、多账号隔离与线程聚合路由
 │       ├── config.rs           # config.toml 双向同步编译器与结构化 Diff 计算
 │       ├── vault.rs            # Windows DPAPI 系统级凭据加密保险箱
 │       ├── agent.rs            # 声明式配置 Agent、密钥前置脱敏拦截与离线解析引擎
 │       ├── llm.rs              # 基于 genai 的多厂商原生推理客户端
-│       └── magpie.rs           # 本机 Magpie 模型路由网关自动发现与免配接入
+│       ├── magpie.rs           # 本机 Magpie 模型路由网关自动发现与免配接入
+│       ├── tray.rs             # 系统托盘常驻、未读红点角标合成与防抖闪烁守护
+│       └── updater.rs          # Tauri v2 Minisign 签名热更新、多渠道检测与 GitHub Releases 兜底引擎
 ├── plugin-lab/                 # 零信任免编译插件系统原型与自动化测试套件
 ├── docs/screenshots/           # README 界面预览截图（模拟演示数据）
 └── LICENSE                     # MIT 开源许可证

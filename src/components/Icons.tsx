@@ -36,18 +36,18 @@ export function BrandAppIcon({ size = 38, ...rest }: IconProps) {
     >
       <path
         d="M128 16 C200 16 240 56 240 128 C240 200 200 240 128 240 C56 240 16 200 16 128 C16 56 56 16 128 16 Z"
-        fill="#FFFFFF"
-        stroke="#E2E8F0"
+        fill="var(--surface-card, #FFFFFF)"
+        stroke="var(--hairline, #E2E8F0)"
         strokeWidth="2.2"
       />
       <path
         d="M128 23 C195 23 233 61 233 128 C233 195 195 233 128 233 C61 233 23 195 23 128 C23 61 61 23 128 23 Z"
-        stroke="#F1F5F9"
+        stroke="var(--surface-subtle, #F1F5F9)"
         strokeWidth="1.2"
       />
-      <path d="M128 70 L70 128 L99 157 L128 128 Z" fill="#0F172A" />
-      <path d="M128 128 L157 99 L186 128 L128 186 Z" fill="#0F172A" />
-      <circle cx="178.5" cy="77.5" r={dotRadius} fill="#3563E9" />
+      <path d="M128 70 L70 128 L99 157 L128 128 Z" fill="var(--ink, #0F172A)" />
+      <path d="M128 128 L157 99 L186 128 L128 186 Z" fill="var(--ink, #0F172A)" />
+      <circle cx="178.5" cy="77.5" r={dotRadius} fill="var(--accent, #3563E9)" />
     </svg>
   );
 }
@@ -612,6 +612,128 @@ export function IconUndo(p: IconProps) {
     <Base {...p}>
       <path d="M8.5 5.5 4.5 9.5 8.5 13.5" />
       <path d="M5 9.5H15.5C18 9.5 19.5 11 19.5 13.5C19.5 16 18 17.5 15.5 17.5H10" />
+    </Base>
+  );
+}
+
+/** 51 · PALETTE — 声明式界面主题调色网格与高光色点 */
+export function IconPalette(p: IconProps) {
+  return (
+    <Base {...p}>
+      <rect x="4" y="4" width="16" height="16" />
+      <path d="M4 11.5H20M11.5 4V20" />
+      <rect x="6.5" y="6.5" width="2.5" height="2.5" fill="var(--accent, #3563e9)" stroke="none" />
+      <rect x="14.5" y="14.5" width="2.5" height="2.5" fill="currentColor" stroke="none" />
+    </Base>
+  );
+}
+
+/** 52 · SUN — 浅色日间模式八向刻度盘 */
+export function IconSun(p: IconProps) {
+  return (
+    <Base {...p}>
+      <circle cx="12" cy="12" r="4" />
+      <path d="M12 3.5V5.5M12 18.5V20.5M3.5 12H5.5M18.5 12H20.5M6 6 7.5 7.5M16.5 16.5 18 18M18 6 16.5 7.5M7.5 16.5 6 18" />
+    </Base>
+  );
+}
+
+/** 53 · MOON — 深色暗夜模式弦月弧 */
+export function IconMoon(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M19.5 14.5A7.5 7.5 0 0 1 9.5 4.5a7.5 7.5 0 1 0 10 10Z" />
+    </Base>
+  );
+}
+
+/** 54 · MONITOR — 跟随系统显示模式框 */
+export function IconMonitor(p: IconProps) {
+  return (
+    <Base {...p}>
+      <rect x="3.5" y="4.5" width="17" height="11.5" />
+      <path d="M9 19.5H15M12 16V19.5" />
+    </Base>
+  );
+}
+
+/** 55 · COMPOSE — 传统信笺框 + Agent 排版游标（写信工坊） */
+export function IconCompose(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M12.5 4.5H5V19.5H19V11.5" />
+      <path d="M16.5 3.8 20.2 7.5 11.8 15.9H8.1V12.2L16.5 3.8Z" />
+      <rect x="7.5" y="7.5" width="3" height="1.5" fill="var(--accent, #3563e9)" stroke="none" />
+    </Base>
+  );
+}
+
+/** 56 · REPLY HUB — 多邮箱层叠收件匣 + 隐私护盾勾选（统一批复中心） */
+export function IconReplyHub(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M4 8H17V18.5H4V8Z" />
+      <path d="M7 5H20V15.5" />
+      <path d="m7.5 13 2.5 2.5 4.5-4.5" />
+    </Base>
+  );
+}
+
+/** 57 · EYE — 入模脱敏审计透视眼 */
+export function IconEye(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M2.8 12C4.8 7.8 8.1 5.8 12 5.8S19.2 7.8 21.2 12C19.2 16.2 15.9 18.2 12 18.2S4.8 16.2 2.8 12Z" />
+      <circle cx="12" cy="12" r="2.6" />
+    </Base>
+  );
+}
+
+/** 58 · SPLIT — 源码与沙箱实时双栏分屏视图 */
+export function IconSplit(p: IconProps) {
+  return (
+    <Base {...p}>
+      <rect x="3.5" y="4.5" width="17" height="15" />
+      <path d="M12 4.5V19.5" />
+    </Base>
+  );
+}
+
+/** 59 · UPDATE — 客户端签名热更新指示徽标（底座承盘 + 向上升级轴 + 签名高光点） */
+export function IconUpdate(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M4.5 14.5V19.5H19.5V14.5" />
+      <path d="M12 15V5.5M8 9.5 12 5.5 16 9.5" />
+      <circle cx="18.25" cy="5.75" r="1.6" fill="var(--accent, #3563e9)" stroke="none" />
+    </Base>
+  );
+}
+
+/** 60 · AGENT DOCK — 右侧邮件智能体分栏面板切换图标（窗口外框 + 右侧停靠栏 + AI 星芒） */
+export function IconAgentDock(p: IconProps & { open?: boolean }) {
+  const { open, ...rest } = p;
+  return (
+    <Base {...rest}>
+      <rect x="3.5" y="4.5" width="17" height="15" rx="2" />
+      <path d="M14.2 4.5V19.5" />
+      {open && (
+        <rect
+          x="15.35"
+          y="5.9"
+          width="3.75"
+          height="12.2"
+          rx="0.9"
+          fill="currentColor"
+          fillOpacity="0.22"
+          stroke="none"
+        />
+      )}
+      <path
+        d="M8.8 9.1 9.55 11.15 11.6 11.9 9.55 12.65 8.8 14.7 8.05 12.65 6 11.9 8.05 11.15Z"
+        fill="var(--accent, #3563e9)"
+        stroke="none"
+      />
     </Base>
   );
 }

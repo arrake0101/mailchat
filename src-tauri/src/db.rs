@@ -9,6 +9,23 @@ use std::sync::Mutex;
 
 pub struct Db(pub Mutex<Connection>, pub PathBuf);
 
+/// 归一化 Agent 实例标识：`"mail"` 为邮件处理智能体实例，其余统一归为 `"config"` 声明式配置智能体实例。
+pub fn normalize_agent_instance(raw: &str) -> &'static str {
+    if raw.trim().eq_ignore_ascii_case("mail") {
+        "mail"
+    } else {
+        "config"
+    }
+}
+
+pub fn default_instance_session_title(instance_id: &str) -> &'static str {
+    if normalize_agent_instance(instance_id) == "mail" {
+        "新邮件对话"
+    } else {
+        "新配置对话"
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Account {
     pub email: String,
@@ -77,6 +94,379 @@ impl Default for AgentConfig {
     }
 }
 
+fn default_theme_mode() -> String {
+    "light".into()
+}
+fn default_theme_preset() -> String {
+    "mist".into()
+}
+fn default_theme_density() -> String {
+    "comfortable".into()
+}
+fn default_theme_font_scale() -> String {
+    "normal".into()
+}
+
+/// 校验并规范化 `#RGB` / `#RRGGBB` / `#RRGGBBAA` 十六进制颜色字符串为小写 `#rrggbb`
+pub fn normalize_hex_color(raw: &str) -> Option<String> {
+    let clean = raw.trim().trim_start_matches('#');
+    if clean.len() == 3 && clean.chars().all(|c| c.is_ascii_hexdigit()) {
+        let mut out = String::with_capacity(7);
+        out.push('#');
+        for c in clean.chars() {
+            let lc = c.to_ascii_lowercase();
+            out.push(lc);
+            out.push(lc);
+        }
+        return Some(out);
+    }
+    if clean.len() == 6 && clean.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Some(format!("#{}", clean.to_ascii_lowercase()));
+    }
+    if clean.len() == 8 && clean.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Some(format!("#{}", clean[..6].to_ascii_lowercase()));
+    }
+    None
+}
+
+/// 将外部主题 ID 或名称清洗为合法 slug（仅保留小写字母、数字、`-`、`_`，最长 48 字符）
+pub fn sanitize_theme_id(raw: &str) -> String {
+    let mut out = String::new();
+    let mut prev_sep = false;
+    for ch in raw.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_sep = false;
+        } else if (ch == '-' || ch == '_' || ch.is_whitespace() || ch == '.') && !out.is_empty() && !prev_sep {
+            out.push('-');
+            prev_sep = true;
+        }
+        if out.len() >= 48 {
+            break;
+        }
+    }
+    let trimmed = out.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        let hash = raw
+            .bytes()
+            .fold(5381u32, |acc, b| acc.wrapping_mul(33).wrapping_add(b as u32));
+        format!("theme-{:06x}", hash & 0x00ff_ffff)
+    } else {
+        trimmed
+    }
+}
+
+/// 用户加载或分享的第三方自定义主题配色声明（对应 `[[theme.custom_themes]]`）
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomThemePalette {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub author: String,
+    /// 配色基准明暗倾向：light | dark
+    #[serde(default = "default_theme_mode")]
+    pub base_mode: String,
+    /// 窗口外框画布底色 (#rrggbb)
+    #[serde(default)]
+    pub canvas: String,
+    /// 侧栏与会话列表底色 (#rrggbb)
+    #[serde(default)]
+    pub sidebar: String,
+    /// 主界面底色 (#rrggbb)
+    #[serde(default)]
+    pub surface: String,
+    /// 卡片/浮层底色 (#rrggbb，留空自动按色阶推导)
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub card: String,
+    /// 主正文色 (#rrggbb)
+    #[serde(default)]
+    pub ink: String,
+    /// 次级辅助文字色 (#rrggbb，留空自动推导)
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ink_muted: String,
+    /// 模板配套主题色 (#rrggbb，随主题模板自动联动)
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub accent: String,
+}
+
+impl CustomThemePalette {
+    pub fn normalized(&self) -> Option<Self> {
+        let surface = normalize_hex_color(&self.surface)
+            .or_else(|| normalize_hex_color(&self.canvas))?;
+        let canvas = normalize_hex_color(&self.canvas).unwrap_or_else(|| surface.clone());
+        let sidebar = normalize_hex_color(&self.sidebar).unwrap_or_else(|| canvas.clone());
+        let card = normalize_hex_color(&self.card).unwrap_or_default();
+        let base_mode = match self.base_mode.trim().to_lowercase().as_str() {
+            "dark" | "night" | "hc-dark" | "hcdark" => "dark".to_string(),
+            "light" | "day" | "hc-light" | "hclight" => "light".to_string(),
+            _ => {
+                // 按 surface 亮度自动推断明暗基准
+                let r = u8::from_str_radix(&surface[1..3], 16).unwrap_or(255) as u32;
+                let g = u8::from_str_radix(&surface[3..5], 16).unwrap_or(255) as u32;
+                let b = u8::from_str_radix(&surface[5..7], 16).unwrap_or(255) as u32;
+                let luma = (299 * r + 587 * g + 114 * b) / 1000;
+                if luma < 128 {
+                    "dark".to_string()
+                } else {
+                    "light".to_string()
+                }
+            }
+        };
+        let ink = normalize_hex_color(&self.ink).unwrap_or_else(|| {
+            if base_mode == "dark" {
+                "#e6edf7".to_string()
+            } else {
+                "#0f172a".to_string()
+            }
+        });
+        let ink_muted = normalize_hex_color(&self.ink_muted).unwrap_or_default();
+        let accent = normalize_hex_color(&self.accent).unwrap_or_else(|| {
+            if base_mode == "dark" {
+                "#5b85ff".to_string()
+            } else {
+                "#3563e9".to_string()
+            }
+        });
+
+        let raw_name = self.name.trim();
+        let raw_id = self.id.trim();
+        let id = if !raw_id.is_empty() {
+            sanitize_theme_id(raw_id)
+        } else if !raw_name.is_empty() {
+            sanitize_theme_id(raw_name)
+        } else {
+            sanitize_theme_id(&surface)
+        };
+        let name = if !raw_name.is_empty() {
+            raw_name.chars().take(48).collect()
+        } else {
+            id.clone()
+        };
+        let author: String = self.author.trim().chars().take(40).collect();
+
+        Some(Self {
+            id,
+            name,
+            author,
+            base_mode,
+            canvas,
+            sidebar,
+            surface,
+            card,
+            ink,
+            ink_muted,
+            accent,
+        })
+    }
+}
+
+pub fn normalize_builtin_or_community_preset(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_lowercase().as_str() {
+        "mist" | "default" => Some("mist"),
+        "paper" | "warm" | "cream" => Some("paper"),
+        "graphite" | "mono" | "zinc" | "minimal" => Some("graphite"),
+        "forest" | "sage" | "mint" => Some("forest"),
+        "midnight" | "obsidian" | "abyss" => Some("midnight"),
+        // 内置精选社区经典主题配色
+        "nord" => Some("nord"),
+        "catppuccin-latte" | "catppuccin_latte" | "latte" => Some("catppuccin-latte"),
+        "catppuccin-mocha" | "catppuccin_mocha" | "catppuccin" | "mocha" => Some("catppuccin-mocha"),
+        "tokyo-night" | "tokyo_night" | "tokyonight" => Some("tokyo-night"),
+        "dracula" => Some("dracula"),
+        "solarized" | "solarized-light" | "solarized-dark" | "solarized_light" | "solarized_dark" => Some("solarized"),
+        "rose-pine" | "rose_pine" | "rosepine" => Some("rose-pine"),
+        "gruvbox" | "gruvbox-dark" | "gruvbox-light" | "gruvbox_dark" | "gruvbox_light" => Some("gruvbox"),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThemeConfig {
+    /// 外观亮暗模式：light | dark | system
+    #[serde(default = "default_theme_mode")]
+    pub mode: String,
+    /// 主题模板标识：官方模板 / 社区经典模板 / `custom_themes` 中的自定义模板 id（主题色随模板自动联动）
+    #[serde(default = "default_theme_preset")]
+    pub preset: String,
+    /// 界面排版密度：comfortable | compact
+    #[serde(default = "default_theme_density")]
+    pub density: String,
+    /// 全局字号缩放：small | normal | large
+    #[serde(default = "default_theme_font_scale")]
+    pub font_scale: String,
+    /// 已加载的第三方外部主题模板列表
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub custom_themes: Vec<CustomThemePalette>,
+}
+
+impl Default for ThemeConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_theme_mode(),
+            preset: default_theme_preset(),
+            density: default_theme_density(),
+            font_scale: default_theme_font_scale(),
+            custom_themes: Vec::new(),
+        }
+    }
+}
+
+impl ThemeConfig {
+    pub fn normalized(&self) -> Self {
+        let mode = match self.mode.trim().to_lowercase().as_str() {
+            "dark" | "night" => "dark".to_string(),
+            "system" | "auto" | "os" => "system".to_string(),
+            _ => "light".to_string(),
+        };
+
+        let mut custom_themes: Vec<CustomThemePalette> = Vec::new();
+        for item in &self.custom_themes {
+            if let Some(norm) = item.normalized() {
+                if let Some(existing) = custom_themes.iter_mut().find(|x| x.id == norm.id) {
+                    *existing = norm;
+                } else if custom_themes.len() < 32 {
+                    custom_themes.push(norm);
+                }
+            }
+        }
+
+        let raw_preset = self.preset.trim();
+        let slug_preset = sanitize_theme_id(raw_preset);
+        let preset = if let Some(found) = custom_themes.iter().find(|ct| {
+            ct.id.eq_ignore_ascii_case(raw_preset)
+                || ct.id.eq_ignore_ascii_case(&slug_preset)
+                || ct.name.eq_ignore_ascii_case(raw_preset)
+        }) {
+            found.id.clone()
+        } else if let Some(builtin) = normalize_builtin_or_community_preset(raw_preset) {
+            builtin.to_string()
+        } else {
+            "mist".to_string()
+        };
+
+        let density = match self.density.trim().to_lowercase().as_str() {
+            "compact" | "dense" | "tight" => "compact".to_string(),
+            _ => "comfortable".to_string(),
+        };
+
+        let font_scale = match self.font_scale.trim().to_lowercase().as_str() {
+            "small" | "sm" => "small".to_string(),
+            "large" | "lg" | "big" | "xl" => "large".to_string(),
+            _ => "normal".to_string(),
+        };
+
+        Self {
+            mode,
+            preset,
+            density,
+            font_scale,
+            custom_themes,
+        }
+    }
+}
+
+fn default_update_interval_hours() -> u32 {
+    6
+}
+
+fn default_update_channel() -> String {
+    "stable".into()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateConfig {
+    /// 启动后与后台运行时是否自动检查新版本（默认开启）
+    #[serde(default = "default_true")]
+    pub auto_check: bool,
+    /// 发现签名热更新包时是否在后台静默预下载（默认关闭：轻提示用户确认后下载并重启）
+    #[serde(default)]
+    pub auto_download: bool,
+    /// 后台定时检查间隔（小时，取值范围 1 ~ 168，默认 6 小时）
+    #[serde(default = "default_update_interval_hours")]
+    pub check_interval_hours: u32,
+    /// 更新通道：stable（稳定正式版） | beta（含预发布版本）
+    #[serde(default = "default_update_channel")]
+    pub channel: String,
+    /// 用户主动标记跳过的版本号（如 "0.2.2"；手动检查更新时仍会展示）
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub skipped_version: String,
+    /// 自定义更新清单镜像端点（留空则默认使用 GitHub Releases 官方 latest.json）
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub custom_endpoint: String,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            auto_check: true,
+            auto_download: false,
+            check_interval_hours: default_update_interval_hours(),
+            channel: default_update_channel(),
+            skipped_version: String::new(),
+            custom_endpoint: String::new(),
+        }
+    }
+}
+
+impl UpdateConfig {
+    pub fn normalized(&self) -> Self {
+        let check_interval_hours = self.check_interval_hours.clamp(1, 168);
+        let channel = match self.channel.trim().to_lowercase().as_str() {
+            "beta" | "prerelease" | "preview" | "nightly" => "beta".to_string(),
+            _ => "stable".to_string(),
+        };
+        let skipped_version = self
+            .skipped_version
+            .trim()
+            .trim_start_matches(['v', 'V'])
+            .to_string();
+        let raw_ep = self.custom_endpoint.trim();
+        let custom_endpoint = if raw_ep.is_empty() {
+            String::new()
+        } else if raw_ep.starts_with("https://")
+            || (cfg!(debug_assertions) && raw_ep.starts_with("http://"))
+        {
+            raw_ep.to_string()
+        } else {
+            String::new()
+        };
+
+        Self {
+            auto_check: self.auto_check,
+            auto_download: self.auto_download,
+            check_interval_hours,
+            channel,
+            skipped_version,
+            custom_endpoint,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowConfig {
+    /// 点击窗口右上角关闭按钮（×）或系统关闭时是否隐藏到系统托盘（默认 true；false 则直接退出程序）
+    #[serde(default = "default_true")]
+    pub close_to_tray: bool,
+    /// 收到“消息”列表未读新来信且窗口未聚焦/隐藏时，右下角系统托盘图标是否交替闪动提醒
+    #[serde(default = "default_true")]
+    pub tray_flash_on_message: bool,
+    /// 收到“消息”列表未读新来信且窗口在后台/最小化到任务栏时，底部任务栏图标是否高亮闪烁提醒
+    #[serde(default = "default_true")]
+    pub taskbar_flash_on_message: bool,
+}
+
+impl Default for WindowConfig {
+    fn default() -> Self {
+        Self {
+            close_to_tray: true,
+            tray_flash_on_message: true,
+            taskbar_flash_on_message: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rule {
     pub id: i64,
@@ -106,6 +496,7 @@ pub struct MailboxStats {
     pub archived_unread: i64,
     pub blocked_count: i64,
     pub pending_count: i64,
+    pub reply_pending_count: i64,
     pub has_demo: bool,
 }
 
@@ -306,6 +697,82 @@ pub struct NewAgentTurn<'a> {
     pub suggestions: &'a [String],
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplyQueueItem {
+    pub id: i64,
+    pub account_email: String,
+    pub message_id_ref: i64,
+    pub rfc_message_id: String,
+    pub peer: String,
+    pub sender_addr: String,
+    pub sender_name: String,
+    pub original_subject: String,
+    pub original_snippet: String,
+    /// 实际送入外部模型的脱敏后文本快照（供前端「入模脱敏审计视图」100% 透明核验）
+    pub sanitized_input: String,
+    pub redactions: Vec<crate::privacy::RedactionHit>,
+    /// "draft_review" | "whitelisted_auto"
+    pub permission_tier: String,
+    pub permission_reason: String,
+    pub draft_subject: String,
+    pub draft_body: String,
+    pub draft_html: String,
+    pub confidence_note: String,
+    pub dlp_warning: String,
+    /// "pending_review" | "approved_sent" | "auto_sent" | "dismissed" | "failed"
+    pub status: String,
+    pub error_msg: String,
+    pub created_at: i64,
+    pub sent_at: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReplyQueueStats {
+    pub pending_count: i64,
+    pub approved_sent_count: i64,
+    pub auto_sent_count: i64,
+    pub dismissed_count: i64,
+    pub failed_count: i64,
+    pub auto_sent_last_hour: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct CandidateMetaRow {
+    pub message_id_pk: i64,
+    pub account_email: String,
+    pub rfc_message_id: String,
+    pub peer: String,
+    pub from_addr: String,
+    pub from_name: String,
+    pub subject: String,
+    pub status: String,
+    pub category: String,
+    pub extracted_code: String,
+    pub date: i64,
+}
+
+pub struct NewReplyQueueItem<'a> {
+    pub account_email: &'a str,
+    pub message_id_ref: i64,
+    pub rfc_message_id: &'a str,
+    pub peer: &'a str,
+    pub sender_addr: &'a str,
+    pub sender_name: &'a str,
+    pub original_subject: &'a str,
+    pub original_snippet: &'a str,
+    pub sanitized_input: &'a str,
+    pub redactions: &'a [crate::privacy::RedactionHit],
+    pub permission_tier: &'a str,
+    pub permission_reason: &'a str,
+    pub draft_subject: &'a str,
+    pub draft_body: &'a str,
+    pub draft_html: &'a str,
+    pub confidence_note: &'a str,
+    pub dlp_warning: &'a str,
+    pub status: &'a str,
+    pub error_msg: &'a str,
+}
+
 pub fn normalize_members(list: &[GroupMember], exclude_email: &str) -> Vec<GroupMember> {
     let ex = exclude_email.trim().to_lowercase();
     let mut map: BTreeMap<String, String> = BTreeMap::new();
@@ -407,6 +874,7 @@ impl Db {
             );
             CREATE TABLE IF NOT EXISTS agent_sessions (
                 id TEXT PRIMARY KEY,
+                instance_id TEXT NOT NULL DEFAULT 'config',
                 title TEXT NOT NULL DEFAULT '新配置对话',
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
@@ -445,6 +913,14 @@ impl Db {
         );
         let _ = conn.execute(
             "ALTER TABLE agent_turns ADD COLUMN snapshot_toml TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE agent_sessions ADD COLUMN instance_id TEXT NOT NULL DEFAULT 'config'",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_sessions_inst ON agent_sessions(instance_id, updated_at DESC)",
             [],
         );
 
@@ -691,6 +1167,32 @@ impl Db {
                 manual_unread INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (account_email, peer)
             );
+            CREATE TABLE IF NOT EXISTS reply_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_email TEXT NOT NULL DEFAULT '__unbound__',
+                message_id_ref INTEGER NOT NULL,
+                rfc_message_id TEXT NOT NULL DEFAULT '',
+                peer TEXT NOT NULL,
+                sender_addr TEXT NOT NULL,
+                sender_name TEXT NOT NULL DEFAULT '',
+                original_subject TEXT NOT NULL DEFAULT '',
+                original_snippet TEXT NOT NULL DEFAULT '',
+                sanitized_input TEXT NOT NULL DEFAULT '',
+                redactions_json TEXT NOT NULL DEFAULT '[]',
+                permission_tier TEXT NOT NULL DEFAULT 'draft_review',
+                permission_reason TEXT NOT NULL DEFAULT '',
+                draft_subject TEXT NOT NULL DEFAULT '',
+                draft_body TEXT NOT NULL DEFAULT '',
+                draft_html TEXT NOT NULL DEFAULT '',
+                confidence_note TEXT NOT NULL DEFAULT '',
+                dlp_warning TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending_review',
+                error_msg TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL DEFAULT 0,
+                sent_at INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(account_email, message_id_ref)
+            );
+            CREATE INDEX IF NOT EXISTS idx_reply_queue_status ON reply_queue(status, created_at DESC);
             "#,
         )?;
         // 将早期版本滞留在不可见 pending 状态的新邮件立即恢复至 inbox（AI 分拣统一通过 agent_done=0 后台推进）
@@ -988,6 +1490,89 @@ impl Db {
     }
     pub fn save_agent_config(&self, a: &AgentConfig) -> Result<()> {
         self.kv_set("agent", a)
+    }
+
+    /// 读取指定 Agent 实例（`"config"` | `"mail"`）的独立模型配置：
+    /// - `"config"` 实例绑定 `config.toml` 的 `[agent]`（存储于 `kv["agent"]`）；
+    /// - `"mail"` 实例拥有独立的 `kv["mail_agent_config"]`（首次未单独指定时继承 `[agent]`，合并共享自定义 `profiles`，且互不覆盖激活模型）。
+    pub fn instance_agent_config(&self, instance_id: &str) -> Result<AgentConfig> {
+        if normalize_agent_instance(instance_id) == "mail" {
+            let base = self.agent_config()?;
+            if let Some(mut custom) = self.kv_get::<AgentConfig>("mail_agent_config")? {
+                for (k, v) in base.profiles {
+                    custom.profiles.entry(k).or_insert(v);
+                }
+                return Ok(custom);
+            }
+            return Ok(base);
+        }
+        self.agent_config()
+    }
+
+    pub fn save_instance_agent_config(&self, instance_id: &str, a: &AgentConfig) -> Result<()> {
+        if normalize_agent_instance(instance_id) == "mail" {
+            self.kv_set("mail_agent_config", a)
+        } else {
+            self.save_agent_config(a)
+        }
+    }
+
+    pub fn theme_config(&self) -> Result<ThemeConfig> {
+        Ok(self
+            .kv_get::<ThemeConfig>("theme_config")?
+            .unwrap_or_default()
+            .normalized())
+    }
+    pub fn save_theme_config(&self, t: &ThemeConfig) -> Result<()> {
+        self.kv_set("theme_config", &t.normalized())
+    }
+
+    pub fn update_config(&self) -> Result<UpdateConfig> {
+        Ok(self
+            .kv_get::<UpdateConfig>("update_config")?
+            .unwrap_or_default()
+            .normalized())
+    }
+    pub fn save_update_config(&self, u: &UpdateConfig) -> Result<()> {
+        self.kv_set("update_config", &u.normalized())
+    }
+
+    pub fn window_config(&self) -> Result<WindowConfig> {
+        Ok(self
+            .kv_get::<WindowConfig>("window_config")?
+            .unwrap_or_default())
+    }
+    pub fn save_window_config(&self, w: &WindowConfig) -> Result<()> {
+        self.kv_set("window_config", w)
+    }
+
+    pub fn is_unread_inbox_message(&self, id: i64) -> bool {
+        let c = self.0.lock().unwrap();
+        c.query_row(
+            "SELECT 1 FROM messages WHERE id=?1 AND status='inbox' AND read=0 AND outgoing=0",
+            [id],
+            |_| Ok(true),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .unwrap_or(false)
+    }
+
+    pub fn total_real_inbox_unread(&self) -> i64 {
+        let Ok(accounts) = self.list_accounts() else {
+            return 0;
+        };
+        if accounts.is_empty() {
+            return 0;
+        }
+        let Ok(map) = self.unread_counts_by_account() else {
+            return 0;
+        };
+        accounts
+            .iter()
+            .map(|a| map.get(&a.email.trim().to_lowercase()).copied().unwrap_or(0))
+            .sum()
     }
 
     pub fn sync_state_for(&self, account_email: &str, folder: &str) -> Result<(u32, u32)> {
@@ -1612,11 +2197,19 @@ impl Db {
             [&scope],
             |r| r.get(0),
         )?;
+        let reply_pending_count: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM reply_queue WHERE status='pending_review'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
         Ok(MailboxStats {
             inbox_unread: inbox_msg_unread + inbox_manual_unread,
             archived_unread: archived_msg_unread + archived_manual_unread,
             blocked_count,
             pending_count,
+            reply_pending_count,
             has_demo: demo_count > 0,
         })
     }
@@ -2811,15 +3404,21 @@ impl Db {
     }
 
     pub fn list_agent_sessions(&self) -> Result<Vec<AgentSessionSummary>> {
+        self.list_instance_sessions("config")
+    }
+
+    pub fn list_instance_sessions(&self, instance_id: &str) -> Result<Vec<AgentSessionSummary>> {
+        let inst = normalize_agent_instance(instance_id);
         let c = self.0.lock().unwrap();
         let mut st = c.prepare(
             "SELECT s.id, s.title, s.created_at, s.updated_at,
                     (SELECT COUNT(*) FROM agent_turns t WHERE t.session_id = s.id) AS turn_count,
                     COALESCE((SELECT t2.content FROM agent_turns t2 WHERE t2.session_id = s.id ORDER BY t2.id DESC LIMIT 1), '') AS last_content
              FROM agent_sessions s
+             WHERE s.instance_id = ?1
              ORDER BY s.updated_at DESC, s.created_at DESC",
         )?;
-        let rows = st.query_map([], |r| {
+        let rows = st.query_map([inst], |r| {
             let raw_preview: String = r.get(5)?;
             Ok(AgentSessionSummary {
                 id: r.get(0)?,
@@ -2834,17 +3433,28 @@ impl Db {
     }
 
     pub fn create_agent_session(&self, title: Option<&str>) -> Result<AgentSessionSummary> {
+        self.create_instance_session("config", title)
+    }
+
+    pub fn create_instance_session(
+        &self,
+        instance_id: &str,
+        title: Option<&str>,
+    ) -> Result<AgentSessionSummary> {
+        let inst = normalize_agent_instance(instance_id);
+        let default_title = default_instance_session_title(inst);
         let now = chrono::Utc::now().timestamp();
-        let id = format!("ags-{}", uuid::Uuid::new_v4().simple());
+        let prefix = if inst == "mail" { "agm" } else { "ags" };
+        let id = format!("{prefix}-{}", uuid::Uuid::new_v4().simple());
         let clean_title = title
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .unwrap_or("新配置对话")
+            .unwrap_or(default_title)
             .to_string();
         let c = self.0.lock().unwrap();
         c.execute(
-            "INSERT INTO agent_sessions(id, title, created_at, updated_at) VALUES(?1, ?2, ?3, ?4)",
-            params![id, clean_title, now, now],
+            "INSERT INTO agent_sessions(id, instance_id, title, created_at, updated_at) VALUES(?1, ?2, ?3, ?4, ?5)",
+            params![id, inst, clean_title, now, now],
         )?;
         Ok(AgentSessionSummary {
             id,
@@ -2857,29 +3467,69 @@ impl Db {
     }
 
     pub fn ensure_agent_session(&self, session_id: Option<&str>) -> Result<String> {
+        self.ensure_instance_session("config", session_id)
+    }
+
+    /// 确保返回的 `session_id` 严格归属于 `instance_id` 实例；
+    /// 若传入了另一个实例的 `session_id`，自动在当前实例下新建独立会话，彻底杜绝跨实例串话污染。
+    pub fn ensure_instance_session(
+        &self,
+        instance_id: &str,
+        session_id: Option<&str>,
+    ) -> Result<String> {
+        let inst = normalize_agent_instance(instance_id);
+        let default_title = default_instance_session_title(inst);
         if let Some(sid) = session_id.map(str::trim).filter(|s| !s.is_empty()) {
             let now = chrono::Utc::now().timestamp();
-            let c = self.0.lock().unwrap();
-            c.execute(
-                "INSERT OR IGNORE INTO agent_sessions(id, title, created_at, updated_at) VALUES(?1, '新配置对话', ?2, ?3)",
-                params![sid, now, now],
-            )?;
-            return Ok(sid.to_string());
+            let existing_owner: Option<String> = {
+                let c = self.0.lock().unwrap();
+                c.query_row(
+                    "SELECT instance_id FROM agent_sessions WHERE id = ?1",
+                    [sid],
+                    |r| r.get(0),
+                )
+                .optional()?
+            };
+            match existing_owner {
+                Some(owner) if owner == inst => return Ok(sid.to_string()),
+                Some(_) => {
+                    // 传入的会话属于另一个实例，拒绝复用并为本实例创建新会话
+                    return Ok(self.create_instance_session(inst, None)?.id);
+                }
+                None => {
+                    let c = self.0.lock().unwrap();
+                    c.execute(
+                        "INSERT INTO agent_sessions(id, instance_id, title, created_at, updated_at) VALUES(?1, ?2, ?3, ?4, ?5)",
+                        params![sid, inst, default_title, now, now],
+                    )?;
+                    return Ok(sid.to_string());
+                }
+            }
         }
-        Ok(self.create_agent_session(None)?.id)
+        Ok(self.create_instance_session(inst, None)?.id)
     }
 
     pub fn get_agent_session_turns(&self, session_id: &str) -> Result<Vec<AgentTurnRecord>> {
+        self.get_instance_session_turns("config", session_id)
+    }
+
+    pub fn get_instance_session_turns(
+        &self,
+        instance_id: &str,
+        session_id: &str,
+    ) -> Result<Vec<AgentTurnRecord>> {
+        let inst = normalize_agent_instance(instance_id);
         let c = self.0.lock().unwrap();
         let mut st = c.prepare(
-            "SELECT id, session_id, role, content, thinking, thinking_ms,
-                    tool_steps_json, changes_json, config_diff_json, snapshot_toml,
-                    secret_prompts_json, suggestions_json, created_at
-             FROM agent_turns
-             WHERE session_id = ?1
-             ORDER BY id ASC",
+            "SELECT t.id, t.session_id, t.role, t.content, t.thinking, t.thinking_ms,
+                    t.tool_steps_json, t.changes_json, t.config_diff_json, t.snapshot_toml,
+                    t.secret_prompts_json, t.suggestions_json, t.created_at
+             FROM agent_turns t
+             INNER JOIN agent_sessions s ON s.id = t.session_id
+             WHERE t.session_id = ?1 AND s.instance_id = ?2
+             ORDER BY t.id ASC",
         )?;
-        let rows = st.query_map([session_id], |r| {
+        let rows = st.query_map(params![session_id, inst], |r| {
             let tool_steps_raw: String = r.get(6)?;
             let changes_raw: String = r.get(7)?;
             let config_diff_raw: String = r.get(8)?;
@@ -2911,6 +3561,12 @@ impl Db {
     }
 
     pub fn append_agent_turn(&self, turn: &NewAgentTurn<'_>) -> Result<i64> {
+        self.append_instance_turn("config", turn)
+    }
+
+    pub fn append_instance_turn(&self, instance_id: &str, turn: &NewAgentTurn<'_>) -> Result<i64> {
+        let inst = normalize_agent_instance(instance_id);
+        let default_title = default_instance_session_title(inst);
         let now = chrono::Utc::now().timestamp();
         let tool_steps_json = serde_json::to_string(turn.tool_steps)?;
         let changes_json = serde_json::to_string(turn.changes)?;
@@ -2923,8 +3579,8 @@ impl Db {
 
         let c = self.0.lock().unwrap();
         c.execute(
-            "INSERT OR IGNORE INTO agent_sessions(id, title, created_at, updated_at) VALUES(?1, '新配置对话', ?2, ?3)",
-            params![turn.session_id, now, now],
+            "INSERT OR IGNORE INTO agent_sessions(id, instance_id, title, created_at, updated_at) VALUES(?1, ?2, ?3, ?4, ?5)",
+            params![turn.session_id, inst, default_title, now, now],
         )?;
         c.execute(
             "INSERT INTO agent_turns(
@@ -2952,14 +3608,17 @@ impl Db {
         if turn.role == "user" {
             let existing_title: Option<String> = c
                 .query_row(
-                    "SELECT title FROM agent_sessions WHERE id=?1",
-                    [turn.session_id],
+                    "SELECT title FROM agent_sessions WHERE id=?1 AND instance_id=?2",
+                    params![turn.session_id, inst],
                     |r| r.get(0),
                 )
                 .optional()?;
             if existing_title
                 .as_deref()
-                .map(|t| t.trim().is_empty() || t == "新配置对话")
+                .map(|t| {
+                    let tr = t.trim();
+                    tr.is_empty() || tr == "新配置对话" || tr == "新邮件对话"
+                })
                 .unwrap_or(true)
             {
                 let single_line = turn.content.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -2972,25 +3631,25 @@ impl Db {
                         short
                     };
                     c.execute(
-                        "UPDATE agent_sessions SET title=?1, updated_at=?2 WHERE id=?3",
-                        params![next_title, now, turn.session_id],
+                        "UPDATE agent_sessions SET title=?1, updated_at=?2 WHERE id=?3 AND instance_id=?4",
+                        params![next_title, now, turn.session_id, inst],
                     )?;
                 } else {
                     c.execute(
-                        "UPDATE agent_sessions SET updated_at=?1 WHERE id=?2",
-                        params![now, turn.session_id],
+                        "UPDATE agent_sessions SET updated_at=?1 WHERE id=?2 AND instance_id=?3",
+                        params![now, turn.session_id, inst],
                     )?;
                 }
             } else {
                 c.execute(
-                    "UPDATE agent_sessions SET updated_at=?1 WHERE id=?2",
-                    params![now, turn.session_id],
+                    "UPDATE agent_sessions SET updated_at=?1 WHERE id=?2 AND instance_id=?3",
+                    params![now, turn.session_id, inst],
                 )?;
             }
         } else {
             c.execute(
-                "UPDATE agent_sessions SET updated_at=?1 WHERE id=?2",
-                params![now, turn.session_id],
+                "UPDATE agent_sessions SET updated_at=?1 WHERE id=?2 AND instance_id=?3",
+                params![now, turn.session_id, inst],
             )?;
         }
 
@@ -2998,27 +3657,75 @@ impl Db {
     }
 
     pub fn delete_agent_session(&self, session_id: &str) -> Result<()> {
+        self.delete_instance_session("config", session_id)
+    }
+
+    pub fn delete_instance_session(&self, instance_id: &str, session_id: &str) -> Result<()> {
+        let inst = normalize_agent_instance(instance_id);
         let c = self.0.lock().unwrap();
-        c.execute("DELETE FROM agent_turns WHERE session_id=?1", [session_id])?;
-        c.execute("DELETE FROM agent_sessions WHERE id=?1", [session_id])?;
+        let owned: bool = c.query_row(
+            "SELECT COUNT(*) > 0 FROM agent_sessions WHERE id=?1 AND instance_id=?2",
+            params![session_id, inst],
+            |r| r.get(0),
+        )?;
+        if owned {
+            c.execute("DELETE FROM agent_turns WHERE session_id=?1", [session_id])?;
+            c.execute(
+                "DELETE FROM agent_sessions WHERE id=?1 AND instance_id=?2",
+                params![session_id, inst],
+            )?;
+        }
         Ok(())
     }
 
     pub fn clear_agent_session_turns(&self, session_id: &str) -> Result<()> {
+        self.clear_instance_session_turns("config", session_id)
+    }
+
+    pub fn clear_instance_session_turns(&self, instance_id: &str, session_id: &str) -> Result<()> {
+        let inst = normalize_agent_instance(instance_id);
+        let default_title = default_instance_session_title(inst);
         let now = chrono::Utc::now().timestamp();
         let c = self.0.lock().unwrap();
-        c.execute("DELETE FROM agent_turns WHERE session_id=?1", [session_id])?;
-        c.execute(
-            "UPDATE agent_sessions SET title='新配置对话', updated_at=?1 WHERE id=?2",
-            params![now, session_id],
+        let owned: bool = c.query_row(
+            "SELECT COUNT(*) > 0 FROM agent_sessions WHERE id=?1 AND instance_id=?2",
+            params![session_id, inst],
+            |r| r.get(0),
         )?;
+        if owned {
+            c.execute("DELETE FROM agent_turns WHERE session_id=?1", [session_id])?;
+            c.execute(
+                "UPDATE agent_sessions SET title=?1, updated_at=?2 WHERE id=?3 AND instance_id=?4",
+                params![default_title, now, session_id, inst],
+            )?;
+        }
         Ok(())
     }
 
     /// 回退指定配置对话至某条消息之前（删除 id >= from_turn_id 的所有消息），并返回该检查点前的脱敏 config.toml 快照
     pub fn rewind_agent_session(&self, session_id: &str, from_turn_id: i64) -> Result<Option<String>> {
+        self.rewind_instance_session("config", session_id, from_turn_id)
+    }
+
+    pub fn rewind_instance_session(
+        &self,
+        instance_id: &str,
+        session_id: &str,
+        from_turn_id: i64,
+    ) -> Result<Option<String>> {
+        let inst = normalize_agent_instance(instance_id);
+        let default_title = default_instance_session_title(inst);
         let now = chrono::Utc::now().timestamp();
         let c = self.0.lock().unwrap();
+
+        let owned: bool = c.query_row(
+            "SELECT COUNT(*) > 0 FROM agent_sessions WHERE id=?1 AND instance_id=?2",
+            params![session_id, inst],
+            |r| r.get(0),
+        )?;
+        if !owned {
+            return Ok(None);
+        }
 
         let mut st = c.prepare(
             "SELECT snapshot_toml, config_diff_json
@@ -3034,21 +3741,23 @@ impl Db {
         drop(st);
 
         let mut rollback_toml: Option<String> = None;
-        for (snap, _) in &candidates {
-            if !snap.trim().is_empty() {
-                rollback_toml = Some(snap.clone());
-                break;
-            }
-        }
-        if rollback_toml.is_none() {
-            for (_, diff_raw) in &candidates {
-                if diff_raw.trim().is_empty() {
-                    continue;
+        if inst == "config" {
+            for (snap, _) in &candidates {
+                if !snap.trim().is_empty() {
+                    rollback_toml = Some(snap.clone());
+                    break;
                 }
-                if let Ok(diff) = serde_json::from_str::<crate::config::ConfigDiffReport>(diff_raw) {
-                    if !diff.before_toml.trim().is_empty() {
-                        rollback_toml = Some(diff.before_toml);
-                        break;
+            }
+            if rollback_toml.is_none() {
+                for (_, diff_raw) in &candidates {
+                    if diff_raw.trim().is_empty() {
+                        continue;
+                    }
+                    if let Ok(diff) = serde_json::from_str::<crate::config::ConfigDiffReport>(diff_raw) {
+                        if !diff.before_toml.trim().is_empty() {
+                            rollback_toml = Some(diff.before_toml);
+                            break;
+                        }
                     }
                 }
             }
@@ -3066,13 +3775,13 @@ impl Db {
         )?;
         if remaining == 0 {
             c.execute(
-                "UPDATE agent_sessions SET title = '新配置对话', updated_at = ?1 WHERE id = ?2",
-                params![now, session_id],
+                "UPDATE agent_sessions SET title = ?1, updated_at = ?2 WHERE id = ?3 AND instance_id = ?4",
+                params![default_title, now, session_id, inst],
             )?;
         } else {
             c.execute(
-                "UPDATE agent_sessions SET updated_at = ?1 WHERE id = ?2",
-                params![now, session_id],
+                "UPDATE agent_sessions SET updated_at = ?1 WHERE id = ?2 AND instance_id = ?3",
+                params![now, session_id, inst],
             )?;
         }
 
@@ -3159,6 +3868,414 @@ impl Db {
         }
         Ok(updated)
     }
+
+    // ── 跨邮箱统一回复：声明式隐私权限策略与待审回复队列 ──────────────────
+
+    pub fn reply_policy(&self) -> Result<crate::privacy::ReplyPolicySpec> {
+        let raw = self
+            .kv_get::<crate::privacy::ReplyPolicySpec>("reply_policy")?
+            .unwrap_or_default();
+        Ok(crate::privacy::normalize_policy(&raw))
+    }
+
+    pub fn save_reply_policy(&self, policy: &crate::privacy::ReplyPolicySpec) -> Result<()> {
+        let norm = crate::privacy::normalize_policy(policy);
+        self.kv_set("reply_policy", &norm)
+    }
+
+    /// 第一阶段零信任元数据扫描：仅提取指定账号集合内「最后一封消息为对方来信」的元数据，绝不在准入前加载邮件完整正文
+    pub fn unanswered_candidate_metas(
+        &self,
+        scopes: &[String],
+        include_dismissed: bool,
+        limit_total: usize,
+    ) -> Result<Vec<CandidateMetaRow>> {
+        if scopes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let c = self.0.lock().unwrap();
+        let mut out = Vec::new();
+        for raw_scope in scopes {
+            let sc = scope_key(raw_scope);
+            let sql = if include_dismissed {
+                r#"
+                SELECT m.id, m.account_email, m.message_id, m.peer, m.from_addr, m.from_name,
+                       m.subject, m.status, m.category, m.extracted_code, m.date
+                FROM messages m
+                INNER JOIN (
+                    SELECT peer, MAX(date * 1000000 + id) AS max_ord
+                    FROM messages
+                    WHERE account_email = ?1
+                    GROUP BY peer
+                ) latest ON m.peer = latest.peer AND (m.date * 1000000 + m.id) = latest.max_ord
+                WHERE m.account_email = ?1
+                  AND m.outgoing = 0
+                  AND NOT EXISTS (
+                      SELECT 1 FROM reply_queue rq
+                      WHERE rq.account_email = m.account_email
+                        AND rq.message_id_ref = m.id
+                        AND rq.status IN ('pending_review', 'approved_sent', 'auto_sent')
+                  )
+                ORDER BY m.date DESC, m.id DESC
+                LIMIT 30
+                "#
+            } else {
+                r#"
+                SELECT m.id, m.account_email, m.message_id, m.peer, m.from_addr, m.from_name,
+                       m.subject, m.status, m.category, m.extracted_code, m.date
+                FROM messages m
+                INNER JOIN (
+                    SELECT peer, MAX(date * 1000000 + id) AS max_ord
+                    FROM messages
+                    WHERE account_email = ?1
+                    GROUP BY peer
+                ) latest ON m.peer = latest.peer AND (m.date * 1000000 + m.id) = latest.max_ord
+                WHERE m.account_email = ?1
+                  AND m.outgoing = 0
+                  AND NOT EXISTS (
+                      SELECT 1 FROM reply_queue rq
+                      WHERE rq.account_email = m.account_email
+                        AND rq.message_id_ref = m.id
+                        AND rq.status IN ('pending_review', 'approved_sent', 'auto_sent', 'dismissed')
+                  )
+                ORDER BY m.date DESC, m.id DESC
+                LIMIT 30
+                "#
+            };
+            let mut st = c.prepare(sql)?;
+            let rows = st.query_map([&sc], |r| {
+                Ok(CandidateMetaRow {
+                    message_id_pk: r.get(0)?,
+                    account_email: r.get(1)?,
+                    rfc_message_id: r.get(2)?,
+                    peer: r.get(3)?,
+                    from_addr: r.get(4)?,
+                    from_name: r.get(5)?,
+                    subject: r.get(6)?,
+                    status: r.get(7)?,
+                    category: r.get(8)?,
+                    extracted_code: r.get(9)?,
+                    date: r.get(10)?,
+                })
+            })?;
+            for item in rows {
+                out.push(item?);
+            }
+        }
+        out.sort_by(|a, b| b.date.cmp(&a.date));
+        out.truncate(limit_total.max(1));
+        Ok(out)
+    }
+
+    /// 仅对已通过第一道隐私准入校验的邮件读取去噪正文（按字符上限截断）
+    pub fn load_stripped_body_by_id(&self, message_id_pk: i64, max_chars: usize) -> Result<String> {
+        let c = self.0.lock().unwrap();
+        let pair: Option<(String, String)> = c
+            .query_row(
+                "SELECT body, body_full FROM messages WHERE id=?1",
+                [message_id_pk],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((body, body_full)) = pair else {
+            return Ok(String::new());
+        };
+        let src = if !body.trim().is_empty() {
+            body
+        } else {
+            crate::mail::clean_body(&body_full)
+        };
+        let cap = max_chars.clamp(120, 8000);
+        let total = src.chars().count();
+        if total <= cap {
+            Ok(src)
+        } else {
+            let head: String = src.chars().take(cap).collect();
+            Ok(format!("{head}\n…（已按隐私长度策略截断，仅读取前 {cap} 字）"))
+        }
+    }
+
+    pub fn upsert_reply_queue_item(&self, item: &NewReplyQueueItem<'_>) -> Result<i64> {
+        let now = chrono::Utc::now().timestamp();
+        let redactions_json = serde_json::to_string(item.redactions)?;
+        let sent_at = if item.status == "auto_sent" || item.status == "approved_sent" {
+            now
+        } else {
+            0
+        };
+        let c = self.0.lock().unwrap();
+        c.execute(
+            r#"
+            INSERT INTO reply_queue (
+                account_email, message_id_ref, rfc_message_id, peer, sender_addr, sender_name,
+                original_subject, original_snippet, sanitized_input, redactions_json,
+                permission_tier, permission_reason, draft_subject, draft_body, draft_html,
+                confidence_note, dlp_warning, status, error_msg, created_at, sent_at
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6,
+                ?7, ?8, ?9, ?10,
+                ?11, ?12, ?13, ?14, ?15,
+                ?16, ?17, ?18, ?19, ?20, ?21
+            )
+            ON CONFLICT(account_email, message_id_ref) DO UPDATE SET
+                sanitized_input = excluded.sanitized_input,
+                redactions_json = excluded.redactions_json,
+                permission_tier = excluded.permission_tier,
+                permission_reason = excluded.permission_reason,
+                draft_subject = excluded.draft_subject,
+                draft_body = excluded.draft_body,
+                draft_html = excluded.draft_html,
+                confidence_note = excluded.confidence_note,
+                dlp_warning = excluded.dlp_warning,
+                status = excluded.status,
+                error_msg = excluded.error_msg,
+                created_at = excluded.created_at,
+                sent_at = excluded.sent_at
+            "#,
+            params![
+                scope_key(item.account_email),
+                item.message_id_ref,
+                item.rfc_message_id,
+                item.peer,
+                item.sender_addr,
+                item.sender_name,
+                item.original_subject,
+                item.original_snippet,
+                item.sanitized_input,
+                redactions_json,
+                item.permission_tier,
+                item.permission_reason,
+                item.draft_subject,
+                item.draft_body,
+                item.draft_html,
+                item.confidence_note,
+                item.dlp_warning,
+                item.status,
+                item.error_msg,
+                now,
+                sent_at
+            ],
+        )?;
+        let id: i64 = c.query_row(
+            "SELECT id FROM reply_queue WHERE account_email=?1 AND message_id_ref=?2",
+            params![scope_key(item.account_email), item.message_id_ref],
+            |r| r.get(0),
+        )?;
+        Ok(id)
+    }
+
+    pub fn list_reply_queue(
+        &self,
+        status_filter: Option<&str>,
+        account_filter: Option<&str>,
+    ) -> Result<Vec<ReplyQueueItem>> {
+        let c = self.0.lock().unwrap();
+        let mut st = c.prepare(
+            r#"
+            SELECT id, account_email, message_id_ref, rfc_message_id, peer, sender_addr, sender_name,
+                   original_subject, original_snippet, sanitized_input, redactions_json,
+                   permission_tier, permission_reason, draft_subject, draft_body, draft_html,
+                   confidence_note, dlp_warning, status, error_msg, created_at, sent_at
+            FROM reply_queue
+            ORDER BY
+                CASE WHEN status = 'pending_review' THEN 0 WHEN status = 'failed' THEN 1 ELSE 2 END ASC,
+                created_at DESC, id DESC
+            LIMIT 200
+            "#,
+        )?;
+        let sf = status_filter.map(str::trim).filter(|s| !s.is_empty() && *s != "all");
+        let af = account_filter
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "all")
+            .map(scope_key);
+
+        let rows = st.query_map([], row_to_reply_queue_item)?;
+        let mut list = Vec::new();
+        for r in rows {
+            let item = r?;
+            if let Some(target_st) = sf {
+                if target_st == "sent" {
+                    if item.status != "approved_sent" && item.status != "auto_sent" {
+                        continue;
+                    }
+                } else if item.status != target_st {
+                    continue;
+                }
+            }
+            if let Some(ref target_acc) = af {
+                if &item.account_email != target_acc {
+                    continue;
+                }
+            }
+            list.push(item);
+        }
+        Ok(list)
+    }
+
+    pub fn get_reply_queue_item(&self, id: i64) -> Result<Option<ReplyQueueItem>> {
+        let c = self.0.lock().unwrap();
+        c.query_row(
+            r#"
+            SELECT id, account_email, message_id_ref, rfc_message_id, peer, sender_addr, sender_name,
+                   original_subject, original_snippet, sanitized_input, redactions_json,
+                   permission_tier, permission_reason, draft_subject, draft_body, draft_html,
+                   confidence_note, dlp_warning, status, error_msg, created_at, sent_at
+            FROM reply_queue
+            WHERE id = ?1
+            "#,
+            [id],
+            row_to_reply_queue_item,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn update_reply_queue_draft(
+        &self,
+        id: i64,
+        draft_subject: &str,
+        draft_body: &str,
+        draft_html: &str,
+        dlp_warning: &str,
+    ) -> Result<Option<ReplyQueueItem>> {
+        {
+            let c = self.0.lock().unwrap();
+            c.execute(
+                r#"
+                UPDATE reply_queue
+                SET draft_subject = ?2,
+                    draft_body = ?3,
+                    draft_html = ?4,
+                    dlp_warning = ?5,
+                    error_msg = CASE WHEN status = 'failed' THEN '' ELSE error_msg END,
+                    status = CASE WHEN status = 'failed' THEN 'pending_review' ELSE status END
+                WHERE id = ?1
+                "#,
+                params![id, draft_subject, draft_body, draft_html, dlp_warning],
+            )?;
+        }
+        self.get_reply_queue_item(id)
+    }
+
+    pub fn mark_reply_queue_status(&self, id: i64, status: &str, error_msg: &str) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let sent_at = if status == "approved_sent" || status == "auto_sent" {
+            now
+        } else {
+            0
+        };
+        let c = self.0.lock().unwrap();
+        c.execute(
+            "UPDATE reply_queue SET status=?2, error_msg=?3, sent_at=CASE WHEN ?4 > 0 THEN ?4 ELSE sent_at END WHERE id=?1",
+            params![id, status, error_msg, sent_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_finished_reply_queue(&self) -> Result<usize> {
+        let c = self.0.lock().unwrap();
+        Ok(c.execute(
+            "DELETE FROM reply_queue WHERE status IN ('approved_sent', 'auto_sent', 'dismissed')",
+            [],
+        )?)
+    }
+
+    pub fn reply_queue_stats(&self) -> Result<ReplyQueueStats> {
+        let hour_ago = chrono::Utc::now().timestamp() - 3600;
+        let c = self.0.lock().unwrap();
+        let pending_count: i64 = c.query_row(
+            "SELECT COUNT(*) FROM reply_queue WHERE status='pending_review'",
+            [],
+            |r| r.get(0),
+        )?;
+        let approved_sent_count: i64 = c.query_row(
+            "SELECT COUNT(*) FROM reply_queue WHERE status='approved_sent'",
+            [],
+            |r| r.get(0),
+        )?;
+        let auto_sent_count: i64 = c.query_row(
+            "SELECT COUNT(*) FROM reply_queue WHERE status='auto_sent'",
+            [],
+            |r| r.get(0),
+        )?;
+        let dismissed_count: i64 = c.query_row(
+            "SELECT COUNT(*) FROM reply_queue WHERE status='dismissed'",
+            [],
+            |r| r.get(0),
+        )?;
+        let failed_count: i64 = c.query_row(
+            "SELECT COUNT(*) FROM reply_queue WHERE status='failed'",
+            [],
+            |r| r.get(0),
+        )?;
+        let auto_sent_last_hour: i64 = c.query_row(
+            "SELECT COUNT(*) FROM reply_queue WHERE status='auto_sent' AND sent_at >= ?1",
+            [hour_ago],
+            |r| r.get(0),
+        )?;
+        Ok(ReplyQueueStats {
+            pending_count,
+            approved_sent_count,
+            auto_sent_count,
+            dismissed_count,
+            failed_count,
+            auto_sent_last_hour: auto_sent_last_hour.max(0) as usize,
+        })
+    }
+
+    /// 防死循环冷却检查：判断某账号是否在最近 `within_minutes` 分钟内已向同一发件人自动回复过
+    pub fn has_recent_auto_reply_to_sender(
+        &self,
+        account_email: &str,
+        sender_addr: &str,
+        within_minutes: u32,
+    ) -> Result<bool> {
+        let mins = within_minutes.clamp(1, 10_080) as i64;
+        let cutoff = chrono::Utc::now().timestamp() - mins * 60;
+        let scope = scope_key(account_email);
+        let sender_norm = sender_addr.trim().to_lowercase();
+        let c = self.0.lock().unwrap();
+        let cnt: i64 = c.query_row(
+            "SELECT COUNT(*) FROM reply_queue WHERE account_email=?1 AND LOWER(sender_addr)=?2 AND status='auto_sent' AND sent_at >= ?3",
+            params![scope, sender_norm, cutoff],
+            |r| r.get(0),
+        )?;
+        Ok(cnt > 0)
+    }
+}
+
+fn row_to_reply_queue_item(r: &rusqlite::Row) -> rusqlite::Result<ReplyQueueItem> {
+    let red_raw: String = r.get(10).unwrap_or_default();
+    let redactions: Vec<crate::privacy::RedactionHit> =
+        if red_raw.trim().is_empty() || red_raw.trim() == "[]" {
+            Vec::new()
+        } else {
+            serde_json::from_str(&red_raw).unwrap_or_default()
+        };
+    Ok(ReplyQueueItem {
+        id: r.get(0)?,
+        account_email: r.get(1)?,
+        message_id_ref: r.get(2)?,
+        rfc_message_id: r.get(3)?,
+        peer: r.get(4)?,
+        sender_addr: r.get(5)?,
+        sender_name: r.get(6)?,
+        original_subject: r.get(7)?,
+        original_snippet: r.get(8)?,
+        sanitized_input: r.get(9)?,
+        redactions,
+        permission_tier: r.get(11)?,
+        permission_reason: r.get(12)?,
+        draft_subject: r.get(13)?,
+        draft_body: r.get(14)?,
+        draft_html: r.get(15)?,
+        confidence_note: r.get(16)?,
+        dlp_warning: r.get(17)?,
+        status: r.get(18)?,
+        error_msg: r.get(19)?,
+        created_at: r.get(20)?,
+        sent_at: r.get(21)?,
+    })
 }
 
 fn normalize_single_attachment(item: &mut AttachmentMeta, idx: usize) {

@@ -1,8 +1,11 @@
 //! 声明式配置引擎（config.toml）：
-//! - 非敏感业务配置（邮箱服务器、模型选择与指令、确定性分流规则、群聊拓扑）全部统一为人类与 Agent 均可读写的 TOML 声明式配置。
+//! - 非敏感业务配置（邮箱服务器、模型选择与指令、界面主题外观、确定性分流规则、群聊拓扑）全部统一为人类与 Agent 均可读写的 TOML 声明式配置。
 //! - 密码与 API Key 绝不落入 config.toml，仅通过 `secret:<key>` 引用本地 DPAPI 隐私保险箱。
 
-use crate::db::{Account, AgentConfig, Db, GroupMember, ProviderProfile};
+use crate::db::{
+    Account, AgentConfig, CustomThemePalette, Db, GroupMember, ProviderProfile, ThemeConfig,
+    UpdateConfig, WindowConfig,
+};
 use crate::vault::{llm_secret_key, mail_secret_key, secret_label, Vault};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -11,11 +14,11 @@ use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ConfigDiffItem {
-    /// 模块标识: "accounts" | "agent" | "triage" | "groups" | "vault"
+    /// 模块标识: "accounts" | "agent" | "theme" | "triage" | "groups" | "vault"
     pub section: String,
     /// 模块中文标题
     pub section_label: String,
-    /// 可视化表单锚点标识，如 "account:wokao@111.com" / "agent.model" / "triage.block_keywords"
+    /// 可视化表单锚点标识，如 "account:wokao@111.com" / "agent.model" / "theme.mode" / "triage.block_keywords"
     pub target_key: String,
     /// 变更类型: "added" | "modified" | "removed"
     pub kind: String,
@@ -49,7 +52,15 @@ pub struct DeclarativeConfig {
     #[serde(default)]
     pub agent: AgentSpec,
     #[serde(default)]
+    pub theme: ThemeConfig,
+    #[serde(default)]
+    pub window: WindowConfig,
+    #[serde(default)]
+    pub update: UpdateConfig,
+    #[serde(default)]
     pub triage: TriageSpec,
+    #[serde(default, skip_serializing_if = "crate::privacy::ReplyPolicySpec::is_default_like")]
+    pub reply_policy: crate::privacy::ReplyPolicySpec,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<GroupSpec>,
 }
@@ -344,7 +355,13 @@ pub fn hydrated_account(db: &Db, vault: &Vault) -> Result<Option<Account>> {
 
 /// 组装供大模型调用使用的完整 AgentConfig（从隐私保险箱注入对应服务商 API Key）
 pub fn hydrated_agent(db: &Db, vault: &Vault) -> Result<AgentConfig> {
-    let mut cfg = db.agent_config()?;
+    hydrated_instance_agent(db, vault, "config")
+}
+
+/// 按 Agent 实例（`"config"` 声明式配置实例 / `"mail"` 邮件处理实例）组装各自独立的模型运行配置，
+/// 同时安全复用本地 DPAPI `Vault` 中的服务商密钥，无需重复录入 API Key。
+pub fn hydrated_instance_agent(db: &Db, vault: &Vault, instance_id: &str) -> Result<AgentConfig> {
+    let mut cfg = db.instance_agent_config(instance_id)?;
     cfg.api_key = llm_secret_key(&cfg.preset)
         .and_then(|k| vault.get(k))
         .unwrap_or_default();
@@ -422,6 +439,11 @@ pub fn build_spec(db: &Db) -> Result<DeclarativeConfig> {
         }
     }
 
+    let theme = db.theme_config()?;
+    let window = db.window_config().unwrap_or_default();
+    let update = db.update_config().unwrap_or_default();
+    let reply_policy = db.reply_policy().unwrap_or_default();
+
     let groups = db
         .list_groups()?
         .into_iter()
@@ -438,7 +460,11 @@ pub fn build_spec(db: &Db) -> Result<DeclarativeConfig> {
         accounts,
         account: None,
         agent,
+        theme,
+        window,
+        update,
         triage,
+        reply_policy,
         groups,
     })
 }
@@ -617,6 +643,15 @@ pub fn apply_spec(app_dir: &Path, spec: &DeclarativeConfig, db: &Db, vault: &Vau
         profiles,
     })?;
 
+    // 2.5 界面主题外观声明
+    db.save_theme_config(&spec.theme)?;
+
+    // 2.55 窗口关闭与系统托盘闪烁提醒声明
+    db.save_window_config(&spec.window)?;
+
+    // 2.6 客户端自动更新策略声明
+    db.save_update_config(&spec.update)?;
+
     // 3. 确定性分流规则声明
     let mut flat_rules: Vec<(String, String)> = Vec::new();
     for s in &spec.triage.allow_senders {
@@ -638,6 +673,9 @@ pub fn apply_spec(app_dir: &Path, spec: &DeclarativeConfig, db: &Db, vault: &Vau
         flat_rules.push(("archive_keyword".into(), s.clone()));
     }
     db.replace_rules(&flat_rules)?;
+
+    // 3.5 跨邮箱统一回复与隐私权限策略声明
+    db.save_reply_policy(&spec.reply_policy)?;
 
     // 4. 当前激活账号的群聊声明对账
     let me = if active_email.is_empty() {
@@ -669,6 +707,57 @@ pub fn apply_spec(app_dir: &Path, spec: &DeclarativeConfig, db: &Db, vault: &Vau
     }
 
     sync_disk_toml(app_dir, db)
+}
+
+pub fn theme_mode_label(mode: &str) -> &'static str {
+    match mode.trim().to_lowercase().as_str() {
+        "dark" | "night" => "深色模式",
+        "system" | "auto" | "os" => "跟随系统",
+        _ => "浅色模式",
+    }
+}
+
+pub fn theme_preset_label_with_custom(preset: &str, custom_themes: &[CustomThemePalette]) -> String {
+    let clean = preset.trim();
+    if let Some(ct) = custom_themes
+        .iter()
+        .find(|x| x.id.eq_ignore_ascii_case(clean) || x.name.eq_ignore_ascii_case(clean))
+    {
+        return format!("外部主题模板「{}」({})", ct.name, ct.id);
+    }
+    match clean.to_lowercase().as_str() {
+        "paper" | "warm" | "cream" => "暖杏纸感 (paper)".into(),
+        "graphite" | "mono" | "zinc" | "minimal" => "极简石墨 (graphite)".into(),
+        "forest" | "sage" | "mint" => "松石青雾 (forest)".into(),
+        "midnight" | "obsidian" | "abyss" => "深空暗夜 (midnight)".into(),
+        "nord" => "社区模板 · 极地冰川 (nord)".into(),
+        "catppuccin-latte" | "catppuccin_latte" | "latte" => "社区模板 · 暖奶拿铁 (catppuccin-latte)".into(),
+        "catppuccin-mocha" | "catppuccin_mocha" | "catppuccin" | "mocha" => {
+            "社区模板 · 摩卡暗夜 (catppuccin-mocha)".into()
+        }
+        "tokyo-night" | "tokyo_night" | "tokyonight" => "社区模板 · 东京暗夜 (tokyo-night)".into(),
+        "dracula" => "社区模板 · 德古拉 (dracula)".into(),
+        "solarized" | "solarized-light" | "solarized-dark" => "社区模板 · 护眼经典 (solarized)".into(),
+        "rose-pine" | "rose_pine" | "rosepine" => "社区模板 · 玫瑰松木 (rose-pine)".into(),
+        "gruvbox" | "gruvbox-dark" | "gruvbox-light" => "社区模板 · 复古暖棕 (gruvbox)".into(),
+        "mist" | "" => "清透雾蓝 (mist)".into(),
+        other => format!("自定义主题模板 ({other})"),
+    }
+}
+
+pub fn theme_density_label(density: &str) -> &'static str {
+    match density.trim().to_lowercase().as_str() {
+        "compact" | "dense" | "tight" => "紧凑高效 (compact)",
+        _ => "舒适标准 (comfortable)",
+    }
+}
+
+pub fn theme_font_scale_label(font_scale: &str) -> &'static str {
+    match font_scale.trim().to_lowercase().as_str() {
+        "small" | "sm" => "紧凑小号 (small)",
+        "large" | "lg" | "big" | "xl" => "清晰大号 (large)",
+        _ => "标准适中 (normal)",
+    }
 }
 
 fn preset_readable_name(preset: &str) -> &'static str {
@@ -1012,6 +1101,90 @@ pub fn diff_specs(
         });
     }
 
+    // 2.5 界面主题与模板对比
+    let bt = before.theme.normalized();
+    let at = after.theme.normalized();
+    if bt.mode != at.mode {
+        items.push(ConfigDiffItem {
+            section: "theme".into(),
+            section_label: "界面主题".into(),
+            target_key: "theme.mode".into(),
+            kind: "modified".into(),
+            field_label: "外观亮暗模式".into(),
+            before: theme_mode_label(&bt.mode).into(),
+            after: theme_mode_label(&at.mode).into(),
+        });
+    }
+    if bt.preset != at.preset {
+        items.push(ConfigDiffItem {
+            section: "theme".into(),
+            section_label: "界面主题".into(),
+            target_key: "theme.preset".into(),
+            kind: "modified".into(),
+            field_label: "主题模板".into(),
+            before: theme_preset_label_with_custom(&bt.preset, &bt.custom_themes),
+            after: theme_preset_label_with_custom(&at.preset, &at.custom_themes),
+        });
+    }
+    if bt.density != at.density {
+        items.push(ConfigDiffItem {
+            section: "theme".into(),
+            section_label: "界面主题".into(),
+            target_key: "theme.density".into(),
+            kind: "modified".into(),
+            field_label: "界面排版密度".into(),
+            before: theme_density_label(&bt.density).into(),
+            after: theme_density_label(&at.density).into(),
+        });
+    }
+    if bt.font_scale != at.font_scale {
+        items.push(ConfigDiffItem {
+            section: "theme".into(),
+            section_label: "界面主题".into(),
+            target_key: "theme.font_scale".into(),
+            kind: "modified".into(),
+            field_label: "全局字号缩放".into(),
+            before: theme_font_scale_label(&bt.font_scale).into(),
+            after: theme_font_scale_label(&at.font_scale).into(),
+        });
+    }
+    for act in &at.custom_themes {
+        match bt.custom_themes.iter().find(|x| x.id == act.id) {
+            None => items.push(ConfigDiffItem {
+                section: "theme".into(),
+                section_label: "界面主题".into(),
+                target_key: "theme.custom_themes".into(),
+                kind: "added".into(),
+                field_label: format!("加载外部主题模板「{}」", act.name),
+                before: "未加载".into(),
+                after: format!("{} · 主题色 {} / 底色 {}", act.base_mode, act.accent, act.surface),
+            }),
+            Some(bct) if bct != act => items.push(ConfigDiffItem {
+                section: "theme".into(),
+                section_label: "界面主题".into(),
+                target_key: "theme.custom_themes".into(),
+                kind: "modified".into(),
+                field_label: format!("更新外部主题模板「{}」", act.name),
+                before: format!("底色 {} / 主题色 {}", bct.surface, bct.accent),
+                after: format!("底色 {} / 主题色 {}", act.surface, act.accent),
+            }),
+            _ => {}
+        }
+    }
+    for bct in &bt.custom_themes {
+        if !at.custom_themes.iter().any(|x| x.id == bct.id) {
+            items.push(ConfigDiffItem {
+                section: "theme".into(),
+                section_label: "界面主题".into(),
+                target_key: "theme.custom_themes".into(),
+                kind: "removed".into(),
+                field_label: format!("移除外部主题模板「{}」", bct.name),
+                before: format!("{} ({})", bct.name, bct.id),
+                after: "已移除".into(),
+            });
+        }
+    }
+
     // 3. 确定性分流规则对比
     let rule_pairs: [(&str, &str, &[String], &[String]); 6] = [
         (
@@ -1205,6 +1378,234 @@ pub fn diff_specs(
                 after: String::new(),
             });
         }
+    }
+
+    // 5. 跨邮箱统一回复与隐私权限策略对比
+    let bp = crate::privacy::normalize_policy(&before.reply_policy);
+    let ap = crate::privacy::normalize_policy(&after.reply_policy);
+    if bp.enabled != ap.enabled {
+        items.push(ConfigDiffItem {
+            section: "reply_policy".into(),
+            section_label: "统一回复与隐私".into(),
+            target_key: "reply_policy.enabled".into(),
+            kind: "modified".into(),
+            field_label: "跨邮箱统一回复工作流".into(),
+            before: bool_label(bp.enabled).into(),
+            after: bool_label(ap.enabled).into(),
+        });
+    }
+    if bp.enabled_accounts != ap.enabled_accounts {
+        items.push(ConfigDiffItem {
+            section: "reply_policy".into(),
+            section_label: "统一回复与隐私".into(),
+            target_key: "reply_policy.enabled_accounts".into(),
+            kind: "modified".into(),
+            field_label: "授权允许读取的邮箱账号".into(),
+            before: if bp.enabled_accounts.is_empty() {
+                "零授权（全部隔离）".into()
+            } else {
+                bp.enabled_accounts.join("、")
+            },
+            after: if ap.enabled_accounts.is_empty() {
+                "零授权（全部隔离）".into()
+            } else {
+                ap.enabled_accounts.join("、")
+            },
+        });
+    }
+    if bp.redact_pii != ap.redact_pii {
+        items.push(ConfigDiffItem {
+            section: "reply_policy".into(),
+            section_label: "统一回复与隐私".into(),
+            target_key: "reply_policy.redact_pii".into(),
+            kind: "modified".into(),
+            field_label: "入模前本地 PII 隐私脱敏".into(),
+            before: bool_label(bp.redact_pii).into(),
+            after: bool_label(ap.redact_pii).into(),
+        });
+    }
+    if bp.auto_send_enabled != ap.auto_send_enabled {
+        items.push(ConfigDiffItem {
+            section: "reply_policy".into(),
+            section_label: "统一回复与隐私".into(),
+            target_key: "reply_policy.auto_send_enabled".into(),
+            kind: "modified".into(),
+            field_label: "白名单受限自动发信权限".into(),
+            before: bool_label(bp.auto_send_enabled).into(),
+            after: bool_label(ap.auto_send_enabled).into(),
+        });
+    }
+    if bp.auto_send_senders != ap.auto_send_senders || bp.auto_send_domains != ap.auto_send_domains {
+        items.push(ConfigDiffItem {
+            section: "reply_policy".into(),
+            section_label: "统一回复与隐私".into(),
+            target_key: "reply_policy.auto_send".into(),
+            kind: "modified".into(),
+            field_label: "自动发信授权白名单".into(),
+            before: format!(
+                "{} 人 / {} 域名",
+                bp.auto_send_senders.len(),
+                bp.auto_send_domains.len()
+            ),
+            after: format!(
+                "{} 人 / {} 域名",
+                ap.auto_send_senders.len(),
+                ap.auto_send_domains.len()
+            ),
+        });
+    }
+    if bp.auto_rules != ap.auto_rules {
+        items.push(ConfigDiffItem {
+            section: "reply_policy".into(),
+            section_label: "自动化回复".into(),
+            target_key: "reply_policy.auto_rules".into(),
+            kind: if bp.auto_rules.is_empty() && !ap.auto_rules.is_empty() {
+                "added".into()
+            } else if !bp.auto_rules.is_empty() && ap.auto_rules.is_empty() {
+                "removed".into()
+            } else {
+                "modified".into()
+            },
+            field_label: "自动化条件回复规则".into(),
+            before: if bp.auto_rules.is_empty() {
+                "无规则".into()
+            } else {
+                format!(
+                    "{} 条（启用 {} 条）",
+                    bp.auto_rules.len(),
+                    bp.auto_rules.iter().filter(|r| r.enabled).count()
+                )
+            },
+            after: if ap.auto_rules.is_empty() {
+                "无规则".into()
+            } else {
+                ap.auto_rules
+                    .iter()
+                    .map(|r| format!("{}{}", r.name, if r.enabled { "" } else { "(暂停)" }))
+                    .collect::<Vec<_>>()
+                    .join("、")
+            },
+        });
+    }
+
+    // 6. 客户端自动更新策略对比
+    let bu = before.update.normalized();
+    let au = after.update.normalized();
+    if bu.auto_check != au.auto_check {
+        items.push(ConfigDiffItem {
+            section: "update".into(),
+            section_label: "自动更新".into(),
+            target_key: "update.auto_check".into(),
+            kind: "modified".into(),
+            field_label: "后台自动检查更新".into(),
+            before: bool_label(bu.auto_check).into(),
+            after: bool_label(au.auto_check).into(),
+        });
+    }
+    if bu.auto_download != au.auto_download {
+        items.push(ConfigDiffItem {
+            section: "update".into(),
+            section_label: "自动更新".into(),
+            target_key: "update.auto_download".into(),
+            kind: "modified".into(),
+            field_label: "静默后台预下载更新包".into(),
+            before: bool_label(bu.auto_download).into(),
+            after: bool_label(au.auto_download).into(),
+        });
+    }
+    if bu.check_interval_hours != au.check_interval_hours {
+        items.push(ConfigDiffItem {
+            section: "update".into(),
+            section_label: "自动更新".into(),
+            target_key: "update.check_interval_hours".into(),
+            kind: "modified".into(),
+            field_label: "后台检查频率".into(),
+            before: format!("每 {} 小时", bu.check_interval_hours),
+            after: format!("每 {} 小时", au.check_interval_hours),
+        });
+    }
+    if bu.channel != au.channel {
+        let ch_label = |c: &str| {
+            if c == "beta" {
+                "抢先预览通道 (beta)"
+            } else {
+                "稳定正式通道 (stable)"
+            }
+        };
+        items.push(ConfigDiffItem {
+            section: "update".into(),
+            section_label: "自动更新".into(),
+            target_key: "update.channel".into(),
+            kind: "modified".into(),
+            field_label: "更新发布通道".into(),
+            before: ch_label(&bu.channel).into(),
+            after: ch_label(&au.channel).into(),
+        });
+    }
+    if bu.skipped_version != au.skipped_version {
+        items.push(ConfigDiffItem {
+            section: "update".into(),
+            section_label: "自动更新".into(),
+            target_key: "update.skipped_version".into(),
+            kind: "modified".into(),
+            field_label: "已标记跳过的版本号".into(),
+            before: val_or(&bu.skipped_version, "无"),
+            after: val_or(&au.skipped_version, "无"),
+        });
+    }
+    if bu.custom_endpoint != au.custom_endpoint {
+        items.push(ConfigDiffItem {
+            section: "update".into(),
+            section_label: "自动更新".into(),
+            target_key: "update.custom_endpoint".into(),
+            kind: "modified".into(),
+            field_label: "自定义更新镜像源".into(),
+            before: val_or(&bu.custom_endpoint, "GitHub 官方默认源"),
+            after: val_or(&au.custom_endpoint, "GitHub 官方默认源"),
+        });
+    }
+
+    let bw = &before.window;
+    let aw = &after.window;
+    if bw.close_to_tray != aw.close_to_tray {
+        let close_label = |v: bool| {
+            if v {
+                "隐藏到系统托盘（后台常驻收信）"
+            } else {
+                "直接退出程序"
+            }
+        };
+        items.push(ConfigDiffItem {
+            section: "window".into(),
+            section_label: "窗口与托盘提醒".into(),
+            target_key: "window.close_to_tray".into(),
+            kind: "modified".into(),
+            field_label: "点击关闭按钮行为".into(),
+            before: close_label(bw.close_to_tray).into(),
+            after: close_label(aw.close_to_tray).into(),
+        });
+    }
+    if bw.tray_flash_on_message != aw.tray_flash_on_message {
+        items.push(ConfigDiffItem {
+            section: "window".into(),
+            section_label: "窗口与托盘提醒".into(),
+            target_key: "window.tray_flash_on_message".into(),
+            kind: "modified".into(),
+            field_label: "新消息系统托盘图标闪动".into(),
+            before: bool_label(bw.tray_flash_on_message).into(),
+            after: bool_label(aw.tray_flash_on_message).into(),
+        });
+    }
+    if bw.taskbar_flash_on_message != aw.taskbar_flash_on_message {
+        items.push(ConfigDiffItem {
+            section: "window".into(),
+            section_label: "窗口与托盘提醒".into(),
+            target_key: "window.taskbar_flash_on_message".into(),
+            kind: "modified".into(),
+            field_label: "新消息底部任务栏闪烁".into(),
+            before: bool_label(bw.taskbar_flash_on_message).into(),
+            after: bool_label(aw.taskbar_flash_on_message).into(),
+        });
     }
 
     let has_toml_change = before_toml.trim() != after_toml.trim();

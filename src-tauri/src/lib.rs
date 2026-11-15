@@ -1,15 +1,20 @@
 mod agent;
 mod config;
 mod db;
+mod kernel;
 mod llm;
 mod magpie;
 mod mail;
+mod privacy;
+mod tray;
+mod updater;
 mod vault;
 
 use db::{
     Account, AgentConfig, AgentSessionSummary, AgentTurnRecord, AttachmentMeta, ContactProfile,
     Conversation, Db, GroupInfo, GroupMember, MailboxStats, MessageDto, NewAgentTurn, NewMessage,
-    ProviderProfile, Rule,
+    NewReplyQueueItem, ProviderProfile, ReplyQueueItem, ReplyQueueStats, Rule, ThemeConfig,
+    UpdateConfig, WindowConfig,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -36,7 +41,7 @@ fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
-struct WatcherControl {
+pub(crate) struct WatcherControl {
     wake_mu: Mutex<u64>,
     wake_cv: Condvar,
     active_socket: Mutex<Option<std::net::TcpStream>>,
@@ -86,7 +91,7 @@ impl WatcherControl {
     }
 
     /// 账号、密码或声明式配置变更时调用：立即中断旧连接并切换到最新配置重连
-    fn reconnect_now(&self) {
+    pub(crate) fn reconnect_now(&self) {
         self.account_epoch.fetch_add(1, Ordering::SeqCst);
         self.interrupt_socket();
         self.signal_wake();
@@ -122,18 +127,29 @@ impl WatcherControl {
     }
 }
 
-struct AppState {
-    app_dir: PathBuf,
-    db: Arc<Db>,
-    vault: Arc<Vault>,
-    syncing: Arc<AtomicBool>,
-    watcher: Arc<WatcherControl>,
-    agent_cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+#[derive(Default)]
+struct DockWindowState {
+    expanded: bool,
+    added_phys_w: u32,
+    shifted_left_px: i32,
+    post_shift_x: Option<i32>,
+}
+
+pub(crate) struct AppState {
+    pub(crate) app_dir: PathBuf,
+    pub(crate) db: Arc<Db>,
+    pub(crate) vault: Arc<Vault>,
+    pub(crate) syncing: Arc<AtomicBool>,
+    pub(crate) watcher: Arc<WatcherControl>,
+    pub(crate) tray: Arc<tray::TrayAlertManager>,
+    pub(crate) updater: Arc<updater::UpdaterManager>,
+    pub(crate) agent_cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    dock_win: Mutex<DockWindowState>,
 }
 
 type CmdResult<T> = Result<T, String>;
 
-fn err<E: std::fmt::Display>(e: E) -> String {
+pub(crate) fn err<E: std::fmt::Display>(e: E) -> String {
     format!("{e:#}")
 }
 
@@ -165,10 +181,10 @@ where
 }
 
 #[derive(Serialize, Clone)]
-struct SyncReport {
-    new_incoming: usize,
-    agent_processed: usize,
-    error: Option<String>,
+pub(crate) struct SyncReport {
+    pub(crate) new_incoming: usize,
+    pub(crate) agent_processed: usize,
+    pub(crate) error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -255,7 +271,7 @@ struct AccountEntry {
     inbox_unread: i64,
 }
 
-fn vault_statuses(db: &Db, vault: &Vault) -> Vec<SecretStatus> {
+pub(crate) fn vault_statuses(db: &Db, vault: &Vault) -> Vec<SecretStatus> {
     let emails = db.account_emails().unwrap_or_default();
     vault.statuses_for_accounts(&emails)
 }
@@ -287,7 +303,7 @@ fn build_account_entries(db: &Db, vault: &Vault) -> CmdResult<Vec<AccountEntry>>
 }
 
 /// 立即拉取 IMAP 新邮件并异步移交后台 Agent 分拣（支持快速切号重入，绝不因等待大模型响应阻塞收信与刷新按钮）。
-async fn run_sync(
+pub(crate) async fn run_sync(
     app: &AppHandle,
     db: Arc<Db>,
     vault: Arc<Vault>,
@@ -336,11 +352,17 @@ fn spawn_agent_triage(app: AppHandle, db: Arc<Db>, vault: Arc<Vault>, watcher: A
                 break;
             }
         }
+        if let Ok(pol) = db.reply_policy() {
+            let has_active_auto_rule = pol.auto_rules.iter().any(|r| r.enabled);
+            if pol.enabled && (pol.auto_scan_on_sync || has_active_auto_rule) && !pol.enabled_accounts.is_empty() {
+                let _ = run_unified_reply_scan(&app, &db, &vault, false).await;
+            }
+        }
         watcher.triaging.store(false, Ordering::SeqCst);
     });
 }
 
-async fn process_pending_with_agent(app: &AppHandle, db: &Arc<Db>, cfg: &AgentConfig) -> usize {
+pub(crate) async fn process_pending_with_agent(app: &AppHandle, db: &Arc<Db>, cfg: &AgentConfig) -> usize {
     let pending = db.pending().unwrap_or_default();
     if pending.is_empty() {
         return 0;
@@ -366,13 +388,20 @@ async fn process_pending_with_agent(app: &AppHandle, db: &Arc<Db>, cfg: &AgentCo
             }));
         }
 
+        let mut chunk_alert_inbox = false;
         for h in handles {
             let Ok((id, from_addr, body_full, existing_code, result)) = h.await else {
                 continue;
             };
+            let was_fresh_pending = app
+                .try_state::<AppState>()
+                .map(|st| st.tray.take_fresh_pending(id))
+                .unwrap_or(false);
+            let final_status: &str;
             match result {
                 Ok(v) => {
                     let status = v.status();
+                    final_status = status;
                     if status == "blocked" && cfg.auto_block_sender {
                         let _ = db.add_rule("block_sender", &from_addr);
                     }
@@ -399,6 +428,7 @@ async fn process_pending_with_agent(app: &AppHandle, db: &Arc<Db>, cfg: &AgentCo
                 }
                 // 模型调用失败或未启用时保持在聊天列表，绝不吞掉正常来信
                 Err(e) => {
+                    final_status = "inbox";
                     let _ = db.apply_verdict(
                         id,
                         "inbox",
@@ -410,7 +440,18 @@ async fn process_pending_with_agent(app: &AppHandle, db: &Arc<Db>, cfg: &AgentCo
                     );
                 }
             }
+            if was_fresh_pending && final_status == "inbox" && db.is_unread_inbox_message(id) {
+                chunk_alert_inbox = true;
+            }
             processed += 1;
+        }
+
+        if let Some(st) = app.try_state::<AppState>() {
+            if chunk_alert_inbox {
+                st.tray.notify_new_inbox_messages(app, db);
+            } else {
+                st.tray.refresh_summary(db);
+            }
         }
 
         let _ = app.emit(
@@ -436,14 +477,18 @@ async fn sync_inner(app: &AppHandle, db: Arc<Db>, vault: Arc<Vault>) -> SyncRepo
     if let Ok(Some(acc)) = config::hydrated_account(&db, &vault) {
         if !acc.password.is_empty() && !acc.imap_host.is_empty() {
             let db2 = db.clone();
+            let db_hook = db.clone();
             let agent_on = cfg.enabled;
             let app_early = app.clone();
             match spawn_mail_blocking(move || {
-                mail::sync_with_hook(&acc, &db2, agent_on, move |inbox_new| {
+                mail::sync_with_hook(&acc, &db2, agent_on, move |inbox_outcome| {
+                    if let Some(st) = app_early.try_state::<AppState>() {
+                        st.tray.handle_sync_outcome(&app_early, &db_hook, inbox_outcome);
+                    }
                     let _ = app_early.emit(
                         "mail-updated",
                         SyncReport {
-                            new_incoming: inbox_new,
+                            new_incoming: inbox_outcome.new_incoming,
                             agent_processed: 0,
                             error: None,
                         },
@@ -452,7 +497,12 @@ async fn sync_inner(app: &AppHandle, db: Arc<Db>, vault: Arc<Vault>) -> SyncRepo
             })
             .await
             {
-                Ok(o) => report.new_incoming = o.new_incoming,
+                Ok(o) => {
+                    report.new_incoming = o.new_incoming;
+                    if let Some(st) = app.try_state::<AppState>() {
+                        st.tray.refresh_summary(&db);
+                    }
+                }
                 Err(e) => report.error = Some(e),
             }
         }
@@ -505,12 +555,15 @@ fn spawn_realtime_imap_watcher(
 
                 watcher.set_socket(Some(tcp_ctl));
 
-                let emit_and_triage = |incoming: usize| {
-                    if incoming > 0 {
+                let emit_and_triage = |outcome: mail::SyncOutcome| {
+                    if let Some(st) = app.try_state::<AppState>() {
+                        st.tray.handle_sync_outcome(&app, &db, &outcome);
+                    }
+                    if outcome.new_incoming > 0 {
                         let _ = app.emit(
                             "mail-updated",
                             SyncReport {
-                                new_incoming: incoming,
+                                new_incoming: outcome.new_incoming,
                                 agent_processed: 0,
                                 error: None,
                             },
@@ -522,11 +575,11 @@ fn spawn_realtime_imap_watcher(
                 // 连接建立后立即同步一次 INBOX，新邮件秒级上屏，随后再同步已发送文件夹
                 let agent_on = db.agent_config().map(|c| c.enabled).unwrap_or(false);
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    rt.sync_inbox(&acc, &db, agent_on)
+                    rt.sync_inbox_outcome(&acc, &db, agent_on)
                 })) {
-                    Ok(Ok(n)) => {
+                    Ok(Ok(outcome)) => {
                         watcher.touch_live();
-                        emit_and_triage(n);
+                        emit_and_triage(outcome);
                     }
                     _ => {
                         watcher.set_socket(None);
@@ -608,11 +661,11 @@ fn spawn_realtime_imap_watcher(
                                 }
                                 let ag_on = db.agent_config().map(|c| c.enabled).unwrap_or(false);
                                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    rt.sync_inbox(&acc, &db, ag_on)
+                                    rt.sync_inbox_outcome(&acc, &db, ag_on)
                                 })) {
-                                    Ok(Ok(n)) => {
+                                    Ok(Ok(outcome)) => {
                                         watcher.touch_live();
-                                        emit_and_triage(n);
+                                        emit_and_triage(outcome);
                                     }
                                     _ => {
                                         watcher.set_socket(None);
@@ -648,11 +701,11 @@ fn spawn_realtime_imap_watcher(
                         if noop_changed || woken || poll_tick % 2 == 0 {
                             let ag_on = db.agent_config().map(|c| c.enabled).unwrap_or(false);
                             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                rt.sync_inbox(&acc, &db, ag_on)
+                                rt.sync_inbox_outcome(&acc, &db, ag_on)
                             })) {
-                                Ok(Ok(n)) => {
+                                Ok(Ok(outcome)) => {
                                     watcher.touch_live();
-                                    emit_and_triage(n);
+                                    emit_and_triage(outcome);
                                 }
                                 _ => {
                                     watcher.set_socket(None);
@@ -692,7 +745,7 @@ fn spawn_realtime_imap_watcher(
         });
 }
 
-fn current_me(db: &Db) -> String {
+pub(crate) fn current_me(db: &Db) -> String {
     db.account()
         .ok()
         .flatten()
@@ -722,7 +775,157 @@ fn get_declarative_config(state: State<AppState>) -> CmdResult<DeclarativeBundle
 }
 
 #[tauri::command]
-fn apply_declarative_config(state: State<AppState>, toml: String) -> CmdResult<DeclarativeBundle> {
+fn get_theme_config(state: State<AppState>) -> CmdResult<ThemeConfig> {
+    state.db.theme_config().map_err(err)
+}
+
+#[tauri::command]
+fn save_theme_config(
+    app: AppHandle,
+    state: State<AppState>,
+    theme: ThemeConfig,
+) -> CmdResult<DeclarativeBundle> {
+    state.db.save_theme_config(&theme).map_err(err)?;
+    let toml = config::sync_disk_toml(&state.app_dir, &state.db).map_err(err)?;
+    let spec = config::build_spec(&state.db).map_err(err)?;
+    let _ = app.emit("theme-updated", &spec.theme);
+    Ok(DeclarativeBundle {
+        path: config_file_path(&state),
+        toml,
+        spec,
+        secrets: vault_statuses(&state.db, &state.vault),
+    })
+}
+
+#[tauri::command]
+fn get_window_config(state: State<AppState>) -> CmdResult<WindowConfig> {
+    state.db.window_config().map_err(err)
+}
+
+#[tauri::command]
+fn save_window_config(
+    app: AppHandle,
+    state: State<AppState>,
+    window_cfg: WindowConfig,
+) -> CmdResult<DeclarativeBundle> {
+    state.db.save_window_config(&window_cfg).map_err(err)?;
+    let toml = config::sync_disk_toml(&state.app_dir, &state.db).map_err(err)?;
+    let spec = config::build_spec(&state.db).map_err(err)?;
+    let _ = app.emit("window-config-updated", &spec.window);
+    state.tray.reconcile_config(&app, &state.db);
+    Ok(DeclarativeBundle {
+        path: config_file_path(&state),
+        toml,
+        spec,
+        secrets: vault_statuses(&state.db, &state.vault),
+    })
+}
+
+#[tauri::command]
+fn get_update_config(state: State<AppState>) -> CmdResult<UpdateConfig> {
+    state.db.update_config().map_err(err)
+}
+
+#[tauri::command]
+fn save_update_config(
+    app: AppHandle,
+    state: State<AppState>,
+    update: UpdateConfig,
+) -> CmdResult<DeclarativeBundle> {
+    let norm = update.normalized();
+    state.db.save_update_config(&norm).map_err(err)?;
+    let toml = config::sync_disk_toml(&state.app_dir, &state.db).map_err(err)?;
+    let spec = config::build_spec(&state.db).map_err(err)?;
+    let _ = app.emit("update-config-updated", &spec.update);
+    let snap = state.updater.snapshot(&spec.update.skipped_version);
+    let _ = app.emit("app-update-status", &snap);
+    Ok(DeclarativeBundle {
+        path: config_file_path(&state),
+        toml,
+        spec,
+        secrets: vault_statuses(&state.db, &state.vault),
+    })
+}
+
+#[tauri::command]
+fn get_update_status(state: State<AppState>) -> CmdResult<updater::UpdateStatusSnapshot> {
+    let cfg = state.db.update_config().unwrap_or_default();
+    Ok(state.updater.snapshot(&cfg.skipped_version))
+}
+
+#[tauri::command]
+async fn check_app_update(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    manual: Option<bool>,
+) -> CmdResult<updater::UpdateStatusSnapshot> {
+    let cfg = state.db.update_config().unwrap_or_default();
+    let updater = state.updater.clone();
+    updater
+        .check_for_updates(&app, &cfg, manual.unwrap_or(true))
+        .await
+        .map_err(err)
+}
+
+#[tauri::command]
+async fn download_app_update(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> CmdResult<updater::UpdateStatusSnapshot> {
+    let cfg = state.db.update_config().unwrap_or_default();
+    let updater = state.updater.clone();
+    updater
+        .download_only(&app, &cfg.skipped_version)
+        .await
+        .map_err(err)
+}
+
+#[tauri::command]
+async fn install_app_update(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> CmdResult<updater::UpdateStatusSnapshot> {
+    let cfg = state.db.update_config().unwrap_or_default();
+    let updater = state.updater.clone();
+    let watcher = state.watcher.clone();
+    let tray_mgr = state.tray.clone();
+    updater
+        .download_and_install_now(&app, &cfg.skipped_version, move || {
+            tray_mgr.mark_quitting();
+            watcher.interrupt_socket();
+        })
+        .await
+        .map_err(err)
+}
+
+#[tauri::command]
+fn skip_app_update_version(
+    app: AppHandle,
+    state: State<AppState>,
+    version: String,
+) -> CmdResult<DeclarativeBundle> {
+    let mut cfg = state.db.update_config().unwrap_or_default();
+    cfg.skipped_version = version.trim().trim_start_matches(['v', 'V']).to_string();
+    state.db.save_update_config(&cfg).map_err(err)?;
+    let toml = config::sync_disk_toml(&state.app_dir, &state.db).map_err(err)?;
+    let spec = config::build_spec(&state.db).map_err(err)?;
+    let _ = app.emit("update-config-updated", &spec.update);
+    let snap = state.updater.snapshot(&spec.update.skipped_version);
+    let _ = app.emit("app-update-status", &snap);
+    Ok(DeclarativeBundle {
+        path: config_file_path(&state),
+        toml,
+        spec,
+        secrets: vault_statuses(&state.db, &state.vault),
+    })
+}
+
+#[tauri::command]
+fn apply_declarative_config(
+    app: AppHandle,
+    state: State<AppState>,
+    toml: String,
+) -> CmdResult<DeclarativeBundle> {
     let prev_spec = config::build_spec(&state.db).unwrap_or_default();
     let normalized = config::apply_toml(&state.app_dir, &toml, &state.db, &state.vault).map_err(err)?;
     let rules = state.db.rules().map_err(err)?;
@@ -735,6 +938,12 @@ fn apply_declarative_config(state: State<AppState>, toml: String) -> CmdResult<D
     if mail_changed {
         state.watcher.reconnect_now();
     }
+    let _ = app.emit("theme-updated", &next_spec.theme);
+    let _ = app.emit("window-config-updated", &next_spec.window);
+    let _ = app.emit("update-config-updated", &next_spec.update);
+    state.tray.reconcile_config(&app, &state.db);
+    let snap = state.updater.snapshot(&next_spec.update.skipped_version);
+    let _ = app.emit("app-update-status", &snap);
     Ok(DeclarativeBundle {
         path: config_file_path(&state),
         toml: normalized,
@@ -745,6 +954,7 @@ fn apply_declarative_config(state: State<AppState>, toml: String) -> CmdResult<D
 
 #[tauri::command]
 fn apply_declarative_spec(
+    app: AppHandle,
     state: State<AppState>,
     spec: config::DeclarativeConfig,
 ) -> CmdResult<DeclarativeBundle> {
@@ -761,6 +971,12 @@ fn apply_declarative_spec(
     if mail_changed {
         state.watcher.reconnect_now();
     }
+    let _ = app.emit("theme-updated", &next_spec.theme);
+    let _ = app.emit("window-config-updated", &next_spec.window);
+    let _ = app.emit("update-config-updated", &next_spec.update);
+    state.tray.reconcile_config(&app, &state.db);
+    let snap = state.updater.snapshot(&next_spec.update.skipped_version);
+    let _ = app.emit("app-update-status", &snap);
     Ok(DeclarativeBundle {
         path: config_file_path(&state),
         toml: normalized,
@@ -1038,6 +1254,12 @@ fn rewind_agent_session(
 
     let toml = config::export_toml(&state.db).map_err(err)?;
     let spec = config::build_spec(&state.db).map_err(err)?;
+    if config_restored {
+        let _ = app.emit("theme-updated", &spec.theme);
+        let _ = app.emit("window-config-updated", &spec.window);
+        let _ = app.emit("update-config-updated", &spec.update);
+        state.tray.reconcile_config(&app, &state.db);
+    }
     let turns = state.db.get_agent_session_turns(&session_id).map_err(err)?;
     let sessions = state.db.list_agent_sessions().map_err(err)?;
 
@@ -1300,6 +1522,9 @@ async fn chat_with_agent(
                     toml,
                     None,
                 );
+                if draft_spec.theme.normalized() != spec_for_stream.theme.normalized() {
+                    let _ = app_for_stream.emit("theme-updated", &draft_spec.theme.normalized());
+                }
                 if let Ok(preview_json) = serde_json::to_string(&serde_json::json!({
                     "spec": draft_spec,
                     "config_diff": live_diff,
@@ -1335,7 +1560,14 @@ async fn chat_with_agent(
     let final_toml = if let Some(new_toml) = &plan.updated_toml {
         match config::apply_toml(&state.app_dir, new_toml, &state.db, &state.vault) {
             Ok(normalized) => {
-                should_reconnect_mail = true;
+                if let Ok(applied_spec) = config::build_spec(&state.db) {
+                    if spec.active_account != applied_spec.active_account
+                        || serde_json::to_string(&spec.accounts).ok()
+                            != serde_json::to_string(&applied_spec.accounts).ok()
+                    {
+                        should_reconnect_mail = true;
+                    }
+                }
                 normalized
             }
             Err(e) => {
@@ -1403,6 +1635,14 @@ async fn chat_with_agent(
                     plan.changes.push(format!("已清理 {n} 封演示邮件"));
                 }
             }
+            "run_reply_scan" => {
+                if let Ok(rep) = run_unified_reply_scan(&app, &state.db, &state.vault, false).await {
+                    plan.changes.push(format!(
+                        "统一批复与自动规则扫描完成：待审 {} 封，自动发出 {} 封",
+                        rep.queued_review_count, rep.auto_sent_count
+                    ));
+                }
+            }
             _ => {}
         }
     }
@@ -1410,6 +1650,10 @@ async fn chat_with_agent(
     let latest_toml = config::sync_disk_toml(&state.app_dir, &state.db).unwrap_or(final_toml);
     let latest_spec = config::build_spec(&state.db).unwrap_or_else(|_| spec.clone());
     let latest_secrets = vault_statuses(&state.db, &state.vault);
+    let _ = app.emit("theme-updated", &latest_spec.theme);
+    let _ = app.emit("window-config-updated", &latest_spec.window);
+    let _ = app.emit("update-config-updated", &latest_spec.update);
+    state.tray.reconcile_config(&app, &state.db);
 
     let raw_diff = config::diff_specs(
         &spec,
@@ -1492,6 +1736,263 @@ async fn chat_with_agent(
         sessions,
         turns,
     })
+}
+
+// ============================================================================
+// 统一智能体内核（Unified Agent Kernel）多实例隔离 IPC 接口
+// ============================================================================
+
+#[tauri::command]
+fn get_agent_instance_state(
+    state: State<AppState>,
+    instance_id: String,
+) -> CmdResult<kernel::KernelInstanceSnapshot> {
+    let kind = kernel::AgentInstanceKind::parse(&instance_id);
+    let inst = kind.as_str();
+    let mut sessions = state.db.list_instance_sessions(inst).map_err(err)?;
+    let active_session_id = if let Some(first) = sessions.first() {
+        first.id.clone()
+    } else {
+        let created = state.db.create_instance_session(inst, None).map_err(err)?;
+        let sid = created.id.clone();
+        sessions = vec![created];
+        sid
+    };
+    let turns = state
+        .db
+        .get_instance_session_turns(inst, &active_session_id)
+        .map_err(err)?;
+    let agent_config = kernel::sanitize_agent_config_for_ui(
+        state.db.instance_agent_config(inst).map_err(err)?,
+    );
+    let toml = config::export_toml(&state.db).map_err(err)?;
+    let spec = config::build_spec(&state.db).map_err(err)?;
+    let secrets = vault_statuses(&state.db, &state.vault);
+
+    Ok(kernel::KernelInstanceSnapshot {
+        descriptor: kind.descriptor(),
+        agent_config,
+        sessions,
+        active_session_id,
+        turns,
+        path: config_file_path(&state),
+        toml,
+        spec,
+        secrets,
+    })
+}
+
+#[tauri::command]
+fn list_instance_sessions(
+    state: State<AppState>,
+    instance_id: String,
+) -> CmdResult<Vec<AgentSessionSummary>> {
+    state.db.list_instance_sessions(&instance_id).map_err(err)
+}
+
+#[tauri::command]
+fn create_instance_session(
+    state: State<AppState>,
+    instance_id: String,
+    title: Option<String>,
+) -> CmdResult<AgentSessionSummary> {
+    state
+        .db
+        .create_instance_session(&instance_id, title.as_deref())
+        .map_err(err)
+}
+
+#[tauri::command]
+fn get_instance_session_turns(
+    state: State<AppState>,
+    instance_id: String,
+    session_id: String,
+) -> CmdResult<Vec<AgentTurnRecord>> {
+    state
+        .db
+        .get_instance_session_turns(&instance_id, &session_id)
+        .map_err(err)
+}
+
+#[tauri::command]
+fn delete_instance_session(
+    state: State<AppState>,
+    instance_id: String,
+    session_id: String,
+) -> CmdResult<Vec<AgentSessionSummary>> {
+    state
+        .db
+        .delete_instance_session(&instance_id, &session_id)
+        .map_err(err)?;
+    state.db.list_instance_sessions(&instance_id).map_err(err)
+}
+
+#[tauri::command]
+fn rewind_instance_session(
+    app: AppHandle,
+    state: State<AppState>,
+    instance_id: String,
+    session_id: String,
+    from_turn_id: i64,
+    restore_config: bool,
+) -> CmdResult<RewindAgentResponse> {
+    let kind = kernel::AgentInstanceKind::parse(&instance_id);
+    let inst = kind.as_str();
+    let prev_spec = config::build_spec(&state.db).unwrap_or_default();
+    let rollback_toml = state
+        .db
+        .rewind_instance_session(inst, &session_id, from_turn_id)
+        .map_err(err)?;
+
+    let mut config_restored = false;
+    if kind == kernel::AgentInstanceKind::Config && restore_config {
+        if let Some(ref target_toml) = rollback_toml {
+            if !target_toml.trim().is_empty() {
+                config::apply_toml(&state.app_dir, target_toml, &state.db, &state.vault)
+                    .map_err(err)?;
+                if let Ok(rules) = state.db.rules() {
+                    let _ = state.db.scan_existing_with_rules(|from, subject, body| {
+                        agent::apply_rules(&rules, from, subject, body)
+                            .map(|h| (h.status, h.reason))
+                    });
+                }
+                let next_spec = config::build_spec(&state.db).unwrap_or_default();
+                let mail_changed = prev_spec.active_account != next_spec.active_account
+                    || serde_json::to_string(&prev_spec.accounts).ok()
+                        != serde_json::to_string(&next_spec.accounts).ok();
+                if mail_changed {
+                    state.watcher.reconnect_now();
+                }
+                let _ = app.emit(
+                    "mail-updated",
+                    SyncReport {
+                        new_incoming: 0,
+                        agent_processed: 0,
+                        error: None,
+                    },
+                );
+                config_restored = true;
+            }
+        }
+    }
+
+    let toml = config::export_toml(&state.db).map_err(err)?;
+    let spec = config::build_spec(&state.db).map_err(err)?;
+    if config_restored {
+        let _ = app.emit("theme-updated", &spec.theme);
+        let _ = app.emit("window-config-updated", &spec.window);
+        let _ = app.emit("update-config-updated", &spec.update);
+        state.tray.reconcile_config(&app, &state.db);
+    }
+    let turns = state
+        .db
+        .get_instance_session_turns(inst, &session_id)
+        .map_err(err)?;
+    let sessions = state.db.list_instance_sessions(inst).map_err(err)?;
+
+    Ok(RewindAgentResponse {
+        turns,
+        sessions,
+        config_restored,
+        bundle: DeclarativeBundle {
+            path: config_file_path(&state),
+            toml,
+            spec,
+            secrets: vault_statuses(&state.db, &state.vault),
+        },
+    })
+}
+
+#[tauri::command]
+fn switch_instance_model(
+    state: State<AppState>,
+    instance_id: String,
+    preset: String,
+    model: Option<String>,
+) -> CmdResult<ModelSwitchResult> {
+    let ag = kernel::switch_instance_model_core(
+        &state.app_dir,
+        &state.db,
+        &state.vault,
+        &instance_id,
+        &preset,
+        model.as_deref(),
+    )
+    .map_err(err)?;
+    let toml = config::export_toml(&state.db).map_err(err)?;
+    let spec = config::build_spec(&state.db).map_err(err)?;
+    Ok(ModelSwitchResult {
+        agent_config: ag,
+        bundle: DeclarativeBundle {
+            path: config_file_path(&state),
+            toml,
+            spec,
+            secrets: vault_statuses(&state.db, &state.vault),
+        },
+    })
+}
+
+#[tauri::command]
+async fn connect_instance_magpie(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    instance_id: String,
+    base_url: Option<String>,
+    model: Option<String>,
+    auto_start: Option<bool>,
+) -> CmdResult<MagpieConnectResult> {
+    let (probe, ag) = kernel::connect_instance_magpie_core(
+        &state.app_dir,
+        &state.db,
+        &state.vault,
+        &instance_id,
+        base_url.as_deref(),
+        model.as_deref(),
+        auto_start.unwrap_or(true),
+    )
+    .await
+    .map_err(err)?;
+
+    let toml = config::export_toml(&state.db).map_err(err)?;
+    let spec = config::build_spec(&state.db).map_err(err)?;
+    if kernel::AgentInstanceKind::parse(&instance_id) == kernel::AgentInstanceKind::Config {
+        let _ = app.emit(
+            "mail-updated",
+            SyncReport {
+                new_incoming: 0,
+                agent_processed: 0,
+                error: None,
+            },
+        );
+    }
+
+    Ok(MagpieConnectResult {
+        probe,
+        agent_config: ag,
+        bundle: DeclarativeBundle {
+            path: config_file_path(&state),
+            toml,
+            spec,
+            secrets: vault_statuses(&state.db, &state.vault),
+        },
+    })
+}
+
+#[tauri::command]
+async fn run_agent_kernel_turn(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    req: kernel::KernelTurnRequest,
+) -> CmdResult<kernel::KernelTurnResponse> {
+    kernel::run_kernel_turn(&app, &state, req).await
+}
+
+#[tauri::command]
+fn cancel_agent_kernel_turn(
+    state: State<AppState>,
+    request_id: Option<String>,
+) -> CmdResult<()> {
+    cancel_agent_chat(state, request_id)
 }
 
 #[tauri::command]
@@ -1871,7 +2372,12 @@ async fn connect_magpie(
 }
 
 #[tauri::command]
-fn window_action(window: tauri::WebviewWindow, action: String) -> CmdResult<bool> {
+fn window_action(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    state: State<AppState>,
+    action: String,
+) -> CmdResult<bool> {
     match action.as_str() {
         "drag" => {
             let _ = window.start_dragging();
@@ -1898,12 +2404,137 @@ fn window_action(window: tauri::WebviewWindow, action: String) -> CmdResult<bool
             }
         }
         "is_maximized" => window.is_maximized().map_err(err),
+        "hide_to_tray" => {
+            window.hide().map_err(err)?;
+            Ok(true)
+        }
         "close" => {
-            window.close().map_err(err)?;
+            let close_to_tray = state
+                .db
+                .window_config()
+                .map(|c| c.close_to_tray)
+                .unwrap_or(true);
+            if close_to_tray {
+                window.hide().map_err(err)?;
+                Ok(true)
+            } else {
+                tray::quit_application(&app, &state.watcher, &state.tray);
+                Ok(false)
+            }
+        }
+        "exit" => {
+            tray::quit_application(&app, &state.watcher, &state.tray);
             Ok(false)
         }
         _ => Err("不支持的窗口操作".into()),
     }
+}
+
+#[tauri::command]
+fn set_agent_dock_expanded(
+    window: tauri::WebviewWindow,
+    state: State<AppState>,
+    expanded: bool,
+    dock_width: Option<f64>,
+) -> CmdResult<bool> {
+    let mut st = state.dock_win.lock().unwrap();
+    if st.expanded == expanded {
+        return Ok(expanded);
+    }
+
+    let dock_w = dock_width.unwrap_or(388.0).clamp(300.0, 560.0);
+    if window.is_maximized().unwrap_or(false) {
+        st.expanded = expanded;
+        st.added_phys_w = 0;
+        st.shifted_left_px = 0;
+        st.post_shift_x = None;
+        return Ok(expanded);
+    }
+
+    let scale = window.scale_factor().unwrap_or(1.0).max(0.5);
+    let delta_w = (dock_w * scale).round() as u32;
+
+    if expanded {
+        let cur_inner = window.inner_size().map_err(err)?;
+        let mut target_w = cur_inner.width.saturating_add(delta_w);
+        st.shifted_left_px = 0;
+        st.post_shift_x = None;
+
+        if let Ok(Some(mon)) = window.current_monitor() {
+            let mon_left = mon.position().x;
+            let mon_w = mon.size().width;
+            let mon_right = mon_left + mon_w as i32;
+            if target_w > mon_w {
+                target_w = mon_w;
+            }
+            if let Ok(pos) = window.outer_position() {
+                let right_edge = pos.x + target_w as i32;
+                if right_edge > mon_right {
+                    let overflow = right_edge - mon_right;
+                    let new_x = (pos.x - overflow).max(mon_left);
+                    let shifted = pos.x - new_x;
+                    if shifted > 0 {
+                        let _ = window.set_position(tauri::Position::Physical(
+                            tauri::PhysicalPosition::new(new_x, pos.y),
+                        ));
+                        st.shifted_left_px = shifted;
+                        st.post_shift_x = Some(new_x);
+                    }
+                }
+            }
+        }
+
+        window
+            .set_size(tauri::Size::Physical(tauri::PhysicalSize::new(
+                target_w,
+                cur_inner.height,
+            )))
+            .map_err(err)?;
+        let _ = window.set_min_size(Some(tauri::Size::Logical(tauri::LogicalSize::new(
+            820.0 + dock_w,
+            520.0,
+        ))));
+        st.expanded = true;
+        st.added_phys_w = target_w.saturating_sub(cur_inner.width);
+    } else {
+        let _ = window.set_min_size(Some(tauri::Size::Logical(tauri::LogicalSize::new(
+            820.0, 520.0,
+        ))));
+        let cur_inner = window.inner_size().map_err(err)?;
+        let sub_w = if st.added_phys_w > 0 {
+            st.added_phys_w
+        } else {
+            delta_w
+        };
+        let min_phys_w = (820.0 * scale).round() as u32;
+        let target_w = cur_inner.width.saturating_sub(sub_w).max(min_phys_w);
+        window
+            .set_size(tauri::Size::Physical(tauri::PhysicalSize::new(
+                target_w,
+                cur_inner.height,
+            )))
+            .map_err(err)?;
+
+        if st.shifted_left_px > 0 {
+            if let Ok(pos) = window.outer_position() {
+                if st
+                    .post_shift_x
+                    .map(|px| (pos.x - px).abs() <= 12)
+                    .unwrap_or(false)
+                {
+                    let _ = window.set_position(tauri::Position::Physical(
+                        tauri::PhysicalPosition::new(pos.x + st.shifted_left_px, pos.y),
+                    ));
+                }
+            }
+        }
+        st.expanded = false;
+        st.added_phys_w = 0;
+        st.shifted_left_px = 0;
+        st.post_shift_x = None;
+    }
+
+    Ok(expanded)
 }
 
 #[tauri::command]
@@ -1938,7 +2569,9 @@ fn poke_mail_sync(state: State<AppState>) -> CmdResult<()> {
 
 #[tauri::command]
 fn get_stats(state: State<AppState>) -> CmdResult<MailboxStats> {
-    state.db.stats().map_err(err)
+    let st = state.db.stats().map_err(err)?;
+    state.tray.refresh_summary(&state.db);
+    Ok(st)
 }
 
 #[tauri::command]
@@ -1948,7 +2581,9 @@ fn list_conversations(state: State<AppState>, status: String) -> CmdResult<Vec<C
 
 #[tauri::command]
 fn list_messages(state: State<AppState>, peer: String, status: String) -> CmdResult<Vec<MessageDto>> {
-    state.db.messages(&peer, &status).map_err(err)
+    let msgs = state.db.messages(&peer, &status).map_err(err)?;
+    state.tray.refresh_summary(&state.db);
+    Ok(msgs)
 }
 
 #[tauri::command]
@@ -2702,8 +3337,11 @@ async fn send_message(
                     &acc2,
                     &mail::Outgoing {
                         recipients: rcpts,
+                        cc: Vec::new(),
+                        bcc: Vec::new(),
                         subject: subj,
                         body: &b,
+                        body_html: None,
                         in_reply_to: irt,
                         references: refs,
                         group_id: gid,
@@ -2782,12 +3420,16 @@ async fn send_message(
 
 #[tauri::command]
 fn set_message_status(state: State<AppState>, id: i64, status: String) -> CmdResult<()> {
-    state.db.set_message_status(id, &status).map_err(err)
+    state.db.set_message_status(id, &status).map_err(err)?;
+    state.tray.refresh_summary(&state.db);
+    Ok(())
 }
 
 #[tauri::command]
 fn move_conversation(state: State<AppState>, peer: String, status: String) -> CmdResult<()> {
-    state.db.move_peer(&peer, &status).map_err(err)
+    state.db.move_peer(&peer, &status).map_err(err)?;
+    state.tray.refresh_summary(&state.db);
+    Ok(())
 }
 
 #[tauri::command]
@@ -2802,12 +3444,16 @@ fn set_conversation_read(
     status: String,
     read: bool,
 ) -> CmdResult<()> {
-    state.db.set_peer_read(&peer, &status, read).map_err(err)
+    state.db.set_peer_read(&peer, &status, read).map_err(err)?;
+    state.tray.refresh_summary(&state.db);
+    Ok(())
 }
 
 #[tauri::command]
 fn mark_all_read(state: State<AppState>, status: String) -> CmdResult<usize> {
-    state.db.mark_all_read(&status).map_err(err)
+    let n = state.db.mark_all_read(&status).map_err(err)?;
+    state.tray.refresh_summary(&state.db);
+    Ok(n)
 }
 
 #[tauri::command]
@@ -2821,7 +3467,9 @@ fn set_conversation_muted(state: State<AppState>, peer: String, muted: bool) -> 
 
 #[tauri::command]
 fn delete_message(state: State<AppState>, id: i64) -> CmdResult<()> {
-    state.db.delete_message(id).map_err(err)
+    state.db.delete_message(id).map_err(err)?;
+    state.tray.refresh_summary(&state.db);
+    Ok(())
 }
 
 #[tauri::command]
@@ -2837,6 +3485,7 @@ fn delete_conversation(
     if peer.trim().starts_with("group:") {
         refresh_disk_toml(&state);
     }
+    state.tray.refresh_summary(&state.db);
     Ok(deleted)
 }
 
@@ -3106,6 +3755,1347 @@ fn start_screen_snip() -> CmdResult<()> {
     }
 }
 
+// ============================================================================
+// 模式一：传统写信 + Agent HTML 工坊（Compose Studio）Tauri 接口
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize)]
+struct ComposeAgentStreamPayload {
+    request_id: String,
+    /// "thinking" | "content" | "html_preview"
+    kind: String,
+    delta: String,
+    thinking_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PrivacyScrubPreviewDto {
+    pub scrubbed: String,
+    pub redactions: Vec<privacy::RedactionHit>,
+    pub dlp_passed: bool,
+    pub dlp_findings: Vec<String>,
+}
+
+#[tauri::command]
+fn preview_privacy_scrub(
+    state: State<AppState>,
+    text: String,
+    redact_pii: Option<bool>,
+    custom_terms: Option<Vec<String>>,
+) -> CmdResult<PrivacyScrubPreviewDto> {
+    let policy = state.db.reply_policy().unwrap_or_default();
+    let do_redact = redact_pii.unwrap_or(policy.redact_pii);
+    let terms = custom_terms.unwrap_or(policy.custom_redact_terms);
+    let scrub = privacy::scrub_text_with_vault(&text, do_redact, &terms);
+    let dlp = privacy::check_outbound_dlp("", &text, "", false);
+    Ok(PrivacyScrubPreviewDto {
+        scrubbed: scrub.scrubbed,
+        redactions: scrub.hits,
+        dlp_passed: dlp.passed,
+        dlp_findings: dlp.findings,
+    })
+}
+
+#[tauri::command]
+async fn chat_compose_agent(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request_id: Option<String>,
+    input: agent::ComposeAgentInput,
+) -> CmdResult<agent::ComposeAgentResult> {
+    if input.user_prompt.trim().is_empty() {
+        return Err("请输入给写信 Agent 的指令或描述".into());
+    }
+    let cfg = config::hydrated_agent(&state.db, &state.vault).map_err(err)?;
+    let req_id = request_id
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| format!("compose-{}", uuid::Uuid::new_v4()));
+
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    {
+        state
+            .agent_cancels
+            .lock()
+            .unwrap()
+            .insert(req_id.clone(), cancel_flag.clone());
+    }
+
+    let emit_app = app.clone();
+    let emit_id = req_id.clone();
+    let res = agent::stream_compose_agent(&cfg, &input, &cancel_flag, |ev| match ev {
+        agent::ComposeAgentStreamEvent::ThinkingDelta { delta, thinking_ms } => {
+            let _ = emit_app.emit(
+                "compose-agent-stream",
+                ComposeAgentStreamPayload {
+                    request_id: emit_id.clone(),
+                    kind: "thinking".into(),
+                    delta: delta.to_string(),
+                    thinking_ms,
+                },
+            );
+        }
+        agent::ComposeAgentStreamEvent::ContentDelta { delta } => {
+            let _ = emit_app.emit(
+                "compose-agent-stream",
+                ComposeAgentStreamPayload {
+                    request_id: emit_id.clone(),
+                    kind: "content".into(),
+                    delta: delta.to_string(),
+                    thinking_ms: 0,
+                },
+            );
+        }
+        agent::ComposeAgentStreamEvent::HtmlPreviewDelta { html } => {
+            let _ = emit_app.emit(
+                "compose-agent-stream",
+                ComposeAgentStreamPayload {
+                    request_id: emit_id.clone(),
+                    kind: "html_preview".into(),
+                    delta: html.to_string(),
+                    thinking_ms: 0,
+                },
+            );
+        }
+    })
+    .await;
+
+    {
+        state.agent_cancels.lock().unwrap().remove(&req_id);
+    }
+
+    Ok(res)
+}
+
+#[tauri::command]
+fn cancel_compose_agent(state: State<AppState>, request_id: String) -> CmdResult<()> {
+    if let Ok(map) = state.agent_cancels.lock() {
+        if let Some(flag) = map.get(&request_id) {
+            flag.store(true, Ordering::SeqCst);
+        }
+    }
+    Ok(())
+}
+
+fn normalize_email_list(raw: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for item in raw {
+        for part in item.split(&[',', ';', '，', '；'][..]) {
+            let clean = part.trim().to_lowercase();
+            if clean.contains('@') && !clean.contains(' ') && !out.contains(&clean) {
+                out.push(clean);
+            }
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+async fn send_composed_mail(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    from_email: Option<String>,
+    to: Vec<String>,
+    cc: Option<Vec<String>>,
+    bcc: Option<Vec<String>>,
+    subject: String,
+    body_plain: String,
+    body_html: Option<String>,
+    attachments: Option<Vec<SendAttachmentInput>>,
+    reply_to_id: Option<i64>,
+    force_dlp_override: Option<bool>,
+) -> CmdResult<MessageDto> {
+    let to_list = normalize_email_list(to);
+    if to_list.is_empty() {
+        return Err("请至少填写 1 位有效的收件人邮箱地址（To）".into());
+    }
+    let cc_list = normalize_email_list(cc.unwrap_or_default());
+    let bcc_list = normalize_email_list(bcc.unwrap_or_default());
+
+    let raw_html = body_html.unwrap_or_default();
+    let clean_html = privacy::sanitize_outgoing_html(&raw_html);
+    let clean_plain = if !body_plain.trim().is_empty() {
+        body_plain.trim().to_string()
+    } else if !clean_html.is_empty() {
+        mail::html_to_text(&clean_html)
+    } else {
+        String::new()
+    };
+
+    let incoming_atts = attachments.unwrap_or_default();
+    if clean_plain.is_empty() && clean_html.is_empty() && incoming_atts.is_empty() {
+        return Err("邮件正文与附件不能同时为空".into());
+    }
+
+    let policy = state.db.reply_policy().unwrap_or_default();
+    if policy.outbound_dlp_guard && !force_dlp_override.unwrap_or(false) {
+        let dlp = privacy::check_outbound_dlp(&subject, &clean_plain, &clean_html, true);
+        if !dlp.passed {
+            return Err(format!("DLP_BLOCK: {}", dlp.findings.join("；")));
+        }
+    }
+
+    const MAX_SEND_ATT_BYTES: usize = 25 * 1024 * 1024;
+    let mut saved_metas: Vec<AttachmentMeta> = Vec::with_capacity(incoming_atts.len());
+    let mut outgoing_atts: Vec<mail::OutgoingAttachment> = Vec::with_capacity(incoming_atts.len());
+    for (idx, item) in incoming_atts.into_iter().enumerate() {
+        if is_dangerous_executable_filename(&item.filename) {
+            return Err(format!(
+                "安全限制：禁止发送可执行程序或脚本附件（{}）",
+                item.filename
+            ));
+        }
+        let bytes = mail::base64_decode(&item.data_base64).map_err(err)?;
+        if bytes.is_empty() {
+            return Err("附件内容为空".into());
+        }
+        if bytes.len() > MAX_SEND_ATT_BYTES {
+            return Err("单个附件大小不能超过 25 MB".into());
+        }
+        let meta = mail::build_attachment_meta(
+            &item.filename,
+            &item.mime,
+            bytes.len(),
+            "",
+            "",
+            idx,
+            &bytes,
+        );
+        outgoing_atts.push(mail::OutgoingAttachment {
+            filename: meta.filename.clone(),
+            mime: meta.mime.clone(),
+            bytes,
+        });
+        saved_metas.push(meta);
+    }
+
+    let active_scope = state.db.active_scope_email().map_err(err)?;
+    let requested_from = from_email
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && s.contains('@'))
+        .map(str::to_lowercase);
+    let target_scope = requested_from.clone().unwrap_or_else(|| active_scope.clone());
+
+    let acc_opt = if target_scope != db::UNBOUND_SCOPE {
+        config::hydrated_account_for(&state.db, &state.vault, &target_scope).map_err(err)?
+    } else {
+        config::hydrated_account(&state.db, &state.vault).map_err(err)?
+    };
+
+    let primary_peer = to_list[0].clone();
+    let (ctx, reply_quote) = if let Some(rid) = reply_to_id {
+        match state.db.reply_context_by_id_for(&target_scope, rid).map_err(err)? {
+            Some((explicit_ctx, quote)) => (Some(explicit_ctx), Some(quote)),
+            None => (None, None),
+        }
+    } else {
+        (None, None)
+    };
+
+    let final_subject = if !subject.trim().is_empty() {
+        subject.trim().to_string()
+    } else if let Some(ref c) = ctx {
+        if c.subject.trim().is_empty() {
+            "(无主题)".to_string()
+        } else if c.subject.to_lowercase().starts_with("re:") || c.subject.starts_with("回复") {
+            c.subject.trim().to_string()
+        } else {
+            format!("Re: {}", c.subject.trim())
+        }
+    } else {
+        "(无主题)".to_string()
+    };
+
+    let (in_reply_to, references) = if let Some(c) = ctx {
+        let mut refs: Vec<String> = c
+            .references
+            .split_whitespace()
+            .map(|r| format!("<{}>", r.trim_matches(&['<', '>'][..])))
+            .collect();
+        let clean_mid = format!("<{}>", c.message_id.trim_matches(&['<', '>'][..]));
+        if !c.message_id.trim().is_empty() && !refs.contains(&clean_mid) {
+            refs.push(clean_mid);
+        }
+        (
+            if c.message_id.trim().is_empty() {
+                None
+            } else {
+                Some(c.message_id)
+            },
+            if refs.is_empty() {
+                None
+            } else {
+                Some(refs.join(" "))
+            },
+        )
+    } else {
+        (None, None)
+    };
+
+    let quote_mid = reply_quote.as_ref().map(|q| q.message_id.clone());
+
+    let (mid, from_addr, from_name, folder, db_scope) = match acc_opt {
+        Some(acc) if !acc.password.is_empty() && !acc.smtp_host.is_empty() => {
+            let acc2 = acc.clone();
+            let (rcpts, ccs, bccs, subj, bp, bh, irt, refs, qmid, out_atts) = (
+                to_list.clone(),
+                cc_list.clone(),
+                bcc_list.clone(),
+                final_subject.clone(),
+                clean_plain.clone(),
+                clean_html.clone(),
+                in_reply_to.clone(),
+                references.clone(),
+                quote_mid,
+                outgoing_atts,
+            );
+            let mid = spawn_mail_blocking(move || {
+                mail::send(
+                    &acc2,
+                    &mail::Outgoing {
+                        recipients: rcpts,
+                        cc: ccs,
+                        bcc: bccs,
+                        subject: subj,
+                        body: &bp,
+                        body_html: if bh.trim().is_empty() {
+                            None
+                        } else {
+                            Some(bh.as_str())
+                        },
+                        in_reply_to: irt,
+                        references: refs,
+                        group_id: None,
+                        group_name: None,
+                        quote_mid: qmid,
+                        attachments: out_atts,
+                    },
+                )
+            })
+            .await?;
+            let em = acc.email.to_lowercase();
+            (mid, em.clone(), acc.display_name, "local", em)
+        }
+        _ => {
+            let stats = state.db.stats().map_err(err)?;
+            if !stats.has_demo {
+                return Err(
+                    "所选发件邮箱尚未配置 SMTP 授权码，请先通过「AI 助手」或「设置」绑定邮箱凭据"
+                        .into(),
+                );
+            }
+            (
+                format!("{}@mailchat.demo", uuid::Uuid::new_v4()),
+                "me@mailchat.local".to_string(),
+                "我 (演示模式)".to_string(),
+                "demo",
+                db::UNBOUND_SCOPE.to_string(),
+            )
+        }
+    };
+
+    let contact_muted = state
+        .db
+        .is_contact_muted_for(&db_scope, &primary_peer)
+        .unwrap_or(false);
+    let target_status = if contact_muted { "archived" } else { "inbox" };
+
+    let id = state
+        .db
+        .insert_message_for(
+            &db_scope,
+            &NewMessage {
+                folder: folder.into(),
+                uid: 0,
+                message_id: mid,
+                in_reply_to: in_reply_to.unwrap_or_default(),
+                references: references.unwrap_or_default(),
+                from_addr,
+                from_name,
+                to_addrs: to_list.join(","),
+                cc_addrs: cc_list.join(","),
+                subject: final_subject,
+                body: clean_plain.clone(),
+                body_full: clean_plain,
+                body_html: clean_html,
+                date: chrono::Utc::now().timestamp(),
+                outgoing: true,
+                peer: primary_peer,
+                status: target_status.into(),
+                category: String::new(),
+                summary: String::new(),
+                reason: String::new(),
+                extracted_code: String::new(),
+                suggested_reply: String::new(),
+                read: true,
+                agent_done: true,
+                attachments: saved_metas,
+                reply_to: reply_quote,
+            },
+        )
+        .map_err(err)?
+        .ok_or("邮件本地入库失败")?;
+
+    let _ = app.emit(
+        "mail-updated",
+        SyncReport {
+            new_incoming: 0,
+            agent_processed: 0,
+            error: None,
+        },
+    );
+
+    state.db.message(id).map_err(err)
+}
+
+// ============================================================================
+// 模式二：跨邮箱隐私脱敏与分级权限统一批复中心（Unified Reply Hub）
+// ============================================================================
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct UnifiedScanReport {
+    pub authorized_accounts: Vec<String>,
+    pub isolated_accounts_count: usize,
+    pub scanned_candidates: usize,
+    pub skipped_by_privacy_count: usize,
+    pub skipped_reasons: Vec<String>,
+    pub total_redactions: usize,
+    pub queued_review_count: usize,
+    pub auto_sent_count: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct BatchApproveResult {
+    pub sent_count: usize,
+    pub failed_count: usize,
+    pub errors: Vec<String>,
+}
+
+#[tauri::command]
+fn get_reply_policy(state: State<AppState>) -> CmdResult<privacy::ReplyPolicySpec> {
+    state.db.reply_policy().map_err(err)
+}
+
+#[tauri::command]
+fn save_reply_policy(
+    app: AppHandle,
+    state: State<AppState>,
+    policy: privacy::ReplyPolicySpec,
+) -> CmdResult<privacy::ReplyPolicySpec> {
+    let normalized = privacy::normalize_policy(&policy);
+    state.db.save_reply_policy(&normalized).map_err(err)?;
+    refresh_disk_toml(&state);
+    let _ = app.emit(
+        "mail-updated",
+        SyncReport {
+            new_incoming: 0,
+            agent_processed: 0,
+            error: None,
+        },
+    );
+    Ok(normalized)
+}
+
+#[tauri::command]
+fn list_reply_queue(
+    state: State<AppState>,
+    status_filter: Option<String>,
+    account_filter: Option<String>,
+) -> CmdResult<Vec<ReplyQueueItem>> {
+    state
+        .db
+        .list_reply_queue(status_filter.as_deref(), account_filter.as_deref())
+        .map_err(err)
+}
+
+#[tauri::command]
+fn get_reply_queue_stats(state: State<AppState>) -> CmdResult<ReplyQueueStats> {
+    state.db.reply_queue_stats().map_err(err)
+}
+
+async fn send_reply_queue_item_smtp(
+    db: &Arc<Db>,
+    vault: &Arc<Vault>,
+    item: &ReplyQueueItem,
+    force_dlp_override: bool,
+    outbound_dlp_guard: bool,
+) -> std::result::Result<(), String> {
+    let clean_html = privacy::sanitize_outgoing_html(&item.draft_html);
+    let clean_plain = if !item.draft_body.trim().is_empty() {
+        item.draft_body.trim().to_string()
+    } else if !clean_html.is_empty() {
+        mail::html_to_text(&clean_html)
+    } else {
+        return Err("回复草稿内容为空".into());
+    };
+
+    if outbound_dlp_guard && !force_dlp_override {
+        let dlp = privacy::check_outbound_dlp(&item.draft_subject, &clean_plain, &clean_html, true);
+        if !dlp.passed {
+            return Err(format!("出站 DLP 安全拦截：{}", dlp.findings.join("；")));
+        }
+    }
+
+    let scope = item.account_email.trim().to_lowercase();
+    let acc_opt = if scope != db::UNBOUND_SCOPE && !scope.is_empty() {
+        config::hydrated_account_for(db, vault, &scope).map_err(err)?
+    } else {
+        config::hydrated_account(db, vault).map_err(err)?
+    };
+
+    let (ctx, reply_quote) = match db
+        .reply_context_by_id_for(&scope, item.message_id_ref)
+        .map_err(err)?
+    {
+        Some((c, q)) => (Some(c), Some(q)),
+        None => (None, None),
+    };
+
+    let final_subject = if !item.draft_subject.trim().is_empty() {
+        item.draft_subject.trim().to_string()
+    } else if !item.original_subject.trim().is_empty() {
+        let os = item.original_subject.trim();
+        if os.to_lowercase().starts_with("re:") || os.starts_with("回复") {
+            os.to_string()
+        } else {
+            format!("Re: {os}")
+        }
+    } else {
+        "Re: 来信回复".to_string()
+    };
+
+    let (in_reply_to, references) = if let Some(c) = ctx {
+        let mut refs: Vec<String> = c
+            .references
+            .split_whitespace()
+            .map(|r| format!("<{}>", r.trim_matches(&['<', '>'][..])))
+            .collect();
+        let clean_mid = format!("<{}>", c.message_id.trim_matches(&['<', '>'][..]));
+        if !c.message_id.trim().is_empty() && !refs.contains(&clean_mid) {
+            refs.push(clean_mid);
+        }
+        (
+            if c.message_id.trim().is_empty() {
+                None
+            } else {
+                Some(c.message_id)
+            },
+            if refs.is_empty() {
+                None
+            } else {
+                Some(refs.join(" "))
+            },
+        )
+    } else if !item.rfc_message_id.trim().is_empty() {
+        let clean_mid = format!("<{}>", item.rfc_message_id.trim_matches(&['<', '>'][..]));
+        (Some(item.rfc_message_id.clone()), Some(clean_mid))
+    } else {
+        (None, None)
+    };
+
+    let recipient = item.sender_addr.trim().to_lowercase();
+    if !recipient.contains('@') {
+        return Err(format!("无效的目标收件人地址: {recipient}"));
+    }
+    let quote_mid = reply_quote.as_ref().map(|q| q.message_id.clone());
+
+    let (mid, from_addr, from_name, folder, write_scope) = match acc_opt {
+        Some(acc) if !acc.password.is_empty() && !acc.smtp_host.is_empty() => {
+            let acc2 = acc.clone();
+            let rcpts = vec![recipient.clone()];
+            let subj = final_subject.clone();
+            let bp = clean_plain.clone();
+            let bh = clean_html.clone();
+            let irt = in_reply_to.clone();
+            let refs = references.clone();
+            let mid = spawn_mail_blocking(move || {
+                mail::send(
+                    &acc2,
+                    &mail::Outgoing {
+                        recipients: rcpts,
+                        cc: Vec::new(),
+                        bcc: Vec::new(),
+                        subject: subj,
+                        body: &bp,
+                        body_html: if bh.trim().is_empty() {
+                            None
+                        } else {
+                            Some(bh.as_str())
+                        },
+                        in_reply_to: irt,
+                        references: refs,
+                        group_id: None,
+                        group_name: None,
+                        quote_mid,
+                        attachments: Vec::new(),
+                    },
+                )
+            })
+            .await?;
+            let em = acc.email.to_lowercase();
+            (mid, em.clone(), acc.display_name, "local", em)
+        }
+        _ => {
+            let stats = db.stats().map_err(err)?;
+            if stats.has_demo && (scope == db::UNBOUND_SCOPE || scope.is_empty()) {
+                (
+                    format!("{}@mailchat.demo", uuid::Uuid::new_v4()),
+                    "me@mailchat.local".to_string(),
+                    "我 (演示模式)".to_string(),
+                    "demo",
+                    db::UNBOUND_SCOPE.to_string(),
+                )
+            } else {
+                return Err(format!(
+                    "邮箱 `{scope}` 尚未配置有效的 SMTP 主机或授权码，无法发送"
+                ));
+            }
+        }
+    };
+
+    let peer = if item.peer.trim().is_empty() {
+        recipient.clone()
+    } else {
+        item.peer.clone()
+    };
+
+    let _ = db
+        .insert_message_for(
+            &write_scope,
+            &NewMessage {
+                folder: folder.into(),
+                uid: 0,
+                message_id: mid,
+                in_reply_to: in_reply_to.unwrap_or_default(),
+                references: references.unwrap_or_default(),
+                from_addr,
+                from_name,
+                to_addrs: recipient,
+                cc_addrs: String::new(),
+                subject: final_subject,
+                body: clean_plain.clone(),
+                body_full: clean_plain,
+                body_html: clean_html,
+                date: chrono::Utc::now().timestamp(),
+                outgoing: true,
+                peer,
+                status: "inbox".into(),
+                category: String::new(),
+                summary: String::new(),
+                reason: String::new(),
+                extracted_code: String::new(),
+                suggested_reply: String::new(),
+                read: true,
+                agent_done: true,
+                attachments: Vec::new(),
+                reply_to: reply_quote,
+            },
+        )
+        .map_err(err)?;
+
+    Ok(())
+}
+
+pub(crate) async fn run_unified_reply_scan(
+    app: &AppHandle,
+    db: &Arc<Db>,
+    vault: &Arc<Vault>,
+    include_dismissed: bool,
+) -> CmdResult<UnifiedScanReport> {
+    let policy = db.reply_policy().map_err(err)?;
+    let all_accounts = db.list_accounts().map_err(err)?;
+    let cfg = config::hydrated_instance_agent(db, vault, "mail").unwrap_or_default();
+
+    let mut report = UnifiedScanReport::default();
+    let mut authorized_scopes: Vec<String> = Vec::new();
+    let mut account_names: HashMap<String, String> = HashMap::new();
+
+    if all_accounts.is_empty() {
+        // 演示模式支持：未绑定真实邮箱但存在演示数据且显式授权了 demo@mailchat.local 时可扫描演示收件箱
+        let has_demo = db.stats().map(|s| s.has_demo).unwrap_or(false);
+        let demo_authorized = policy.enabled_accounts.iter().any(|a| {
+            let n = a.trim().to_lowercase();
+            n == "demo@mailchat.local" || n == "me@mailchat.local" || n == db::UNBOUND_SCOPE
+        });
+        if has_demo && demo_authorized {
+            authorized_scopes.push(db::UNBOUND_SCOPE.to_string());
+            report
+                .authorized_accounts
+                .push("demo@mailchat.local".to_string());
+            account_names.insert(db::UNBOUND_SCOPE.to_string(), "演示邮箱".to_string());
+        }
+    } else {
+        for acc in &all_accounts {
+            let em = acc.email.trim().to_lowercase();
+            account_names.insert(em.clone(), acc.display_name.clone());
+            if policy
+                .enabled_accounts
+                .iter()
+                .any(|x| x.trim().eq_ignore_ascii_case(&em))
+            {
+                authorized_scopes.push(em.clone());
+                report.authorized_accounts.push(em);
+            } else {
+                report.isolated_accounts_count += 1;
+            }
+        }
+    }
+
+    if authorized_scopes.is_empty() {
+        return Ok(report);
+    }
+
+    // 第一阶段：零信任仅扫描元数据（不加载任何邮件正文）
+    let candidates = db
+        .unanswered_candidate_metas(&authorized_scopes, include_dismissed, 40)
+        .map_err(err)?;
+    report.scanned_candidates = candidates.len();
+
+    let mut auto_sent_last_hour = db
+        .reply_queue_stats()
+        .map(|s| s.auto_sent_last_hour)
+        .unwrap_or(0);
+
+    for row in candidates {
+        let sender_lc = row.from_addr.trim().to_lowercase();
+        if sender_lc == "me@mailchat.local"
+            || all_accounts
+                .iter()
+                .any(|a| a.email.trim().eq_ignore_ascii_case(&sender_lc))
+        {
+            continue;
+        }
+
+        let policy_account_label = if row.account_email == db::UNBOUND_SCOPE {
+            report
+                .authorized_accounts
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "demo@mailchat.local".to_string())
+        } else {
+            row.account_email.clone()
+        };
+        let is_group = row.peer.starts_with("group:");
+
+        // 第二阶段（a）：元数据级读取准入校验（拦截槽、验证码/账单、免回复系统号、黑名单在此直接拦截，零正文读取）
+        if let privacy::ReadAccessVerdict::Denied { reason, .. } = privacy::evaluate_read_access(
+            &policy,
+            &policy_account_label,
+            is_group,
+            &row.status,
+            &row.from_addr,
+            &row.subject,
+            &row.category,
+            &row.extracted_code,
+            "",
+        ) {
+            report.skipped_by_privacy_count += 1;
+            if report.skipped_reasons.len() < 12 {
+                report
+                    .skipped_reasons
+                    .push(format!("{} · 《{}》：{}", row.from_addr, row.subject, reason));
+            }
+            continue;
+        }
+
+        // 第二阶段（b）：仅对准入通过的邮件按字符上限加载去噪纯文本，再执行正文级隐私排除词复核
+        let stripped_body = db
+            .load_stripped_body_by_id(row.message_id_pk, policy.max_context_chars)
+            .map_err(err)?;
+
+        if let privacy::ReadAccessVerdict::Denied { reason, .. } = privacy::evaluate_read_access(
+            &policy,
+            &policy_account_label,
+            is_group,
+            &row.status,
+            &row.from_addr,
+            &row.subject,
+            &row.category,
+            &row.extracted_code,
+            &stripped_body,
+        ) {
+            report.skipped_by_privacy_count += 1;
+            if report.skipped_reasons.len() < 12 {
+                report
+                    .skipped_reasons
+                    .push(format!("{} · 《{}》：{}", row.from_addr, row.subject, reason));
+            }
+            continue;
+        }
+
+        // 第三阶段：入模前本地确定性隐私与密钥脱敏（立即丢弃原始 vault_map，确保统一批复永不持久化或外泄明文 PII）
+        const SUBJ_BODY_SEP: &str = "\n\x1e__MC_UNIFIED_SEP__\x1e\n";
+        let combined_in = format!("{}{SUBJ_BODY_SEP}{}", row.subject, stripped_body);
+        let scrub = privacy::scrub_text_with_vault(
+            &combined_in,
+            policy.redact_pii,
+            &policy.custom_redact_terms,
+        );
+        let hits = scrub.hits;
+        let scrubbed_text = scrub.scrubbed;
+        drop(scrub.vault_map);
+
+        report.total_redactions += hits.len();
+
+        let (sanitized_subj, sanitized_body) = match scrubbed_text.split_once(SUBJ_BODY_SEP) {
+            Some((s, b)) => (s.trim().to_string(), b.trim().to_string()),
+            None => (row.subject.clone(), scrubbed_text.clone()),
+        };
+        let sanitized_audit_view = format!(
+            "发件人: {} <{}>\n主题: {}\n\n{}",
+            row.from_name, row.from_addr, sanitized_subj, sanitized_body
+        );
+
+        let sender_display = if row.from_name.trim().is_empty() {
+            row.from_addr.clone()
+        } else {
+            format!("{} <{}>", row.from_name.trim(), row.from_addr)
+        };
+        let acc_disp_name = account_names
+            .get(&row.account_email)
+            .cloned()
+            .unwrap_or_default();
+
+        // 第四阶段：匹配自动化回复规则或调用统一草稿生成（仅向大模型发送已脱敏文本）
+        let matched_rule = privacy::match_auto_reply_rule(
+            &policy,
+            &policy_account_label,
+            &row.from_addr,
+            &row.subject,
+            &stripped_body,
+        );
+
+        let (draft_body, draft_html, confidence_note, used_offline_fallback) =
+            if let Some(rule) = matched_rule {
+                if rule.mode == "template" {
+                    let tpl_body = if rule.instructions_or_template.trim().is_empty() {
+                        "您好，已收到您的来信，我们会尽快处理并回复您。".to_string()
+                    } else {
+                        rule.instructions_or_template.trim().to_string()
+                    };
+                    let tpl_html = privacy::sanitize_outgoing_html(&rule.template_html);
+                    (
+                        tpl_body,
+                        tpl_html,
+                        format!("命中自动化规则「{}」固定模板", rule.name),
+                        false,
+                    )
+                } else {
+                    let combined_persona = if rule.instructions_or_template.trim().is_empty() {
+                        policy.persona_instructions.clone()
+                    } else if policy.persona_instructions.trim().is_empty() {
+                        rule.instructions_or_template.clone()
+                    } else {
+                        format!(
+                            "【本条自动化规则专属要求】：{}\n【全局回复规范】：{}",
+                            rule.instructions_or_template.trim(),
+                            policy.persona_instructions.trim()
+                        )
+                    };
+                    let gen = agent::generate_unified_reply_draft(
+                        &cfg,
+                        &policy_account_label,
+                        &acc_disp_name,
+                        &sender_display,
+                        &sanitized_subj,
+                        &sanitized_body,
+                        &combined_persona,
+                    )
+                    .await;
+                    let tpl_html = privacy::sanitize_outgoing_html(&rule.template_html);
+                    (
+                        gen.draft_body,
+                        tpl_html,
+                        format!("命中自动化规则「{}」· {}", rule.name, gen.confidence_note),
+                        gen.used_offline_fallback,
+                    )
+                }
+            } else {
+                let gen = agent::generate_unified_reply_draft(
+                    &cfg,
+                    &policy_account_label,
+                    &acc_disp_name,
+                    &sender_display,
+                    &sanitized_subj,
+                    &sanitized_body,
+                    &policy.persona_instructions,
+                )
+                .await;
+                (
+                    gen.draft_body,
+                    String::new(),
+                    gen.confidence_note,
+                    gen.used_offline_fallback,
+                )
+            };
+
+        let draft_subject = if row.subject.trim().is_empty() {
+            "Re: 来信回复".to_string()
+        } else if row.subject.to_lowercase().starts_with("re:") || row.subject.starts_with("回复") {
+            row.subject.trim().to_string()
+        } else {
+            format!("Re: {}", row.subject.trim())
+        };
+
+        let dlp = privacy::check_outbound_dlp(&draft_subject, &draft_body, &draft_html, true);
+        let dlp_warning = if dlp.passed {
+            String::new()
+        } else {
+            dlp.findings.join("；")
+        };
+
+        // 第五阶段：自动化规则 / 白名单分级发信裁决（含防乒乓死循环冷却、小时限速与出站 DLP 守卫）
+        let (perm_tier, perm_reason, want_auto_send) = if let Some(rule) = matched_rule {
+            if rule.require_review {
+                (
+                    "rule_review",
+                    format!("命中自动化规则「{}」（规则设为人工确认后发出）", rule.name),
+                    false,
+                )
+            } else if db
+                .has_recent_auto_reply_to_sender(
+                    &row.account_email,
+                    &row.from_addr,
+                    rule.cooldown_minutes,
+                )
+                .unwrap_or(false)
+            {
+                (
+                    "draft_review",
+                    format!(
+                        "防循环冷却保护：{} 分钟内已向该发件人自动回复过，降级人工待审",
+                        rule.cooldown_minutes
+                    ),
+                    false,
+                )
+            } else if auto_sent_last_hour >= policy.auto_send_hourly_limit as usize {
+                (
+                    "draft_review",
+                    format!(
+                        "已达每小时自动发信上限（{} 封/小时），降级为人工待审",
+                        policy.auto_send_hourly_limit
+                    ),
+                    false,
+                )
+            } else if !dlp.passed {
+                (
+                    "draft_review",
+                    format!("命中出站 DLP 守卫（{}），已强制降级为人工待审", dlp_warning),
+                    false,
+                )
+            } else if rule.mode != "template" && used_offline_fallback {
+                (
+                    "draft_review",
+                    format!(
+                        "命中规则「{}」但模型未在线使用了本地模板，已自动降级待审",
+                        rule.name
+                    ),
+                    false,
+                )
+            } else {
+                (
+                    "rule_auto_send",
+                    format!("命中自动化回复规则「{}」并通过冷却与 DLP 校验", rule.name),
+                    true,
+                )
+            }
+        } else {
+            let perm =
+                privacy::evaluate_send_permission(&policy, &row.from_addr, auto_sent_last_hour);
+            match perm {
+                privacy::PermissionVerdict::WhitelistedAutoSend => {
+                    if db
+                        .has_recent_auto_reply_to_sender(&row.account_email, &row.from_addr, 60)
+                        .unwrap_or(false)
+                    {
+                        (
+                            "draft_review",
+                            "防循环冷却保护：60 分钟内已向该发件人自动回复过".to_string(),
+                            false,
+                        )
+                    } else if !dlp.passed {
+                        (
+                            "draft_review",
+                            format!("命中出站 DLP 守卫（{}），已强制降级为人工待审", dlp_warning),
+                            false,
+                        )
+                    } else if used_offline_fallback {
+                        (
+                            "draft_review",
+                            "当前为本地离线模板草稿，已自动降级为人工待审".to_string(),
+                            false,
+                        )
+                    } else {
+                        (
+                            "whitelisted_auto_send",
+                            "命中已验证自动发信白名单且通过出站 DLP 校验".to_string(),
+                            true,
+                        )
+                    }
+                }
+                privacy::PermissionVerdict::DraftReview { reason } => ("draft_review", reason, false),
+            }
+        };
+
+        let snippet: String = stripped_body
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(110)
+            .collect();
+
+        let queue_id = db
+            .upsert_reply_queue_item(&NewReplyQueueItem {
+                account_email: &row.account_email,
+                message_id_ref: row.message_id_pk,
+                rfc_message_id: &row.rfc_message_id,
+                peer: &row.peer,
+                sender_addr: &row.from_addr,
+                sender_name: &row.from_name,
+                original_subject: &row.subject,
+                original_snippet: &snippet,
+                sanitized_input: &sanitized_audit_view,
+                redactions: &hits,
+                permission_tier: perm_tier,
+                permission_reason: &perm_reason,
+                draft_subject: &draft_subject,
+                draft_body: &draft_body,
+                draft_html: &draft_html,
+                confidence_note: &confidence_note,
+                dlp_warning: &dlp_warning,
+                status: "pending_review",
+                error_msg: "",
+            })
+            .map_err(err)?;
+
+        if want_auto_send {
+            if let Ok(Some(saved_item)) = db.get_reply_queue_item(queue_id) {
+                match send_reply_queue_item_smtp(
+                    db,
+                    vault,
+                    &saved_item,
+                    false,
+                    policy.outbound_dlp_guard,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        let _ = db.mark_reply_queue_status(queue_id, "auto_sent", "");
+                        auto_sent_last_hour += 1;
+                        report.auto_sent_count += 1;
+                    }
+                    Err(send_err) => {
+                        let _ =
+                            db.mark_reply_queue_status(queue_id, "pending_review", &send_err);
+                        report.queued_review_count += 1;
+                    }
+                }
+            } else {
+                report.queued_review_count += 1;
+            }
+        } else {
+            report.queued_review_count += 1;
+        }
+    }
+
+    let _ = app.emit(
+        "mail-updated",
+        SyncReport {
+            new_incoming: 0,
+            agent_processed: 0,
+            error: None,
+        },
+    );
+    let _ = app.emit("reply-queue-updated", &report);
+
+    Ok(report)
+}
+
+#[tauri::command]
+async fn scan_unified_replies(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    include_dismissed: Option<bool>,
+) -> CmdResult<UnifiedScanReport> {
+    run_unified_reply_scan(
+        &app,
+        &state.db,
+        &state.vault,
+        include_dismissed.unwrap_or(false),
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviseReplyQueueResult {
+    pub item: ReplyQueueItem,
+    pub reply: String,
+    pub thinking: String,
+    pub thinking_ms: u64,
+}
+
+#[tauri::command]
+async fn revise_reply_queue_with_agent(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: i64,
+    instruction: String,
+    request_id: Option<String>,
+) -> CmdResult<ReviseReplyQueueResult> {
+    if instruction.trim().is_empty() {
+        return Err("请输入对当前回复草稿的修改要求".into());
+    }
+    let item = state
+        .db
+        .get_reply_queue_item(id)
+        .map_err(err)?
+        .ok_or_else(|| "找不到该待审回复记录".to_string())?;
+    let cfg = config::hydrated_agent(&state.db, &state.vault).map_err(err)?;
+
+    let req_id = request_id
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| format!("revise-{}", uuid::Uuid::new_v4()));
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    {
+        state
+            .agent_cancels
+            .lock()
+            .unwrap()
+            .insert(req_id.clone(), cancel_flag.clone());
+    }
+
+    let sender_identity = if item.account_email == db::UNBOUND_SCOPE {
+        "demo@mailchat.local".to_string()
+    } else {
+        item.account_email.clone()
+    };
+
+    let input = agent::ComposeAgentInput {
+        sender_identity,
+        to: vec![item.sender_addr.clone()],
+        cc: Vec::new(),
+        current_subject: item.draft_subject.clone(),
+        current_html: item.draft_html.clone(),
+        current_plain: item.draft_body.clone(),
+        reply_context: Some(format!(
+            "【已本地脱敏的原邮件摘要（仅含脱敏占位符，严禁外泄明文隐私）】：\n{}",
+            item.sanitized_input
+        )),
+        redact_pii: false, // sanitized_input 已完成本地盲脱敏且原始 vault 已销毁
+        custom_redact_terms: Vec::new(),
+        history: Vec::new(),
+        user_prompt: instruction,
+    };
+
+    let emit_app = app.clone();
+    let emit_id = req_id.clone();
+    let res = agent::stream_compose_agent(&cfg, &input, &cancel_flag, |ev| match ev {
+        agent::ComposeAgentStreamEvent::ThinkingDelta { delta, thinking_ms } => {
+            let _ = emit_app.emit(
+                "compose-agent-stream",
+                ComposeAgentStreamPayload {
+                    request_id: emit_id.clone(),
+                    kind: "thinking".into(),
+                    delta: delta.to_string(),
+                    thinking_ms,
+                },
+            );
+        }
+        agent::ComposeAgentStreamEvent::ContentDelta { delta } => {
+            let _ = emit_app.emit(
+                "compose-agent-stream",
+                ComposeAgentStreamPayload {
+                    request_id: emit_id.clone(),
+                    kind: "content".into(),
+                    delta: delta.to_string(),
+                    thinking_ms: 0,
+                },
+            );
+        }
+        agent::ComposeAgentStreamEvent::HtmlPreviewDelta { html } => {
+            let _ = emit_app.emit(
+                "compose-agent-stream",
+                ComposeAgentStreamPayload {
+                    request_id: emit_id.clone(),
+                    kind: "html_preview".into(),
+                    delta: html.to_string(),
+                    thinking_ms: 0,
+                },
+            );
+        }
+    })
+    .await;
+
+    {
+        state.agent_cancels.lock().unwrap().remove(&req_id);
+    }
+
+    let next_subj = res
+        .suggested_subject
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&item.draft_subject)
+        .to_string();
+    let next_html = match res.suggested_html {
+        Some(ref h) if !h.trim().is_empty() => privacy::sanitize_outgoing_html(h),
+        _ => String::new(),
+    };
+    let next_body = if let Some(ref p) = res.suggested_plain {
+        if !p.trim().is_empty() {
+            p.trim().to_string()
+        } else if !next_html.is_empty() {
+            mail::html_to_text(&next_html)
+        } else {
+            item.draft_body.clone()
+        }
+    } else if !next_html.is_empty() {
+        mail::html_to_text(&next_html)
+    } else {
+        item.draft_body.clone()
+    };
+
+    let dlp = privacy::check_outbound_dlp(&next_subj, &next_body, &next_html, true);
+    let dlp_warning = if dlp.passed {
+        String::new()
+    } else {
+        dlp.findings.join("；")
+    };
+
+    let updated = state
+        .db
+        .update_reply_queue_draft(id, &next_subj, &next_body, &next_html, &dlp_warning)
+        .map_err(err)?
+        .ok_or_else(|| "更新待审回复草稿失败".to_string())?;
+
+    let _ = app.emit("reply-queue-updated", &updated);
+
+    Ok(ReviseReplyQueueResult {
+        item: updated,
+        reply: res.reply,
+        thinking: res.thinking,
+        thinking_ms: res.thinking_ms,
+    })
+}
+
+#[tauri::command]
+fn update_reply_queue_item(
+    state: State<AppState>,
+    id: i64,
+    draft_subject: String,
+    draft_body: String,
+    draft_html: Option<String>,
+) -> CmdResult<ReplyQueueItem> {
+    let clean_html = privacy::sanitize_outgoing_html(&draft_html.unwrap_or_default());
+    let dlp = privacy::check_outbound_dlp(&draft_subject, &draft_body, &clean_html, true);
+    let dlp_warning = if dlp.passed {
+        String::new()
+    } else {
+        dlp.findings.join("；")
+    };
+    state
+        .db
+        .update_reply_queue_draft(id, draft_subject.trim(), draft_body.trim(), &clean_html, &dlp_warning)
+        .map_err(err)?
+        .ok_or_else(|| "找不到该待审回复记录".to_string())
+}
+
+#[tauri::command]
+async fn approve_send_reply_queue(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    ids: Vec<i64>,
+    force_dlp_override: Option<bool>,
+) -> CmdResult<BatchApproveResult> {
+    if ids.is_empty() {
+        return Err("请至少选择 1 封待批准回复的邮件".into());
+    }
+    let policy = state.db.reply_policy().unwrap_or_default();
+    let force_override = force_dlp_override.unwrap_or(false);
+    let mut out = BatchApproveResult::default();
+
+    for id in ids {
+        let Some(item) = state.db.get_reply_queue_item(id).map_err(err)? else {
+            continue;
+        };
+        if item.status == "approved_sent" || item.status == "auto_sent" {
+            continue;
+        }
+        match send_reply_queue_item_smtp(
+            &state.db,
+            &state.vault,
+            &item,
+            force_override,
+            policy.outbound_dlp_guard,
+        )
+        .await
+        {
+            Ok(()) => {
+                let _ = state.db.mark_reply_queue_status(id, "approved_sent", "");
+                out.sent_count += 1;
+            }
+            Err(e) => {
+                let _ = state.db.mark_reply_queue_status(id, "failed", &e);
+                out.failed_count += 1;
+                out.errors
+                    .push(format!("{} ({}): {}", item.sender_addr, item.account_email, e));
+            }
+        }
+    }
+
+    let _ = app.emit(
+        "mail-updated",
+        SyncReport {
+            new_incoming: 0,
+            agent_processed: 0,
+            error: None,
+        },
+    );
+
+    Ok(out)
+}
+
+#[tauri::command]
+fn dismiss_reply_queue_items(
+    app: AppHandle,
+    state: State<AppState>,
+    ids: Vec<i64>,
+) -> CmdResult<usize> {
+    let mut n = 0usize;
+    for id in ids {
+        state
+            .db
+            .mark_reply_queue_status(id, "dismissed", "")
+            .map_err(err)?;
+        n += 1;
+    }
+    let _ = app.emit(
+        "mail-updated",
+        SyncReport {
+            new_incoming: 0,
+            agent_processed: 0,
+            error: None,
+        },
+    );
+    Ok(n)
+}
+
+#[tauri::command]
+fn clear_finished_reply_queue(app: AppHandle, state: State<AppState>) -> CmdResult<usize> {
+    let n = state.db.clear_finished_reply_queue().map_err(err)?;
+    let _ = app.emit(
+        "mail-updated",
+        SyncReport {
+            new_incoming: 0,
+            agent_processed: 0,
+            error: None,
+        },
+    );
+    Ok(n)
+}
+
 #[cfg(target_os = "windows")]
 fn apply_win11_window_style(window: &tauri::WebviewWindow) {
     #[link(name = "kernel32")]
@@ -3141,6 +5131,7 @@ fn apply_win11_window_style(window: &tauri::WebviewWindow) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             #[cfg(target_os = "windows")]
             if let Some(win) = app.get_webview_window("main") {
@@ -3193,6 +5184,11 @@ pub fn run() {
 
             let syncing = Arc::new(AtomicBool::new(false));
             let watcher = Arc::new(WatcherControl::new());
+            let base_tray_icon = app.default_window_icon().map(|i| {
+                tauri::image::Image::new_owned(i.rgba().to_vec(), i.width(), i.height())
+            });
+            let tray_mgr = tray::TrayAlertManager::new(base_tray_icon);
+            let updater_mgr = Arc::new(updater::UpdaterManager::new());
             let app_dir_for_state = dir.clone();
             app.manage(AppState {
                 app_dir: app_dir_for_state,
@@ -3200,10 +5196,28 @@ pub fn run() {
                 vault: vault.clone(),
                 syncing: syncing.clone(),
                 watcher: watcher.clone(),
+                tray: tray_mgr.clone(),
+                updater: updater_mgr.clone(),
                 agent_cancels: Mutex::new(HashMap::new()),
+                dock_win: Mutex::new(DockWindowState::default()),
             });
 
+            let _ = tray::setup_system_tray_and_window_hooks(
+                app,
+                &dir,
+                db.clone(),
+                vault.clone(),
+                syncing.clone(),
+                watcher.clone(),
+                tray_mgr,
+            );
+
             let handle = app.handle().clone();
+            updater::spawn_background_update_checker(
+                handle.clone(),
+                db.clone(),
+                updater_mgr,
+            );
 
             // 零配置无感沿用：若用户尚未启用/配置任何模型 API Key，且本机 Magpie 路由网关已在线并配好模型，自动在后台沿用接入
             let should_probe_adopt = db
@@ -3276,6 +5290,17 @@ pub fn run() {
             get_declarative_config,
             apply_declarative_config,
             apply_declarative_spec,
+            get_theme_config,
+            save_theme_config,
+            get_window_config,
+            save_window_config,
+            get_update_config,
+            save_update_config,
+            get_update_status,
+            check_app_update,
+            download_app_update,
+            install_app_update,
+            skip_app_update_version,
             list_secrets,
             set_secret,
             delete_secret,
@@ -3288,6 +5313,16 @@ pub fn run() {
             clear_agent_session_turns,
             rewind_agent_session,
             switch_active_model,
+            get_agent_instance_state,
+            list_instance_sessions,
+            create_instance_session,
+            get_instance_session_turns,
+            delete_instance_session,
+            rewind_instance_session,
+            switch_instance_model,
+            connect_instance_magpie,
+            run_agent_kernel_turn,
+            cancel_agent_kernel_turn,
             list_accounts,
             get_account,
             save_account,
@@ -3302,6 +5337,7 @@ pub fn run() {
             start_magpie_gateway,
             connect_magpie,
             window_action,
+            set_agent_dock_expanded,
             reclassify_messages,
             sync_now,
             poke_mail_sync,
@@ -3339,6 +5375,20 @@ pub fn run() {
             clear_demo_data,
             open_external_url,
             start_screen_snip,
+            preview_privacy_scrub,
+            chat_compose_agent,
+            cancel_compose_agent,
+            send_composed_mail,
+            get_reply_policy,
+            save_reply_policy,
+            list_reply_queue,
+            get_reply_queue_stats,
+            scan_unified_replies,
+            revise_reply_queue_with_agent,
+            update_reply_queue_item,
+            approve_send_reply_queue,
+            dismiss_reply_queue_items,
+            clear_finished_reply_queue,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

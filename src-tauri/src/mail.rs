@@ -55,8 +55,13 @@ type Session = imap::Session<ImapStream>;
 /// 首次同步时每个文件夹最多拉取的邮件数
 const INITIAL_FETCH: usize = 200;
 
+#[derive(Debug, Clone, Default)]
 pub struct SyncOutcome {
     pub new_incoming: usize,
+    /// 增量同步（排除初次绑定邮箱拉取历史邮件）中立即进入“消息(inbox)”且未读的新来信数量
+    pub alert_inbox_unread: usize,
+    /// 增量同步中进入后台 AI 智能分拣队列的新来信 ID（分拣若落入 inbox 则触发闪烁，落入通知或拦截则不打扰）
+    pub fresh_pending_ids: Vec<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,9 +282,19 @@ impl RealtimeSession {
         self.supports_idle
     }
 
+    #[allow(dead_code)]
     pub fn sync_inbox(&mut self, acc: &Account, db: &Db, agent_enabled: bool) -> Result<usize> {
+        Ok(self.sync_inbox_outcome(acc, db, agent_enabled)?.new_incoming)
+    }
+
+    pub fn sync_inbox_outcome(
+        &mut self,
+        acc: &Account,
+        db: &Db,
+        agent_enabled: bool,
+    ) -> Result<SyncOutcome> {
         let rules = db.rules()?;
-        sync_folder_on(&mut self.session, "INBOX", false, acc, db, &rules, agent_enabled)
+        sync_folder_batch(&mut self.session, "INBOX", false, acc, db, &rules, agent_enabled)
     }
 
     pub fn sync_sent(&mut self, acc: &Account, db: &Db, agent_enabled: bool) -> Result<usize> {
@@ -372,24 +387,24 @@ fn find_sent_folder<S: Read + Write>(session: &mut imap::Session<S>) -> Option<S
 
 pub fn sync_with_hook<F>(acc: &Account, db: &Db, agent_enabled: bool, mut on_inbox_new: F) -> Result<SyncOutcome>
 where
-    F: FnMut(usize),
+    F: FnMut(&SyncOutcome),
 {
     let mut session = connect(acc)?;
     let rules = db.rules()?;
-    let mut new_incoming = sync_folder_on(&mut session, "INBOX", false, acc, db, &rules, agent_enabled)?;
-    if new_incoming > 0 {
-        on_inbox_new(new_incoming);
+    let mut outcome = sync_folder_batch(&mut session, "INBOX", false, acc, db, &rules, agent_enabled)?;
+    if outcome.new_incoming > 0 {
+        on_inbox_new(&outcome);
     }
     if let Some(sent) = find_sent_folder(&mut session) {
-        new_incoming += sync_folder_on(&mut session, &sent, true, acc, db, &rules, agent_enabled)?;
+        outcome.new_incoming += sync_folder_on(&mut session, &sent, true, acc, db, &rules, agent_enabled)?;
     }
     if let Ok((_, enriched, _)) = backfill_html_on(&mut session, &acc.email, db, 40) {
-        if enriched > 0 && new_incoming == 0 {
-            on_inbox_new(0);
+        if enriched > 0 && outcome.new_incoming == 0 {
+            on_inbox_new(&SyncOutcome::default());
         }
     }
     let _ = session.logout();
-    Ok(SyncOutcome { new_incoming })
+    Ok(outcome)
 }
 
 #[allow(dead_code)]
@@ -1057,18 +1072,26 @@ fn fetch_partial_mail_without_attachments<S: Read + Write>(
     }))
 }
 
+#[derive(Default)]
+struct IngestOutcome {
+    counted_incoming: bool,
+    immediate_inbox_alert: bool,
+    fresh_pending_id: Option<i64>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn ingest_parsed_mail(
     parsed: ParsedMail,
     seen: bool,
     is_sent: bool,
+    is_initial_backfill: bool,
     last: u32,
     me: &str,
     acc: &Account,
     db: &Db,
     rules: &[Rule],
     agent_enabled: bool,
-) -> Result<bool> {
+) -> Result<IngestOutcome> {
     let mut nm = parsed.msg;
     nm.outgoing = is_sent || nm.from_addr == me;
     let others = normalize_members(&parsed.participants, me);
@@ -1105,7 +1128,7 @@ fn ingest_parsed_mail(
     } else if nm.outgoing {
         match nm.to_addrs.split(',').next().filter(|s| !s.is_empty()) {
             Some(p) => nm.peer = p.to_string(),
-            None => return Ok(false),
+            None => return Ok(IngestOutcome::default()),
         }
     } else {
         nm.peer = nm.from_addr.clone();
@@ -1156,7 +1179,21 @@ fn ingest_parsed_mail(
         nm.agent_done = true;
     }
 
-    Ok(db.insert_message_for(me, &nm)?.is_some() && !nm.outgoing)
+    let inserted_id = db.insert_message_for(me, &nm)?;
+    let counted_incoming = inserted_id.is_some() && !nm.outgoing;
+    let is_realtime_unread = counted_incoming && !is_initial_backfill && !is_sent && !nm.read;
+    let immediate_inbox_alert = is_realtime_unread && nm.agent_done && nm.status == "inbox";
+    let fresh_pending_id = if is_realtime_unread && !nm.agent_done {
+        inserted_id
+    } else {
+        None
+    };
+
+    Ok(IngestOutcome {
+        counted_incoming,
+        immediate_inbox_alert,
+        fresh_pending_id,
+    })
 }
 
 pub(crate) fn sync_folder_on<S: Read + Write>(
@@ -1168,20 +1205,33 @@ pub(crate) fn sync_folder_on<S: Read + Write>(
     rules: &[Rule],
     agent_enabled: bool,
 ) -> Result<usize> {
+    Ok(sync_folder_batch(session, folder, is_sent, acc, db, rules, agent_enabled)?.new_incoming)
+}
+
+pub(crate) fn sync_folder_batch<S: Read + Write>(
+    session: &mut imap::Session<S>,
+    folder: &str,
+    is_sent: bool,
+    acc: &Account,
+    db: &Db,
+    rules: &[Rule],
+    agent_enabled: bool,
+) -> Result<SyncOutcome> {
     let me = acc.email.trim().to_lowercase();
     let mb = session.select(folder).with_context(|| format!("打开文件夹 {folder} 失败"))?;
     let validity = mb.uid_validity.unwrap_or(0);
     let (stored_validity, stored_last) = db.sync_state_for(&me, folder)?;
+    let is_initial_backfill = stored_validity == 0 || stored_validity != validity;
     let last = if stored_validity == validity { stored_last } else { 0 };
 
     // 快速短路：当 UIDVALIDITY 未变且邮箱为空或 UIDNEXT 未超过已同步最大 UID 时，直接跳过 UID SEARCH 往返
     if last > 0 {
         if mb.exists == 0 {
-            return Ok(0);
+            return Ok(SyncOutcome::default());
         }
         if let Some(uid_next) = mb.uid_next {
             if uid_next <= last + 1 {
-                return Ok(0);
+                return Ok(SyncOutcome::default());
             }
         }
     }
@@ -1205,7 +1255,19 @@ pub(crate) fn sync_folder_on<S: Read + Write>(
     }
 
     let mut max_uid = last;
-    let mut new_incoming = 0;
+    let mut outcome = SyncOutcome::default();
+    let mut record_ingest = |res: IngestOutcome| {
+        if res.counted_incoming {
+            outcome.new_incoming += 1;
+        }
+        if res.immediate_inbox_alert {
+            outcome.alert_inbox_unread += 1;
+        }
+        if let Some(pid) = res.fresh_pending_id {
+            outcome.fresh_pending_ids.push(pid);
+        }
+    };
+
     for chunk in uids.chunks(50) {
         let set = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
         // 第一步：仅查询轻量结构元数据与信封头，识别含附件邮件以彻底跳过附件内容下载
@@ -1223,9 +1285,18 @@ pub(crate) fn sync_folder_on<S: Read + Write>(
                     // 兼容直接返回 BODY[] 的极简测试桩或代理服务端
                     if let Some(raw) = f.body() {
                         if let Some(parsed) = parse_full(raw, folder, uid, validity) {
-                            if ingest_parsed_mail(parsed, seen, is_sent, last, &me, acc, db, rules, agent_enabled)? {
-                                new_incoming += 1;
-                            }
+                            record_ingest(ingest_parsed_mail(
+                                parsed,
+                                seen,
+                                is_sent,
+                                is_initial_backfill,
+                                last,
+                                &me,
+                                acc,
+                                db,
+                                rules,
+                                agent_enabled,
+                            )?);
                         }
                         continue;
                     }
@@ -1243,9 +1314,18 @@ pub(crate) fn sync_folder_on<S: Read + Write>(
                             folder,
                             validity,
                         )? {
-                            if ingest_parsed_mail(parsed, seen, is_sent, last, &me, acc, db, rules, agent_enabled)? {
-                                new_incoming += 1;
-                            }
+                            record_ingest(ingest_parsed_mail(
+                                parsed,
+                                seen,
+                                is_sent,
+                                is_initial_backfill,
+                                last,
+                                &me,
+                                acc,
+                                db,
+                                rules,
+                                agent_enabled,
+                            )?);
                         }
                     } else {
                         full_fetch_uids.push((uid, seen));
@@ -1268,9 +1348,18 @@ pub(crate) fn sync_folder_on<S: Read + Write>(
                             f.flags().iter().any(|fl| matches!(fl, imap::types::Flag::Seen))
                         });
                         let Some(parsed) = parse_full(raw, folder, uid, validity) else { continue };
-                        if ingest_parsed_mail(parsed, seen, is_sent, last, &me, acc, db, rules, agent_enabled)? {
-                            new_incoming += 1;
-                        }
+                        record_ingest(ingest_parsed_mail(
+                            parsed,
+                            seen,
+                            is_sent,
+                            is_initial_backfill,
+                            last,
+                            &me,
+                            acc,
+                            db,
+                            rules,
+                            agent_enabled,
+                        )?);
                     }
                 }
             }
@@ -1283,9 +1372,18 @@ pub(crate) fn sync_folder_on<S: Read + Write>(
                     let Some(raw) = f.body() else { continue };
                     let seen = f.flags().iter().any(|fl| matches!(fl, imap::types::Flag::Seen));
                     let Some(parsed) = parse_full(raw, folder, uid, validity) else { continue };
-                    if ingest_parsed_mail(parsed, seen, is_sent, last, &me, acc, db, rules, agent_enabled)? {
-                        new_incoming += 1;
-                    }
+                    record_ingest(ingest_parsed_mail(
+                        parsed,
+                        seen,
+                        is_sent,
+                        is_initial_backfill,
+                        last,
+                        &me,
+                        acc,
+                        db,
+                        rules,
+                        agent_enabled,
+                    )?);
                 }
             }
         }
@@ -1293,7 +1391,7 @@ pub(crate) fn sync_folder_on<S: Read + Write>(
     if max_uid > last || stored_validity != validity {
         db.save_sync_state_for(&me, folder, validity, max_uid)?;
     }
-    Ok(new_incoming)
+    Ok(outcome)
 }
 
 pub(crate) fn backfill_html_on<S: Read + Write>(
@@ -2427,12 +2525,12 @@ pub fn clean_body(text: &str) -> String {
             Regex::new(r"(?mi)^[ \t]*-{2,}[ \t]*(?:Original Message|Original|原始邮件|原邮件|回复的原邮件|回复邮件|Replied Message|Reply Message|Forwarded message|转发邮件|转发的邮件|转发的原邮件|已转发邮件)[ \t]*-{2,}[ \t]*$").unwrap(),
             // 转发引导行
             Regex::new(r"(?mi)^[ \t]*(?:Begin forwarded message:|下面是被转发的邮件[：:]|以下是转发的邮件[：:])[ \t]*$").unwrap(),
-            // 英文客户端 On ... wrote:（兼容 72 列自动折成两行的情况，不跨空行）
-            Regex::new(r"(?mi)^[ \t]*On [^\n]{4,180}(?:\n[^\n]{1,120})?\bwrote:[ \t]*$").unwrap(),
+            // 英文客户端 On ... wrote:（兼容 72 列自动折成两行的情况，包括第二行直接为 wrote:，不跨空行）
+            Regex::new(r"(?mi)^[ \t]*On [^\n]{4,180}(?:\n[^\n]{0,120})?\bwrote:[ \t]*$").unwrap(),
             // 中文客户端 在 ... 写道：（兼容折成两行）
-            Regex::new(r"(?m)^[ \t]*在[ \t]*[^\n]{4,180}(?:\n[^\n]{1,120})?写道[：:][ \t]*$").unwrap(),
+            Regex::new(r"(?m)^[ \t]*在[ \t]*[^\n]{4,180}(?:\n[^\n]{0,120})?写道[：:][ \t]*$").unwrap(),
             // Gmail 中文版：xxx <xxx@...> 于2026年11月14日周六 13:20写道：（兼容折成两行）
-            Regex::new(r"(?m)^[ \t]*[^\n]{2,140}于[ \t]*20\d{2}[^\n]{2,80}(?:\n[^\n]{1,80})?写道[：:][ \t]*$").unwrap(),
+            Regex::new(r"(?m)^[ \t]*[^\n]{2,140}于[ \t]*20\d{2}[^\n]{2,80}(?:\n[^\n]{0,80})?写道[：:][ \t]*$").unwrap(),
             // Outlook / Exchange 下划线分隔或长横线 + 发件人头
             Regex::new(r"(?mi)^[ \t]*_{5,}[ \t]*$").unwrap(),
             Regex::new(r"(?mi)^[ \t]*-{20,}[ \t]*\n+[ \t]*(?:\|[ \t]*)?(?:From|发件人)[ \t]*(?:\||[:：])").unwrap(),
@@ -2577,8 +2675,11 @@ pub struct OutgoingAttachment {
 
 pub struct Outgoing<'a> {
     pub recipients: Vec<String>,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
     pub subject: String,
     pub body: &'a str,
+    pub body_html: Option<&'a str>,
     pub in_reply_to: Option<String>,
     pub references: Option<String>,
     pub group_id: Option<String>,
@@ -2587,12 +2688,11 @@ pub struct Outgoing<'a> {
     pub attachments: Vec<OutgoingAttachment>,
 }
 
-/// 发送单聊或群聊（多收件人全员回复，支持图片与文件附件及消息引用头）邮件，返回不带尖括号的 Message-ID
-pub fn send(acc: &Account, out: &Outgoing) -> Result<String> {
+/// 组装标准 RFC MIME 邮件（支持 To / Cc / Bcc、multipart/alternative HTML + 纯文本回退、以及 multipart/mixed 附件）
+pub fn build_mime_email(acc: &Account, out: &Outgoing) -> Result<(lettre::Message, String)> {
     use lettre::message::{header::ContentType, Attachment, Body, Mailbox, MultiPart, SinglePart};
-    use lettre::Transport;
 
-    if out.recipients.is_empty() {
+    if out.recipients.is_empty() && out.cc.is_empty() && out.bcc.is_empty() {
         anyhow::bail!("收件人列表不能为空");
     }
 
@@ -2612,9 +2712,30 @@ pub fn send(acc: &Account, out: &Outgoing) -> Result<String> {
 
     for rcpt in &out.recipients {
         let mbox: Mailbox = rcpt
+            .trim()
             .parse()
             .with_context(|| format!("收件人邮箱格式无效: {rcpt}"))?;
         b = b.to(mbox);
+    }
+    for cc_rcpt in &out.cc {
+        let clean = cc_rcpt.trim();
+        if clean.is_empty() {
+            continue;
+        }
+        let mbox: Mailbox = clean
+            .parse()
+            .with_context(|| format!("抄送邮箱格式无效: {clean}"))?;
+        b = b.cc(mbox);
+    }
+    for bcc_rcpt in &out.bcc {
+        let clean = bcc_rcpt.trim();
+        if clean.is_empty() {
+            continue;
+        }
+        let mbox: Mailbox = clean
+            .parse()
+            .with_context(|| format!("密送邮箱格式无效: {clean}"))?;
+        b = b.bcc(mbox);
     }
 
     if let Some(r) = &out.in_reply_to {
@@ -2645,23 +2766,78 @@ pub fn send(acc: &Account, out: &Outgoing) -> Result<String> {
         }
     }
 
-    let email = if out.attachments.is_empty() {
-        b.header(ContentType::TEXT_PLAIN).body(out.body.to_string())?
+    let html_opt = out.body_html.map(str::trim).filter(|s| !s.is_empty());
+    let plain_text = if !out.body.trim().is_empty() {
+        out.body.to_string()
+    } else if let Some(h) = html_opt {
+        html_to_text(h)
     } else {
-        let mut mp = MultiPart::mixed().singlepart(
-            SinglePart::builder()
-                .header(ContentType::TEXT_PLAIN)
-                .body(out.body.to_string()),
-        );
-        for att in &out.attachments {
-            let ct = ContentType::parse(&att.mime)
-                .unwrap_or_else(|_| ContentType::parse("application/octet-stream").unwrap());
-            mp = mp.singlepart(
-                Attachment::new(att.filename.clone()).body(Body::new(att.bytes.clone()), ct),
-            );
-        }
-        b.multipart(mp)?
+        String::new()
     };
+
+    let email = match (html_opt, out.attachments.is_empty()) {
+        (None, true) => b.header(ContentType::TEXT_PLAIN).body(plain_text)?,
+        (Some(html_str), true) => {
+            let alt = MultiPart::alternative()
+                .singlepart(
+                    SinglePart::builder()
+                        .header(ContentType::TEXT_PLAIN)
+                        .body(plain_text),
+                )
+                .singlepart(
+                    SinglePart::builder()
+                        .header(ContentType::TEXT_HTML)
+                        .body(html_str.to_string()),
+                );
+            b.multipart(alt)?
+        }
+        (None, false) => {
+            let mut mp = MultiPart::mixed().singlepart(
+                SinglePart::builder()
+                    .header(ContentType::TEXT_PLAIN)
+                    .body(plain_text),
+            );
+            for att in &out.attachments {
+                let ct = ContentType::parse(&att.mime)
+                    .unwrap_or_else(|_| ContentType::parse("application/octet-stream").unwrap());
+                mp = mp.singlepart(
+                    Attachment::new(att.filename.clone()).body(Body::new(att.bytes.clone()), ct),
+                );
+            }
+            b.multipart(mp)?
+        }
+        (Some(html_str), false) => {
+            let alt = MultiPart::alternative()
+                .singlepart(
+                    SinglePart::builder()
+                        .header(ContentType::TEXT_PLAIN)
+                        .body(plain_text),
+                )
+                .singlepart(
+                    SinglePart::builder()
+                        .header(ContentType::TEXT_HTML)
+                        .body(html_str.to_string()),
+                );
+            let mut mp = MultiPart::mixed().multipart(alt);
+            for att in &out.attachments {
+                let ct = ContentType::parse(&att.mime)
+                    .unwrap_or_else(|_| ContentType::parse("application/octet-stream").unwrap());
+                mp = mp.singlepart(
+                    Attachment::new(att.filename.clone()).body(Body::new(att.bytes.clone()), ct),
+                );
+            }
+            b.multipart(mp)?
+        }
+    };
+
+    Ok((email, mid))
+}
+
+/// 发送单聊、群聊或传统富文本 HTML 邮件（支持 To / Cc / Bcc、附件及线程头），返回不带尖括号的 Message-ID
+pub fn send(acc: &Account, out: &Outgoing) -> Result<String> {
+    use lettre::Transport;
+
+    let (email, mid) = build_mime_email(acc, out)?;
     smtp_transport(acc)?.send(&email).context("SMTP 发送失败")?;
     Ok(mid)
 }
@@ -2681,6 +2857,44 @@ mod tests {
         assert_eq!(others.len(), 3);
         assert_eq!(p.group_id_hdr.as_deref(), Some("grp-123"));
         assert_eq!(p.group_name_hdr.as_deref(), Some("Team Sync"));
+    }
+
+    #[test]
+    fn builds_multipart_alternative_html_with_cc_and_hidden_bcc() {
+        let acc = Account {
+            email: "sender@nebula-studio.cn".into(),
+            display_name: "林悦".into(),
+            ..Default::default()
+        };
+        let html = r#"<div style="max-width:600px;"><h2>Q4 发布通知</h2><p>详情见 <a href="https://example.com">官网</a></p></div>"#;
+        let out = Outgoing {
+            recipients: vec!["to@partner.com".into()],
+            cc: vec!["cc@partner.com".into()],
+            bcc: vec!["secret-audit@nebula-studio.cn".into()],
+            subject: "Q4 发布通知".into(),
+            body: "",
+            body_html: Some(html),
+            in_reply_to: None,
+            references: None,
+            group_id: None,
+            group_name: None,
+            quote_mid: None,
+            attachments: vec![],
+        };
+        let (msg, mid) = build_mime_email(&acc, &out).unwrap();
+        assert!(mid.ends_with("@nebula-studio.cn"));
+
+        // SMTP 信封必须包含 To + Cc + Bcc 全部 3 个投递目标
+        assert_eq!(msg.envelope().to().len(), 3);
+
+        // 导出的 RFC5322 原始字节中不得暴露 Bcc 地址，且必须同时包含 text/plain 与 text/html
+        let formatted = String::from_utf8_lossy(&msg.formatted()).into_owned();
+        assert!(!formatted.contains("secret-audit@nebula-studio.cn"));
+        assert!(formatted.contains("to@partner.com"));
+        assert!(formatted.contains("cc@partner.com"));
+        assert!(formatted.contains("multipart/alternative"));
+        assert!(formatted.contains("text/html"));
+        assert!(formatted.contains("text/plain"));
     }
 
     #[test]
@@ -2752,7 +2966,7 @@ mod tests {
 
     #[test]
     fn cleans_netease_reply_pipe_table_and_mobile_signatures() {
-        let sample = "已收到，谢谢\r\n\r\n---- 回复的原邮件 ----\r\n| 发件人 | arrake<arrake@163.com> |\r\n| 日期 | 2026年11月14日 13:20 |\r\n| 收件人 | arrake@126.com |\r\n| 抄送至 | |\r\n| 主题 | 来自 arrake 的消息 |\r\nhi";
+        let sample = "已收到，谢谢\r\n\r\n---- 回复的原邮件 ----\r\n| 发件人 | linyue<linyue@163.com> |\r\n| 日期 | 2026年11月14日 13:20 |\r\n| 收件人 | zhouming@126.com |\r\n| 抄送至 | |\r\n| 主题 | 来自 linyue 的消息 |\r\nhi";
         assert_eq!(clean_body(sample), "已收到，谢谢");
 
         let with_sig = "好的，马上处理\n\n发自网易邮箱大师\n---- 回复的原邮件 ----\n| 发件人 | a@163.com |\n| 日期 | 2026-11-14 |";
@@ -2761,10 +2975,10 @@ mod tests {
 
     #[test]
     fn cleans_multiline_gmail_and_qq_quotes() {
-        let gmail_en = "Sounds good to me!\n\nOn Sat, Nov 14, 2026 at 1:20 PM Arrake <arrake@gmail.com>\nwrote:\n> Hello there";
+        let gmail_en = "Sounds good to me!\n\nOn Sat, Nov 14, 2026 at 1:20 PM Alex <alex@gmail.com>\nwrote:\n> Hello there";
         assert_eq!(clean_body(gmail_en), "Sounds good to me!");
 
-        let gmail_zh = "没问题，下午见\n\narrake <arrake@163.com> 于2026年11月14日周六\n13:20写道：\n> hi";
+        let gmail_zh = "没问题，下午见\n\nlinyue <linyue@163.com> 于2026年11月14日周六\n13:20写道：\n> hi";
         assert_eq!(clean_body(gmail_zh), "没问题，下午见");
 
         let qq_mail = "收到附件了\n\n------------------ 原始邮件 ------------------\n发件人: \"Alice\" <alice@qq.com>;\n发送时间: 2026年11月14日 13:20";
@@ -2773,11 +2987,11 @@ mod tests {
 
     #[test]
     fn normalizes_wrapped_angle_urls_and_preserves_html_cta_links() {
-        let google_alert = "[image: Google]\r\n如果您并未授予访问权限，则应检查此活动，并确保您的账号安全。\r\n查看活动\r\n<https://accounts.google.com/AccountChooser?Email=yita0v0@gmail.com&continue=\r\nhttps://myaccount.google.com/alert/nt/1793841841000?rfn%3D127%26rfnc%3D1>";
+        let google_alert = "[image: Google]\r\n如果您并未授予访问权限，则应检查此活动，并确保您的账号安全。\r\n查看活动\r\n<https://accounts.google.com/AccountChooser?Email=alex.chen@example.com&continue=\r\nhttps://myaccount.google.com/alert/nt/1793841841000?rfn%3D127%26rfnc%3D1>";
         let cleaned = clean_body(google_alert);
         assert_eq!(
             cleaned,
-            "如果您并未授予访问权限，则应检查此活动，并确保您的账号安全。\n查看活动\n<https://accounts.google.com/AccountChooser?Email=yita0v0@gmail.com&continue=https://myaccount.google.com/alert/nt/1793841841000?rfn%3D127%26rfnc%3D1>"
+            "如果您并未授予访问权限，则应检查此活动，并确保您的账号安全。\n查看活动\n<https://accounts.google.com/AccountChooser?Email=alex.chen@example.com&continue=https://myaccount.google.com/alert/nt/1793841841000?rfn%3D127%26rfnc%3D1>"
         );
 
         let html = r#"<div><p>安全提醒</p><a href="https://accounts.google.com/AccountChooser?Email=a@b.com&amp;continue=x">查看活动</a></div>"#;
@@ -2996,7 +3210,7 @@ mod tests {
         // 2. 富 HTML 安全通知邮件（含 multipart/alternative + cid 内联 PNG 图标）
         let google_like = concat!(
             "From: Google <no-reply@accounts.google.com>\r\n",
-            "To: arrake@126.com\r\n",
+            "To: zhouming@126.com\r\n",
             "Subject: 有人已将您的电子邮件地址添加为其辅助邮箱\r\n",
             "Message-ID: <google-recovery-1@accounts.google.com>\r\n",
             "MIME-Version: 1.0\r\n",
@@ -3005,10 +3219,10 @@ mod tests {
             "Content-Type: multipart/alternative; boundary=\"alt_bound\"\r\n\r\n",
             "--alt_bound\r\n",
             "Content-Type: text/plain; charset=utf-8\r\n\r\n",
-            "[image: Google]\r\n有人已将 arrake@126.com 添加为其辅助邮箱。\r\n查看活动\r\n<https://accounts.google.com/AccountChooser?Email=yita0v0@gmail.com>\r\n",
+            "[image: Google]\r\n有人已将 zhouming@126.com 添加为其辅助邮箱。\r\n查看活动\r\n<https://accounts.google.com/AccountChooser?Email=alex.chen@example.com>\r\n",
             "--alt_bound\r\n",
             "Content-Type: text/html; charset=utf-8\r\n\r\n",
-            "<html><body><div style=\"border:1px solid #dadce0;border-radius:8px;padding:24px\"><img src=\"cid:google_logo@gstatic\" width=\"74\" height=\"24\" alt=\"Google\"><h2>有人已将您的电子邮件地址添加为其辅助邮箱</h2><a href=\"https://accounts.google.com/AccountChooser?Email=yita0v0@gmail.com\" style=\"background:#4184f3;color:#fff;padding:10px 24px;border-radius:4px\">查看活动</a></div></body></html>\r\n",
+            "<html><body><div style=\"border:1px solid #dadce0;border-radius:8px;padding:24px\"><img src=\"cid:google_logo@gstatic\" width=\"74\" height=\"24\" alt=\"Google\"><h2>有人已将您的电子邮件地址添加为其辅助邮箱</h2><a href=\"https://accounts.google.com/AccountChooser?Email=alex.chen@example.com\" style=\"background:#4184f3;color:#fff;padding:10px 24px;border-radius:4px\">查看活动</a></div></body></html>\r\n",
             "--alt_bound--\r\n",
             "--rel_bound\r\n",
             "Content-Type: image/png\r\n",
@@ -3018,7 +3232,7 @@ mod tests {
             "--rel_bound--\r\n"
         );
         let parsed_html = parse_full(google_like.as_bytes(), "INBOX", 2, 1).unwrap();
-        assert!(parsed_html.msg.body.contains("有人已将 arrake@126.com 添加为其辅助邮箱"));
+        assert!(parsed_html.msg.body.contains("有人已将 zhouming@126.com 添加为其辅助邮箱"));
         assert!(parsed_html.msg.body_html.contains("data:image/png;base64,"));
         assert!(!parsed_html.msg.body_html.contains("cid:google_logo@gstatic"));
         assert!(parsed_html.msg.body_html.contains("查看活动"));
@@ -3033,9 +3247,9 @@ mod tests {
         assert_eq!(decoded, sample_bytes);
 
         let raw_with_att = concat!(
-            "From: Arrake <arrake@126.com>\r\n",
-            "To: arrake@163.com\r\n",
-            "Subject: Re: 来自 arrake 的消息\r\n",
+            "From: Zhou Ming <zhouming@126.com>\r\n",
+            "To: linyue@163.com\r\n",
+            "Subject: Re: 来自 linyue 的消息\r\n",
             "Message-ID: <reply-99@126.com>\r\n",
             "In-Reply-To: <orig-1@163.com>\r\n",
             "X-MailChat-Quote-Id: <orig-1@163.com>\r\n",

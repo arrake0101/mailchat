@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api, MODEL_PRESETS, PRESETS } from "../api";
+import { normalizeThemeConfig } from "../theme";
 import {
   mailSecretKey,
   type Account,
@@ -12,9 +13,13 @@ import {
   type GroupSpec,
   type MagpieProbeReport,
   type ProviderPresetId,
+  type ReplyPolicySpec,
   type RuleKind,
   type SecretStatus,
+  type ThemeConfig,
   type TriageSpec,
+  type UpdateConfig,
+  type WindowConfig,
 } from "../types";
 import {
   IconCheck,
@@ -29,6 +34,9 @@ import {
   IconSliders,
   IconTrash,
 } from "./Icons";
+import { ThemeConfiguratorCard } from "./ThemeConfiguratorCard";
+import { normalizeUpdateConfig, UpdateConfiguratorCard } from "./UpdateConfiguratorCard";
+import { normalizeWindowConfig, WindowConfiguratorCard } from "./WindowConfiguratorCard";
 import { startWindowDrag, toggleWindowMaximize } from "./WindowControls";
 
 export type InspectorTab = "visual" | "diff" | "toml";
@@ -37,7 +45,11 @@ export interface NormalizedDeclarativeSpec {
   active_account: string;
   accounts: AccountSpec[];
   agent: DeclarativeConfigSpec["agent"];
+  theme: ThemeConfig;
+  window: WindowConfig;
+  update: UpdateConfig;
   triage: TriageSpec;
+  reply_policy?: ReplyPolicySpec;
   groups: GroupSpec[];
 }
 
@@ -68,6 +80,9 @@ export function normalizeDeclarativeSpec(
       instructions: raw?.agent?.instructions ?? "",
       profiles: raw?.agent?.profiles ?? {},
     },
+    theme: normalizeThemeConfig(raw?.theme),
+    window: normalizeWindowConfig(raw?.window),
+    update: normalizeUpdateConfig(raw?.update),
     triage: {
       allow_senders: raw?.triage?.allow_senders ?? [],
       block_senders: raw?.triage?.block_senders ?? [],
@@ -76,6 +91,7 @@ export function normalizeDeclarativeSpec(
       archive_senders: raw?.triage?.archive_senders ?? [],
       archive_keywords: raw?.triage?.archive_keywords ?? [],
     },
+    reply_policy: raw?.reply_policy,
     groups: (raw?.groups ?? []).map((g) => ({
       id: g.id ?? "",
       name: g.name ?? "未命名群聊",
@@ -2116,6 +2132,53 @@ function InspectorVisualView({
         </div>
       </section>
 
+      {/* 2.5 界面主题与外观卡片 */}
+      <ThemeConfiguratorCard
+        theme={spec.theme}
+        changedSections={changedSections}
+        itemsByTarget={itemsByTarget}
+        notify={notify}
+        onApplyTheme={async (nextTheme, summaryLabel) => {
+          try {
+            const bundle = await api.saveThemeConfig(nextTheme);
+            onBundleUpdated(bundle, summaryLabel);
+          } catch (e) {
+            notify(`保存主题配置失败：${e}`, true);
+          }
+        }}
+      />
+
+      {/* 2.55 窗口关闭最小化与新消息闪烁提醒卡片 */}
+      <WindowConfiguratorCard
+        windowCfg={spec.window}
+        changedSections={changedSections}
+        itemsByTarget={itemsByTarget}
+        onApplyWindowConfig={async (nextWin, summaryLabel) => {
+          try {
+            const bundle = await api.saveWindowConfig(nextWin);
+            onBundleUpdated(bundle, summaryLabel);
+          } catch (e) {
+            notify(`保存窗口与托盘设置失败：${e}`, true);
+          }
+        }}
+      />
+
+      {/* 2.6 客户端版本与自动更新卡片 */}
+      <UpdateConfiguratorCard
+        update={spec.update}
+        changedSections={changedSections}
+        itemsByTarget={itemsByTarget}
+        notify={notify}
+        onApplyUpdateConfig={async (nextUpdate, summaryLabel) => {
+          try {
+            const bundle = await api.saveUpdateConfig(nextUpdate);
+            onBundleUpdated(bundle, summaryLabel);
+          } catch (e) {
+            notify(`保存自动更新配置失败：${e}`, true);
+          }
+        }}
+      />
+
       {/* 3. 分流过滤规则卡片 */}
       <section
         className={`ins-card ${changedSections.has("triage") ? "is-section-updated" : ""}`}
@@ -2302,6 +2365,63 @@ function InspectorVisualView({
           </div>
         )}
       </section>
+
+      {/* 5. 跨邮箱隐私统一批复策略卡片 ([reply_policy]) */}
+      {(spec.reply_policy || changedSections.has("reply_policy")) && (
+        <section
+          className={`ins-card ${changedSections.has("reply_policy") ? "is-section-updated" : ""}`}
+          data-config-section="reply_policy"
+          data-config-target="reply_policy"
+        >
+          <div className="ins-card-head">
+            <div className="ins-card-title-row">
+              <span className="ins-card-title">统一批复隐私与权限策略</span>
+              <span className="ins-code-pill">[reply_policy]</span>
+              {changedSections.has("reply_policy") && (
+                <span className="ins-updated-badge">刚修改</span>
+              )}
+            </div>
+          </div>
+
+          <div className="ins-group-list">
+            <div className="ins-group-item">
+              <div className="ins-group-top">
+                <div className="ins-group-title-wrap">
+                  <span className="ins-group-name">
+                    {spec.reply_policy?.enabled ? "已开启统一批复扫描" : "默认关闭（按需手动扫描）"}
+                  </span>
+                  <span className="ins-mini-pill muted">
+                    授权邮箱 {spec.reply_policy?.enabled_accounts?.length ?? 0} 个
+                  </span>
+                  <span className="ins-mini-pill muted">
+                    {spec.reply_policy?.redact_pii !== false ? "入模 PII 脱敏开启" : "入模脱敏关闭"}
+                  </span>
+                  <span className="ins-mini-pill muted">
+                    {spec.reply_policy?.auto_send_enabled
+                      ? `白名单自动发信 (≤${spec.reply_policy?.auto_send_hourly_limit ?? 10}/h)`
+                      : "默认人工审阅"}
+                  </span>
+                  {(spec.reply_policy?.auto_rules?.length ?? 0) > 0 && (
+                    <span className="ins-mini-pill primary">
+                      自动化规则 {spec.reply_policy!.auto_rules.filter((r) => r.enabled).length}/
+                      {spec.reply_policy!.auto_rules.length} 条
+                    </span>
+                  )}
+                </div>
+              </div>
+              {(spec.reply_policy?.enabled_accounts?.length ?? 0) > 0 && (
+                <div className="ins-group-members">
+                  {spec.reply_policy!.enabled_accounts.map((em) => (
+                    <span key={em} className="ins-member-chip">
+                      {em}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </section>
+      )}
     </div>
   );
 }

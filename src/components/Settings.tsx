@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { api, MODEL_PRESETS, PRESETS } from "../api";
+import { applyThemeToDom, DEFAULT_THEME_CONFIG, normalizeThemeConfig } from "../theme";
 import {
   mailSecretKey,
   type Account,
@@ -10,7 +12,10 @@ import {
   type Rule,
   type RuleKind,
   type SecretStatus,
+  type ThemeConfig,
+  type UpdateConfig,
   type Verdict,
+  type WindowConfig,
 } from "../types";
 import {
   IconArrowDown,
@@ -25,13 +30,24 @@ import {
   IconSparkles,
   IconTrash,
 } from "./Icons";
+import { ThemeConfiguratorCard } from "./ThemeConfiguratorCard";
+import {
+  DEFAULT_UPDATE_CONFIG,
+  normalizeUpdateConfig,
+  UpdateConfiguratorCard,
+} from "./UpdateConfiguratorCard";
+import {
+  DEFAULT_WINDOW_CONFIG,
+  normalizeWindowConfig,
+  WindowConfiguratorCard,
+} from "./WindowConfiguratorCard";
 import { startWindowDrag, toggleWindowMaximize } from "./WindowControls";
 
 export type SettingsTab = "declarative" | "vault" | "visual";
 
 export interface AccountFormIntent {
   seq: number;
-  mode: "add" | "manage";
+  mode: "add" | "manage" | "update";
   presetDomain?: string;
 }
 
@@ -191,6 +207,9 @@ function DeclarativeTab({
     setApplying(true);
     try {
       const b = await api.applyDeclarativeConfig(draft);
+      if (b.spec?.theme) {
+        applyThemeToDom(b.spec.theme);
+      }
       setSaved(b.toml);
       setDraft(b.toml);
       onDataChanged();
@@ -435,7 +454,27 @@ function VisualTab({
   const [magpieProbe, setMagpieProbe] = useState<MagpieProbeReport | null>(null);
   const [probingMagpie, setProbingMagpie] = useState(false);
   const [connectingMagpie, setConnectingMagpie] = useState(false);
+  const [themeCfg, setThemeCfg] = useState<ThemeConfig>(DEFAULT_THEME_CONFIG);
+  const [windowCfg, setWindowCfg] = useState<WindowConfig>(DEFAULT_WINDOW_CONFIG);
+  const [updateCfg, setUpdateCfg] = useState<UpdateConfig>(DEFAULT_UPDATE_CONFIG);
   const emailInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const unTheme = listen<ThemeConfig>("theme-updated", (ev) => {
+      setThemeCfg(normalizeThemeConfig(ev.payload));
+    });
+    const unWin = listen<WindowConfig>("window-config-updated", (ev) => {
+      setWindowCfg(normalizeWindowConfig(ev.payload));
+    });
+    const unUpd = listen<UpdateConfig>("update-config-updated", (ev) => {
+      setUpdateCfg(normalizeUpdateConfig(ev.payload));
+    });
+    return () => {
+      unTheme.then((f) => f());
+      unWin.then((f) => f());
+      unUpd.then((f) => f());
+    };
+  }, []);
 
   const entryToAccount = (entry: AccountEntry): Account => ({
     email: entry.email,
@@ -449,17 +488,24 @@ function VisualTab({
   });
 
   const reloadAll = async (preferAddMode = false, presetDomain?: string) => {
-    const [accList, activeAcc, ag, secList, ruleList] = await Promise.all([
-      api.listAccounts().catch(() => [] as AccountEntry[]),
-      api.getAccount(),
-      api.getAgentConfig(),
-      api.listSecrets(),
-      api.listRules(),
-    ]);
+    const [accList, activeAcc, ag, secList, ruleList, curTheme, curWin, curUpdate] =
+      await Promise.all([
+        api.listAccounts().catch(() => [] as AccountEntry[]),
+        api.getAccount(),
+        api.getAgentConfig(),
+        api.listSecrets(),
+        api.listRules(),
+        api.getThemeConfig().catch(() => DEFAULT_THEME_CONFIG),
+        api.getWindowConfig().catch(() => DEFAULT_WINDOW_CONFIG),
+        api.getUpdateConfig().catch(() => DEFAULT_UPDATE_CONFIG),
+      ]);
     setAccounts(accList);
     setC(ag);
     setSecrets(secList);
     setRules(ruleList);
+    setThemeCfg(normalizeThemeConfig(curTheme));
+    setWindowCfg(normalizeWindowConfig(curWin));
+    setUpdateCfg(normalizeUpdateConfig(curUpdate));
 
     api
       .probeMagpie(ag.preset === "magpie" ? ag.base_url : undefined)
@@ -516,7 +562,15 @@ function VisualTab({
   };
 
   useEffect(() => {
-    reloadAll(accountIntent?.mode === "add", accountIntent?.presetDomain);
+    reloadAll(accountIntent?.mode === "add", accountIntent?.presetDomain).then(() => {
+      if (accountIntent?.mode === "update") {
+        requestAnimationFrame(() => {
+          document
+            .getElementById("mailchat-update-card")
+            ?.scrollIntoView({ behavior: "smooth", block: "center" });
+        });
+      }
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [accountIntent?.seq]);
 
@@ -1515,6 +1569,56 @@ function VisualTab({
           </div>
         </div>
       )}
+
+      <div className="settings-theme-card-wrap">
+        <ThemeConfiguratorCard
+          theme={themeCfg}
+          notify={notify}
+          onApplyTheme={async (nextTheme, summaryLabel) => {
+            try {
+              setThemeCfg(nextTheme);
+              await api.saveThemeConfig(nextTheme);
+              onDataChanged();
+              notify(`${summaryLabel}（已同步至 config.toml）`);
+            } catch (e) {
+              notify(`保存主题失败：${e}`, true);
+            }
+          }}
+        />
+      </div>
+
+      <div className="settings-theme-card-wrap">
+        <WindowConfiguratorCard
+          windowCfg={windowCfg}
+          onApplyWindowConfig={async (nextWin, summaryLabel) => {
+            try {
+              setWindowCfg(nextWin);
+              await api.saveWindowConfig(nextWin);
+              onDataChanged();
+              notify(`${summaryLabel}（已同步至 config.toml）`);
+            } catch (e) {
+              notify(`保存窗口与托盘设置失败：${e}`, true);
+            }
+          }}
+        />
+      </div>
+
+      <div className="settings-theme-card-wrap">
+        <UpdateConfiguratorCard
+          update={updateCfg}
+          notify={notify}
+          onApplyUpdateConfig={async (nextUpdate, summaryLabel) => {
+            try {
+              setUpdateCfg(nextUpdate);
+              await api.saveUpdateConfig(nextUpdate);
+              onDataChanged();
+              notify(`${summaryLabel}（已同步至 config.toml）`);
+            } catch (e) {
+              notify(`保存自动更新配置失败：${e}`, true);
+            }
+          }}
+        />
+      </div>
 
       <div className="surface-card">
         <div className="section-title">确定性分流规则（0 延迟优先匹配）</div>

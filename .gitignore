@@ -19,6 +19,11 @@ secrets.vault.json
 *.sqlite3
 /config.toml
 
+# Local Tauri updater signing private keys (NEVER commit private keys; only pubkey goes in tauri.conf.json)
+.tauri-keys/
+*.tauri.key
+*.tauri.key.pub
+
 # Environment variables
 .env
 .env.*

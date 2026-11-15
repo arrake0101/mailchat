@@ -4,23 +4,35 @@ import type {
   AccountEntry,
   AgentChatResponse,
   AgentConfig,
+  AgentInstanceId,
   AgentSessionSummary,
   AgentTurnRecord,
   AttachmentMeta,
+  BatchApproveResult,
   ChatTurn,
+  ComposeAgentInput,
+  ComposeAgentResult,
   ContactProfile,
   Conversation,
   DeclarativeBundle,
   DeclarativeConfigSpec,
   GroupInfo,
   GroupMember,
+  KernelInstanceSnapshot,
+  KernelTurnRequest,
+  KernelTurnResponse,
   MagpieConnectResult,
   MagpieProbeReport,
   MailboxStats,
   Message,
   ModelSwitchResult,
+  PrivacyScrubPreview,
   ProviderPresetId,
   ProviderProtocol,
+  ReplyPolicySpec,
+  ReplyQueueItem,
+  ReplyQueueStats,
+  ReviseReplyQueueResult,
   RewindAgentResponse,
   Rule,
   RuleKind,
@@ -29,8 +41,13 @@ import type {
   SendAttachmentInput,
   Status,
   SyncReport,
+  ThemeConfig,
+  UnifiedScanReport,
+  UpdateConfig,
+  UpdateStatusSnapshot,
   Verdict,
   WindowAction,
+  WindowConfig,
 } from "./types";
 
 export const api = {
@@ -38,6 +55,19 @@ export const api = {
   applyDeclarativeConfig: (toml: string) => invoke<DeclarativeBundle>("apply_declarative_config", { toml }),
   applyDeclarativeSpec: (spec: DeclarativeConfigSpec) =>
     invoke<DeclarativeBundle>("apply_declarative_spec", { spec }),
+  getThemeConfig: () => invoke<ThemeConfig>("get_theme_config"),
+  saveThemeConfig: (theme: ThemeConfig) => invoke<DeclarativeBundle>("save_theme_config", { theme }),
+  getWindowConfig: () => invoke<WindowConfig>("get_window_config"),
+  saveWindowConfig: (windowCfg: WindowConfig) =>
+    invoke<DeclarativeBundle>("save_window_config", { windowCfg }),
+  getUpdateConfig: () => invoke<UpdateConfig>("get_update_config"),
+  saveUpdateConfig: (update: UpdateConfig) => invoke<DeclarativeBundle>("save_update_config", { update }),
+  getUpdateStatus: () => invoke<UpdateStatusSnapshot>("get_update_status"),
+  checkAppUpdate: (manual = true) => invoke<UpdateStatusSnapshot>("check_app_update", { manual }),
+  downloadAppUpdate: () => invoke<UpdateStatusSnapshot>("download_app_update"),
+  installAppUpdate: () => invoke<UpdateStatusSnapshot>("install_app_update"),
+  skipAppUpdateVersion: (version: string) =>
+    invoke<DeclarativeBundle>("skip_app_update_version", { version }),
   listSecrets: () => invoke<SecretStatus[]>("list_secrets"),
   setSecret: (key: string, value: string, verify = true) =>
     invoke<SecretSaveResult>("set_secret", { key, value, verify }),
@@ -76,6 +106,62 @@ export const api = {
       preset,
       model: model?.trim() ? model.trim() : null,
     }),
+  // 统一智能体内核（Unified Agent Kernel）多实例隔离接口
+  getAgentInstanceState: (instanceId: AgentInstanceId) =>
+    invoke<KernelInstanceSnapshot>("get_agent_instance_state", { instanceId }),
+  listInstanceSessions: (instanceId: AgentInstanceId) =>
+    invoke<AgentSessionSummary[]>("list_instance_sessions", { instanceId }),
+  createInstanceSession: (instanceId: AgentInstanceId, title?: string) =>
+    invoke<AgentSessionSummary>("create_instance_session", {
+      instanceId,
+      title: title ?? null,
+    }),
+  getInstanceSessionTurns: (instanceId: AgentInstanceId, sessionId: string) =>
+    invoke<AgentTurnRecord[]>("get_instance_session_turns", {
+      instanceId,
+      sessionId,
+    }),
+  deleteInstanceSession: (instanceId: AgentInstanceId, sessionId: string) =>
+    invoke<AgentSessionSummary[]>("delete_instance_session", {
+      instanceId,
+      sessionId,
+    }),
+  rewindInstanceSession: (
+    instanceId: AgentInstanceId,
+    sessionId: string,
+    fromTurnId: number,
+    restoreConfig: boolean,
+  ) =>
+    invoke<RewindAgentResponse>("rewind_instance_session", {
+      instanceId,
+      sessionId,
+      fromTurnId,
+      restoreConfig,
+    }),
+  switchInstanceModel: (
+    instanceId: AgentInstanceId,
+    preset: string,
+    model?: string,
+  ) =>
+    invoke<ModelSwitchResult>("switch_instance_model", {
+      instanceId,
+      preset,
+      model: model?.trim() ? model.trim() : null,
+    }),
+  connectInstanceMagpie: (
+    instanceId: AgentInstanceId,
+    opts?: { baseUrl?: string; model?: string; autoStart?: boolean },
+  ) =>
+    invoke<MagpieConnectResult>("connect_instance_magpie", {
+      instanceId,
+      baseUrl: opts?.baseUrl?.trim() ? opts.baseUrl.trim() : null,
+      model: opts?.model?.trim() ? opts.model.trim() : null,
+      autoStart: opts?.autoStart ?? true,
+    }),
+  runAgentKernelTurn: (req: KernelTurnRequest) =>
+    invoke<KernelTurnResponse>("run_agent_kernel_turn", { req }),
+  cancelAgentKernelTurn: (requestId?: string | null) =>
+    invoke<void>("cancel_agent_kernel_turn", { requestId: requestId ?? null }),
   listAccounts: () => invoke<AccountEntry[]>("list_accounts"),
   getAccount: () => invoke<Account | null>("get_account"),
   saveAccount: (account: Account, setActive = true) =>
@@ -103,6 +189,11 @@ export const api = {
       autoStart: opts?.autoStart ?? true,
     }),
   windowAction: (action: WindowAction) => invoke<boolean>("window_action", { action }),
+  setAgentDockExpanded: (expanded: boolean, dockWidth?: number) =>
+    invoke<boolean>("set_agent_dock_expanded", {
+      expanded,
+      dockWidth: dockWidth ?? null,
+    }),
   reclassifyMessages: (all: boolean) => invoke<number>("reclassify_messages", { all }),
   syncNow: () => invoke<SyncReport>("sync_now"),
   pokeMailSync: () => invoke<void>("poke_mail_sync").catch(() => {}),
@@ -171,6 +262,80 @@ export const api = {
     }
   },
   startScreenSnip: () => invoke<void>("start_screen_snip"),
+  previewPrivacyScrub: (text: string, redactPii?: boolean, customTerms?: string[]) =>
+    invoke<PrivacyScrubPreview>("preview_privacy_scrub", {
+      text,
+      redactPii: redactPii ?? null,
+      customTerms: customTerms ?? null,
+    }),
+  chatComposeAgent: (input: ComposeAgentInput, requestId?: string | null) =>
+    invoke<ComposeAgentResult>("chat_compose_agent", {
+      input,
+      requestId: requestId ?? null,
+    }),
+  cancelComposeAgent: (requestId: string) =>
+    invoke<void>("cancel_compose_agent", { requestId }),
+  sendComposedMail: (opts: {
+    fromEmail?: string | null;
+    to: string[];
+    cc?: string[];
+    bcc?: string[];
+    subject: string;
+    bodyPlain: string;
+    bodyHtml?: string | null;
+    attachments?: SendAttachmentInput[];
+    replyToId?: number | null;
+    forceDlpOverride?: boolean;
+  }) =>
+    invoke<Message>("send_composed_mail", {
+      fromEmail: opts.fromEmail ?? null,
+      to: opts.to,
+      cc: opts.cc && opts.cc.length > 0 ? opts.cc : null,
+      bcc: opts.bcc && opts.bcc.length > 0 ? opts.bcc : null,
+      subject: opts.subject,
+      bodyPlain: opts.bodyPlain,
+      bodyHtml: opts.bodyHtml?.trim() ? opts.bodyHtml : null,
+      attachments: opts.attachments && opts.attachments.length > 0 ? opts.attachments : null,
+      replyToId: opts.replyToId ?? null,
+      forceDlpOverride: opts.forceDlpOverride ?? false,
+    }),
+  getReplyPolicy: () => invoke<ReplyPolicySpec>("get_reply_policy"),
+  saveReplyPolicy: (policy: ReplyPolicySpec) =>
+    invoke<ReplyPolicySpec>("save_reply_policy", { policy }),
+  listReplyQueue: (statusFilter?: string, accountFilter?: string) =>
+    invoke<ReplyQueueItem[]>("list_reply_queue", {
+      statusFilter: statusFilter ?? null,
+      accountFilter: accountFilter ?? null,
+    }),
+  getReplyQueueStats: () => invoke<ReplyQueueStats>("get_reply_queue_stats"),
+  scanUnifiedReplies: (includeDismissed = false) =>
+    invoke<UnifiedScanReport>("scan_unified_replies", { includeDismissed }),
+  reviseReplyQueueWithAgent: (id: number, instruction: string, requestId?: string | null) =>
+    invoke<ReviseReplyQueueResult>("revise_reply_queue_with_agent", {
+      id,
+      instruction,
+      requestId: requestId ?? null,
+    }),
+  updateReplyQueueItem: (
+    id: number,
+    draftSubject: string,
+    draftBody: string,
+    draftHtml?: string | null,
+  ) =>
+    invoke<ReplyQueueItem>("update_reply_queue_item", {
+      id,
+      draftSubject,
+      draftBody,
+      draftHtml: draftHtml?.trim() ? draftHtml : null,
+    }),
+  approveSendReplyQueue: (ids: number[], forceDlpOverride = false) =>
+    invoke<BatchApproveResult>("approve_send_reply_queue", {
+      ids,
+      forceDlpOverride,
+    }),
+  dismissReplyQueueItems: (ids: number[]) =>
+    invoke<number>("dismiss_reply_queue_items", { ids }),
+  clearFinishedReplyQueue: () => invoke<number>("clear_finished_reply_queue"),
 };
 
 /** 常见邮箱的服务器预设 */

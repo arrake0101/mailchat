@@ -9,7 +9,14 @@ import {
   useState,
 } from "react";
 import { api } from "../api";
-import type { Conversation, GroupInfo, GroupMember, Message, Status } from "../types";
+import type {
+  ComposeLaunchIntent,
+  Conversation,
+  GroupInfo,
+  GroupMember,
+  Message,
+  Status,
+} from "../types";
 import { Avatar, clockTime, copyText, dayLabel, GroupAvatar, senderColor } from "../util";
 import {
   AttachmentLightbox,
@@ -25,6 +32,7 @@ import { ContactDrawer } from "./ContactDrawer";
 import { type ContextMenuEntry, useContextMenu } from "./ContextMenu";
 import { hasHtmlBody, HtmlMailView, type HtmlMailContextInfo, isRichHtmlEmail } from "./HtmlMailView";
 import {
+  IconAgentDock,
   IconArrowDown,
   IconArrowUp,
   IconAt,
@@ -32,6 +40,7 @@ import {
   IconChat,
   IconCheck,
   IconClose,
+  IconCompose,
   IconCopy,
   IconDraft,
   IconEdit,
@@ -67,9 +76,13 @@ interface Props {
   status: Status;
   messages: Message[];
   initialDraft?: string;
+  externalDraftSignal?: { seq: number; text: string } | null;
   openDrawerSeq?: number;
   onDraftChange?: (text: string) => void;
   onStartDirectChat?: (email: string, name?: string) => void;
+  onOpenComposeStudio?: (intent: Omit<ComposeLaunchIntent, "id">) => void;
+  agentDockOpen?: boolean;
+  onToggleAgentDock?: () => void;
   onSent: (m: Message) => void;
   onChanged: () => void;
   onGroupUpdated: (grp: GroupInfo) => void;
@@ -125,9 +138,13 @@ export function ChatView({
   status,
   messages,
   initialDraft = "",
+  externalDraftSignal = null,
   openDrawerSeq = 0,
   onDraftChange,
   onStartDirectChat,
+  onOpenComposeStudio,
+  agentDockOpen = false,
+  onToggleAgentDock,
   onSent,
   onChanged,
   onGroupUpdated,
@@ -208,6 +225,26 @@ export function ChatView({
     },
     [onDraftChange],
   );
+
+  const handledExternalDraftSeqRef = useRef(0);
+  useEffect(() => {
+    if (
+      !externalDraftSignal ||
+      externalDraftSignal.seq <= handledExternalDraftSeqRef.current
+    ) {
+      return;
+    }
+    handledExternalDraftSeqRef.current = externalDraftSignal.seq;
+    setTextState(externalDraftSignal.text);
+    window.setTimeout(() => {
+      const el = inputRef.current;
+      if (el) {
+        el.focus();
+        const len = el.value.length;
+        el.setSelectionRange(len, len);
+      }
+    }, 30);
+  }, [externalDraftSignal]);
 
   const cleanTitle = conv.name.replace(/^🚀\s*/, "");
   const trimmedSearch = showSearchBar ? searchQuery.trim() : "";
@@ -604,6 +641,33 @@ export function ChatView({
     }
   };
 
+  const launchComposeStudioFromChat = (targetMsg?: Message) => {
+    if (!onOpenComposeStudio) return;
+    const to = conv.is_group
+      ? conv.members.map((m) => m.email).filter(Boolean)
+      : [conv.peer].filter(Boolean);
+    const refMsg =
+      targetMsg ??
+      (replyTarget ? messages.find((m) => m.id === replyTarget.id) : undefined) ??
+      [...messages].reverse().find((m) => !m.outgoing) ??
+      messages[messages.length - 1];
+    const baseSubj = customSubject.trim() || refMsg?.subject?.trim() || "";
+    const normalizedSubj = baseSubj
+      ? /^(re|回复)[:：]/i.test(baseSubj) || customSubject.trim()
+        ? baseSubj
+        : `Re: ${baseSubj}`
+      : "";
+    onOpenComposeStudio({
+      to,
+      subject: normalizedSubj,
+      bodyPlain: text,
+      replyToId: refMsg?.id ?? null,
+      replyContext: refMsg
+        ? `发件人: ${refMsg.from_name ? `${refMsg.from_name} <${refMsg.from_addr}>` : refMsg.from_addr}\n主题: ${refMsg.subject || "(无主题)"}\n\n${refMsg.body || ""}`
+        : undefined,
+    });
+  };
+
   const buildMessageMenuEntries = (
     m: Message,
     opts: {
@@ -714,6 +778,14 @@ export function ChatView({
           const snippet = (m.body.trim() || m.subject.trim()).slice(0, 180);
           void draft(`请重点针对对方这条消息起草得体回复：${snippet}`);
         },
+      });
+    }
+
+    if (onOpenComposeStudio && status !== "blocked") {
+      entries.push({
+        label: "在写信工坊中排版 HTML 回复",
+        icon: <IconCompose size={14} />,
+        onSelect: () => launchComposeStudioFromChat(m),
       });
     }
 
@@ -1293,6 +1365,22 @@ export function ChatView({
                 >
                   <IconNote size={14} />
                   <span className="chat-action-label">{summarizing ? "提炼中…" : "纪要总结"}</span>
+                </button>
+              )}
+
+              {onToggleAgentDock && (
+                <button
+                  type="button"
+                  className={`soft-btn chat-action-btn ${agentDockOpen ? "active-soft" : ""}`}
+                  onClick={onToggleAgentDock}
+                  title={
+                    agentDockOpen
+                      ? "收起右侧邮件 AI 面板 (Ctrl+J)"
+                      : "向右展开邮件 AI 面板 (Ctrl+J) · 总结会话、起草回复或写 HTML 邮件"
+                  }
+                >
+                  <IconAgentDock size={14} open={agentDockOpen} />
+                  <span className="chat-action-label">邮件 AI</span>
                 </button>
               )}
 
@@ -2007,6 +2095,17 @@ export function ChatView({
                     >
                       <IconTag size={15} />
                     </button>
+
+                    {onOpenComposeStudio && (
+                      <button
+                        type="button"
+                        className="im-tool-btn"
+                        onClick={() => launchComposeStudioFromChat()}
+                        title="转入传统写信 / Agent HTML 排版工坊（携带收件人、引用与草稿）"
+                      >
+                        <IconCompose size={15} />
+                      </button>
+                    )}
                   </div>
 
                   <div className="im-composer-right" data-popover-zone="true">

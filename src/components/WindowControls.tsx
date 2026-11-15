@@ -8,11 +8,13 @@ import {
   type MouseEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { api } from "../api";
-import type { AccountEntry } from "../types";
+import type { AccountEntry, UpdateStatusSnapshot, WindowConfig } from "../types";
 import { copyText } from "../util";
 import { useContextMenu } from "./ContextMenu";
 import {
+  IconAgentDock,
   IconArrowDown,
   IconArrowUp,
   IconCheck,
@@ -23,6 +25,8 @@ import {
   IconPlus,
   IconRefresh,
   IconSliders,
+  IconSparkles,
+  IconUpdate,
   IconWinMaximize,
   IconWinMinimize,
   IconWinRestore,
@@ -60,12 +64,18 @@ export interface WindowControlsProps {
   syncing?: boolean;
   switchingAccount?: boolean;
   hasDemo?: boolean;
+  updateStatus?: UpdateStatusSnapshot | null;
+  onClickUpdate?: () => void;
   onClickAccount?: () => void;
   onSwitchAccount?: (email: string) => void;
   onReorderAccounts?: (emails: string[]) => Promise<void> | void;
   onAddAccount?: () => void;
   onManageAccounts?: () => void;
   onSyncNow?: () => void;
+  showAgentDockToggle?: boolean;
+  agentDockOpen?: boolean;
+  onToggleAgentDock?: () => void;
+  onOpenConfigAssistant?: () => void;
   notify?: (text: string, isError?: boolean) => void;
 }
 
@@ -95,17 +105,24 @@ export function WindowControls({
   syncing = false,
   switchingAccount = false,
   hasDemo = false,
+  updateStatus = null,
+  onClickUpdate,
   onClickAccount,
   onSwitchAccount,
   onReorderAccounts,
   onAddAccount,
   onManageAccounts,
   onSyncNow,
+  showAgentDockToggle = false,
+  agentDockOpen = false,
+  onToggleAgentDock,
+  onOpenConfigAssistant,
   notify,
 }: WindowControlsProps) {
   const { openContextMenu } = useContextMenu();
   const [maximized, setMaximized] = useState(false);
   const [pinned, setPinned] = useState(false);
+  const [closeToTray, setCloseToTray] = useState(true);
   const [menuOpen, setMenuOpen] = useState(false);
 
   // 拖拽排序状态（左键按住邮箱胶囊左右拖动即可调整前后顺序）
@@ -176,8 +193,9 @@ export function WindowControls({
     const headerW = headerEl.clientWidth || window.innerWidth || 1100;
     const brandW = brandClusterRef.current?.offsetWidth ?? 94;
 
-    // 整个左侧区域（MailChat + 分隔符 + 邮箱平铺栏）不超过窗口 48% 且上限 780px，同时右侧至少留出 260px 拖拽与控制按钮空间
-    const maxLeftTotal = Math.min(Math.floor(headerW * 0.48), 780, headerW - 260);
+    // 整个左侧区域（MailChat + 分隔符 + 邮箱平铺栏）不超过窗口 48% 且上限 780px，同时右侧预留拖拽与控制按钮空间
+    const rightReserve = showAgentDockToggle ? 336 : 260;
+    const maxLeftTotal = Math.min(Math.floor(headerW * 0.48), 780, headerW - rightReserve);
     const stripBudget = Math.max(176, maxLeftTotal - brandW - 10);
 
     const pillNodes = Array.from(
@@ -238,7 +256,7 @@ export function WindowControls({
     }
 
     setVisibleEmails(chosenIndices.map((idx) => displayAccounts[idx].email));
-  }, [displayAccounts, dragEmail]);
+  }, [displayAccounts, dragEmail, showAgentDockToggle]);
 
   useLayoutEffect(() => {
     recomputeStripLayout();
@@ -268,11 +286,19 @@ export function WindowControls({
       .windowAction("is_pinned")
       .then(setPinned)
       .catch(() => {});
+    api
+      .getWindowConfig()
+      .then((cfg) => setCloseToTray(cfg.close_to_tray ?? true))
+      .catch(() => {});
+    const unWinCfg = listen<WindowConfig>("window-config-updated", (ev) => {
+      setCloseToTray(ev.payload?.close_to_tray ?? true);
+    });
     window.addEventListener("resize", sync);
     window.addEventListener("mailchat-win-max", onCustom);
     return () => {
       window.removeEventListener("resize", sync);
       window.removeEventListener("mailchat-win-max", onCustom);
+      unWinCfg.then((f) => f());
     };
   }, []);
 
@@ -778,6 +804,120 @@ export function WindowControls({
       </div>
 
       <div className="win-controls no-drag" aria-label="窗口控制">
+        {updateStatus &&
+          !updateStatus.is_skipped &&
+          Boolean(updateStatus.latest_version) &&
+          (updateStatus.phase === "available" ||
+            updateStatus.phase === "downloading" ||
+            updateStatus.phase === "ready" ||
+            updateStatus.phase === "installing") && (
+            <button
+              type="button"
+              className={`win-update-pill phase-${updateStatus.phase}`}
+              onClick={() => onClickUpdate?.()}
+              onContextMenu={(e) => {
+                const ver = updateStatus.latest_version || "";
+                openContextMenu(e, [
+                  {
+                    kind: "header",
+                    label: `发现新版本 v${ver}`,
+                    badge: updateStatus.install_channel.channel_label,
+                  },
+                  updateStatus.can_hot_install && updateStatus.phase === "ready"
+                    ? {
+                        label: "立即重启并应用签名更新",
+                        icon: <IconUpdate size={14} />,
+                        accent: true,
+                        onSelect: () => {
+                          notify?.("正在校验签名并重启升级…");
+                          api.installAppUpdate().catch((err) => {
+                            notify?.(`安装更新失败：${err}`, true);
+                          });
+                        },
+                      }
+                    : {
+                        label: "查看更新说明与升级选项",
+                        icon: <IconUpdate size={14} />,
+                        accent: true,
+                        onSelect: () => onClickUpdate?.(),
+                      },
+                  ver
+                    ? {
+                        label: `静音此版本提醒 (v${ver})`,
+                        onSelect: () => {
+                          api
+                            .skipAppUpdateVersion(ver)
+                            .then(() => notify?.(`已忽略 v${ver} 的顶栏提醒`))
+                            .catch(() => {});
+                        },
+                      }
+                    : null,
+                ]);
+              }}
+              title={
+                updateStatus.phase === "ready"
+                  ? `MailChat v${updateStatus.latest_version} 已下载就绪，点击查看或确认重启升级`
+                  : updateStatus.phase === "downloading"
+                    ? `正在后台下载 MailChat v${updateStatus.latest_version} (${
+                        updateStatus.progress_percent ?? 0
+                      }%)`
+                    : `发现新版本 MailChat v${updateStatus.latest_version}，点击查看更新日志 · 右键快捷操作`
+              }
+            >
+              <IconUpdate size={12} />
+              <span>
+                {updateStatus.phase === "ready"
+                  ? `重启升至 v${updateStatus.latest_version}`
+                  : updateStatus.phase === "downloading"
+                    ? `下载中 ${updateStatus.progress_percent ?? 0}%`
+                    : `新版本 v${updateStatus.latest_version}`}
+              </span>
+            </button>
+          )}
+
+        {showAgentDockToggle && onToggleAgentDock && (
+          <>
+            <button
+              type="button"
+              className={`win-agent-toggle ${agentDockOpen ? "is-open" : ""}`}
+              onClick={onToggleAgentDock}
+              onContextMenu={(e) => {
+                openContextMenu(e, [
+                  {
+                    kind: "header",
+                    label: "邮件智能体侧栏 (实例: mail)",
+                  },
+                  {
+                    label: agentDockOpen
+                      ? "收起右侧邮件 AI 面板 (Ctrl+J)"
+                      : "向右展开邮件 AI 面板 (Ctrl+J)",
+                    icon: <IconAgentDock size={14} open={!agentDockOpen} />,
+                    accent: true,
+                    onSelect: () => onToggleAgentDock(),
+                  },
+                  onOpenConfigAssistant
+                    ? {
+                        label: "前往独立配置助手 (实例: config)",
+                        icon: <IconSparkles size={14} />,
+                        onSelect: () => onOpenConfigAssistant(),
+                      }
+                    : null,
+                ]);
+              }}
+              title={
+                agentDockOpen
+                  ? "点击收起右侧邮件 AI 面板 (Ctrl+J) · 右键更多选项"
+                  : "向右展开邮件 AI 面板 (Ctrl+J) · 独立邮件实例"
+              }
+              aria-pressed={agentDockOpen}
+            >
+              <IconAgentDock size={13.5} open={agentDockOpen} />
+              <span className="win-agent-toggle-text">邮件 AI</span>
+            </button>
+            <span className="win-controls-sep" aria-hidden="true" />
+          </>
+        )}
+
         <button
           type="button"
           className={`win-ctl ${pinned ? "pinned" : ""}`}
@@ -821,7 +961,28 @@ export function WindowControls({
           type="button"
           className="win-ctl close"
           onClick={() => api.windowAction("close").catch(() => {})}
-          title="关闭"
+          onContextMenu={(e) => {
+            openContextMenu(e, [
+              {
+                label: "隐藏到右下角系统托盘",
+                icon: <IconWinMinimize size={14} />,
+                accent: closeToTray,
+                onSelect: () => {
+                  api.windowAction("hide_to_tray").catch(() => {});
+                },
+              },
+              { kind: "divider" },
+              {
+                label: "彻底退出 MailChat",
+                icon: <IconClose size={14} />,
+                danger: true,
+                onSelect: () => {
+                  api.windowAction("exit").catch(() => {});
+                },
+              },
+            ]);
+          }}
+          title={closeToTray ? "隐藏到系统托盘（右键可彻底退出）" : "关闭并退出 MailChat"}
         >
           <IconClose size={14} />
         </button>

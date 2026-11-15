@@ -530,7 +530,7 @@ function renderInlineTokens(
 
   const pushPlainWithMentions = (segment: string) => {
     if (!segment) return;
-    // 先匹配完整邮箱地址并原样保留，防止 arrake@163.com 中的 @163 被误高亮为 @提及
+    // 先匹配完整邮箱地址并原样保留，防止 alice@163.com 中的 @163 被误高亮为 @提及
     const subRe =
       /([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})|((?:^|[^A-Za-z0-9._%+/-])@[^\s@，。！？,.!?:：;；()（）<>]{1,24})/g;
     let sLast = 0;

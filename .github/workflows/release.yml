@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to build & publish (e.g. v0.2.1)"
+        description: "Release tag to build & publish (e.g. v0.3.0 or v0.3.1-beta.1)"
         required: true
-        default: "v0.2.1"
+        default: "v0.3.0"
 
 permissions:
   contents: write
@@ -21,6 +21,7 @@ jobs:
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
       version: ${{ steps.meta.outputs.version }}
+      is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
     steps:
       - name: Resolve tag and version
         id: meta
@@ -28,19 +29,29 @@ jobs:
         run: |
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
           VERSION="${TAG#v}"
+          if [[ "$VERSION" == *"-"* ]]; then
+            IS_PRE="true"
+          else
+            IS_PRE="false"
+          fi
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=${IS_PRE}" >> "$GITHUB_OUTPUT"
 
       - name: Create or ensure draft GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.meta.outputs.tag }}
           VERSION: ${{ steps.meta.outputs.version }}
+          IS_PRE: ${{ steps.meta.outputs.is_prerelease }}
         shell: bash
         run: |
           if ! gh release view "$TAG" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            NOTES=$(cat <<EOF
+            cat > release-notes.md <<EOF
           ## MailChat v${VERSION}
+
+          ### 客户端内置签名热更新
+          已安装版用户可直接在客户端顶栏或 **「配置 → 客户端版本与自动更新 \`[update]\`」** 中点击 **「检查更新」**，经 Minisign Ed25519 公钥签名强校验后一键下载重启升级。
 
           ### 声明式安装（推荐）
 
@@ -58,7 +69,7 @@ jobs:
 
           ### 预编译安装包说明
           - **Windows (x64)**：
-            - \`MailChat_${VERSION}_x64-setup.exe\` — NSIS 标准向导安装包
+            - \`MailChat_${VERSION}_x64-setup.exe\` — NSIS 标准安装向导（支持应用内签名热更新）
             - \`MailChat_${VERSION}_x64-portable.zip\` — 免安装绿色便携包（亦供 Scoop 使用）
           - **macOS（已完成深度 Ad-hoc 签名密封）**：
             - \`MailChat_${VERSION}_aarch64.dmg\` — Apple Silicon (M1 ~ M4)
@@ -67,15 +78,19 @@ jobs:
           - **Linux (x64)**：
             - \`MailChat_${VERSION}_amd64.deb\` — Debian / Ubuntu 安装包
             - \`MailChat_${VERSION}_amd64.AppImage\` — 通用免安装包
-          - **校验文件**：\`SHA256SUMS.txt\`
+          - **更新清单与校验文件**：\`latest.json\`（Minisign 签名更新清单）· \`SHA256SUMS.txt\`
           EOF
-            )
+            PRE_FLAG=()
+            if [ "$IS_PRE" = "true" ]; then
+              PRE_FLAG+=(--prerelease)
+            fi
             gh release create "$TAG" \
               --repo "${GITHUB_REPOSITORY}" \
               --target "${GITHUB_SHA}" \
               --title "MailChat ${TAG}" \
-              --notes "$NOTES" \
-              --draft
+              --notes-file release-notes.md \
+              --draft \
+              "${PRE_FLAG[@]}"
           fi
 
   build:
@@ -144,6 +159,24 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Align manifest versions with release tag (${{ needs.prepare-release.outputs.version }})
+        shell: bash
+        env:
+          REL_VERSION: ${{ needs.prepare-release.outputs.version }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const v = process.env.REL_VERSION;
+            for (const f of ["package.json", "src-tauri/tauri.conf.json"]) {
+              const j = JSON.parse(fs.readFileSync(f, "utf8"));
+              j.version = v;
+              fs.writeFileSync(f, JSON.stringify(j, null, 2) + "\n");
+            }
+            const cargo = fs.readFileSync("src-tauri/Cargo.toml", "utf8")
+              .replace(/^version\s*=\s*"[^"]*"/m, `version = "${v}"`);
+            fs.writeFileSync("src-tauri/Cargo.toml", cargo);
+          '
+
       - name: Build Tauri release bundles
         env:
           CI: "true"
@@ -151,13 +184,15 @@ jobs:
           APPIMAGE_EXTRACT_AND_RUN: "1"
         run: npx tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
 
-      - name: Package Windows portable zip & upload Windows assets
+      - name: Package, sign & upload Windows assets
         if: matrix.platform == 'windows-x64'
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.prepare-release.outputs.tag }}
           VERSION: ${{ needs.prepare-release.outputs.version }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           $relDir = "src-tauri/target/${{ matrix.target }}/release"
           $stageDir = "portable-stage"
@@ -170,18 +205,33 @@ jobs:
           $zipName = "MailChat_${env:VERSION}_x64-portable.zip"
           Compress-Archive -Path "$stageDir/*" -DestinationPath $zipName -Force
 
-          $nsisExe = Get-ChildItem "$relDir/bundle/nsis/*.exe" | Select-Object -First 1
-          if (-not $nsisExe) { throw "NSIS installer not found!" }
+          $rawNsis = Get-ChildItem "$relDir/bundle/nsis/*.exe" | Select-Object -First 1
+          if (-not $rawNsis) { throw "NSIS installer not found!" }
+          $nsisName = "MailChat_${env:VERSION}_x64-setup.exe"
+          Copy-Item -Force $rawNsis.FullName $nsisName
 
-          gh release upload "$env:TAG" $nsisExe.FullName $zipName --clobber --repo "${env:GITHUB_REPOSITORY}"
+          $uploadList = @($nsisName, $zipName)
+          if ($env:TAURI_SIGNING_PRIVATE_KEY -and $env:TAURI_SIGNING_PRIVATE_KEY.Trim().Length -gt 0) {
+            $pwdArg = if ($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) { $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD } else { "" }
+            npx tauri signer sign -p "$pwdArg" --app-version "$env:VERSION" "$nsisName"
+            if (Test-Path "$nsisName.sig") {
+              $uploadList += "$nsisName.sig"
+            }
+          } else {
+            Write-Warning "TAURI_SIGNING_PRIVATE_KEY secret not set; skipping Minisign signature for Windows NSIS."
+          }
 
-      - name: Deep ad-hoc sign macOS App, build DMG & upload
+          gh release upload "$env:TAG" @uploadList --clobber --repo "${env:GITHUB_REPOSITORY}"
+
+      - name: Deep ad-hoc sign macOS App, build updater tar.gz & DMG, sign & upload
         if: runner.os == 'macOS'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.prepare-release.outputs.tag }}
           VERSION: ${{ needs.prepare-release.outputs.version }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           set -euo pipefail
           APP_PATH="src-tauri/target/${{ matrix.target }}/release/bundle/macos/MailChat.app"
@@ -195,12 +245,17 @@ jobs:
           codesign --force --deep --sign - "$APP_PATH"
           codesign --verify --deep --strict --verbose=2 "$APP_PATH"
 
-          # 2. Build clean compressed UDZO DMG with /Applications drag target
           if [ "${{ matrix.platform }}" = "macos-aarch64" ]; then
             ARCH_LABEL="aarch64"
           else
             ARCH_LABEL="x64"
           fi
+
+          # 2. Pack updater .app.tar.gz AFTER deep ad-hoc seal so signature matches sealed bundle
+          TAR_NAME="MailChat_${VERSION}_${ARCH_LABEL}.app.tar.gz"
+          COPYFILE_DISABLE=1 tar -czf "$TAR_NAME" -C "$(dirname "$APP_PATH")" "MailChat.app"
+
+          # 3. Build clean compressed UDZO DMG with /Applications drag target
           DMG_NAME="MailChat_${VERSION}_${ARCH_LABEL}.dmg"
           STAGE_DIR="$(mktemp -d)"
           ditto "$APP_PATH" "$STAGE_DIR/MailChat.app"
@@ -212,43 +267,304 @@ jobs:
             "$DMG_NAME"
           rm -rf "$STAGE_DIR"
 
-          gh release upload "$TAG" "$DMG_NAME" --clobber --repo "${GITHUB_REPOSITORY}"
+          UPLOAD_FILES=("$DMG_NAME" "$TAR_NAME")
+          if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            npx tauri signer sign -p "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" --app-version "$VERSION" "$TAR_NAME"
+            if [ -f "${TAR_NAME}.sig" ]; then
+              UPLOAD_FILES+=("${TAR_NAME}.sig")
+            fi
+          else
+            echo "::warning::TAURI_SIGNING_PRIVATE_KEY secret not set; skipping Minisign signature for macOS."
+          fi
 
-      - name: Upload Linux DEB & AppImage assets
+          gh release upload "$TAG" "${UPLOAD_FILES[@]}" --clobber --repo "${GITHUB_REPOSITORY}"
+
+      - name: Sign & upload Linux DEB & AppImage assets
         if: runner.os == 'Linux'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.prepare-release.outputs.tag }}
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
+          set -euo pipefail
           shopt -s nullglob
-          ASSETS=(
-            src-tauri/target/${{ matrix.target }}/release/bundle/deb/*.deb
-            src-tauri/target/${{ matrix.target }}/release/bundle/appimage/*.AppImage
-          )
-          if [ ${#ASSETS[@]} -eq 0 ]; then
+          DEB_SRC=(src-tauri/target/${{ matrix.target }}/release/bundle/deb/*.deb)
+          APPIMG_SRC=(src-tauri/target/${{ matrix.target }}/release/bundle/appimage/*.AppImage)
+          if [ ${#DEB_SRC[@]} -eq 0 ] || [ ${#APPIMG_SRC[@]} -eq 0 ]; then
             echo "Linux bundles not found!" >&2
             exit 1
           fi
-          gh release upload "$TAG" "${ASSETS[@]}" --clobber --repo "${GITHUB_REPOSITORY}"
+
+          DEB_NAME="MailChat_${VERSION}_amd64.deb"
+          APPIMG_NAME="MailChat_${VERSION}_amd64.AppImage"
+          cp -f "${DEB_SRC[0]}" "$DEB_NAME"
+          cp -f "${APPIMG_SRC[0]}" "$APPIMG_NAME"
+
+          UPLOAD_FILES=("$DEB_NAME" "$APPIMG_NAME")
+          if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            for f in "$DEB_NAME" "$APPIMG_NAME"; do
+              npx tauri signer sign -p "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" --app-version "$VERSION" "$f"
+              if [ -f "${f}.sig" ]; then
+                UPLOAD_FILES+=("${f}.sig")
+              fi
+            done
+          else
+            echo "::warning::TAURI_SIGNING_PRIVATE_KEY secret not set; skipping Minisign signature for Linux."
+          fi
+
+          gh release upload "$TAG" "${UPLOAD_FILES[@]}" --clobber --repo "${GITHUB_REPOSITORY}"
 
   publish-release:
-    name: Generate SHA256 & Publish Release
+    name: Build latest.json, SHA256 & Publish
     needs: [prepare-release, build]
     runs-on: ubuntu-latest
     steps:
-      - name: Generate SHA256SUMS.txt and publish release
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Generate signed latest.json, SHA256SUMS.txt and publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.prepare-release.outputs.tag }}
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+          IS_PRE: ${{ needs.prepare-release.outputs.is_prerelease }}
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p release-assets
           gh release download "$TAG" --dir release-assets --repo "${GITHUB_REPOSITORY}"
+
+          NOTES="$(gh release view "$TAG" --repo "${GITHUB_REPOSITORY}" --json body --jq .body || true)"
+          export RELEASE_NOTES="$NOTES"
+
+          node -e '
+            const fs = require("fs");
+            const path = require("path");
+            const dir = "release-assets";
+            const repo = process.env.GITHUB_REPOSITORY;
+            const tag = process.env.TAG;
+            const version = process.env.VERSION;
+            const baseUrl = `https://github.com/${repo}/releases/download/${tag}`;
+
+            function entryFor(fileName) {
+              const sigPath = path.join(dir, `${fileName}.sig`);
+              const binPath = path.join(dir, fileName);
+              if (!fs.existsSync(binPath) || !fs.existsSync(sigPath)) return null;
+              return {
+                signature: fs.readFileSync(sigPath, "utf8").trim(),
+                url: `${baseUrl}/${encodeURIComponent(fileName)}`,
+              };
+            }
+
+            const platforms = {};
+            const win = entryFor(`MailChat_${version}_x64-setup.exe`);
+            if (win) {
+              platforms["windows-x86_64-nsis"] = win;
+              platforms["windows-x86_64"] = win;
+            }
+            const macArm = entryFor(`MailChat_${version}_aarch64.app.tar.gz`);
+            if (macArm) {
+              platforms["darwin-aarch64-app"] = macArm;
+              platforms["darwin-aarch64"] = macArm;
+            }
+            const macIntel = entryFor(`MailChat_${version}_x64.app.tar.gz`);
+            if (macIntel) {
+              platforms["darwin-x86_64-app"] = macIntel;
+              platforms["darwin-x86_64"] = macIntel;
+            }
+            const appImg = entryFor(`MailChat_${version}_amd64.AppImage`);
+            if (appImg) {
+              platforms["linux-x86_64-appimage"] = appImg;
+              platforms["linux-x86_64"] = appImg;
+            }
+            const deb = entryFor(`MailChat_${version}_amd64.deb`);
+            if (deb) {
+              platforms["linux-x86_64-deb"] = deb;
+            }
+
+            if (Object.keys(platforms).length > 0) {
+              const manifest = {
+                version,
+                notes: process.env.RELEASE_NOTES || `MailChat v${version}`,
+                pub_date: new Date().toISOString(),
+                platforms,
+              };
+              fs.writeFileSync(path.join(dir, "latest.json"), JSON.stringify(manifest, null, 2) + "\n");
+              console.log("Generated latest.json with targets:", Object.keys(platforms).join(", "));
+            } else {
+              console.warn("No .sig files present; skipping latest.json generation.");
+            }
+          '
+
           (
             cd release-assets
             rm -f SHA256SUMS.txt
-            sha256sum * > SHA256SUMS.txt
+            sha256sum $(ls -1 | grep -v '\.sig$' | grep -v '^SHA256SUMS\.txt$') > SHA256SUMS.txt
           )
-          gh release upload "$TAG" release-assets/SHA256SUMS.txt --clobber --repo "${GITHUB_REPOSITORY}"
-          gh release edit "$TAG" --draft=false --latest --repo "${GITHUB_REPOSITORY}"
+
+          EXTRA_UPLOADS=("release-assets/SHA256SUMS.txt")
+          if [ -f "release-assets/latest.json" ]; then
+            EXTRA_UPLOADS+=("release-assets/latest.json")
+          fi
+          gh release upload "$TAG" "${EXTRA_UPLOADS[@]}" --clobber --repo "${GITHUB_REPOSITORY}"
+
+          if [ "$IS_PRE" = "true" ]; then
+            gh release edit "$TAG" --draft=false --prerelease --repo "${GITHUB_REPOSITORY}"
+          else
+            gh release edit "$TAG" --draft=false --latest --repo "${GITHUB_REPOSITORY}"
+          fi
+
+  sync-package-managers:
+    name: Sync Scoop Bucket & Homebrew Tap
+    needs: [prepare-release, publish-release]
+    if: needs.prepare-release.outputs.is_prerelease == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compute hashes & sync Scoop / Homebrew manifests
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PKG_TOKEN: ${{ secrets.PACKAGE_MANAGER_TOKEN }}
+          TAG: ${{ needs.prepare-release.outputs.tag }}
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+          SCOOP_REPO: "arrake0101/scoop-bucket"
+          TAP_REPO: "arrake0101/homebrew-tap"
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p pm-assets
+          gh release download "$TAG" \
+            --pattern "SHA256SUMS.txt" \
+            --dir pm-assets \
+            --repo "${GITHUB_REPOSITORY}"
+
+          WIN_ZIP="MailChat_${VERSION}_x64-portable.zip"
+          MAC_ARM="MailChat_${VERSION}_aarch64.dmg"
+          MAC_X64="MailChat_${VERSION}_x64.dmg"
+
+          HASH_WIN="$(awk -v f="$WIN_ZIP" '$2 == f || $2 == "*"f {print $1}' pm-assets/SHA256SUMS.txt | head -n1)"
+          HASH_ARM="$(awk -v f="$MAC_ARM" '$2 == f || $2 == "*"f {print $1}' pm-assets/SHA256SUMS.txt | head -n1)"
+          HASH_X64="$(awk -v f="$MAC_X64" '$2 == f || $2 == "*"f {print $1}' pm-assets/SHA256SUMS.txt | head -n1)"
+
+          export HASH_WIN HASH_ARM HASH_X64
+
+          python3 - <<'PY'
+          import json, os, textwrap
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          ver = os.environ["VERSION"]
+          h_win = os.environ.get("HASH_WIN", "")
+          h_arm = os.environ.get("HASH_ARM", "")
+          h_x64 = os.environ.get("HASH_X64", "")
+
+          scoop = {
+              "version": ver,
+              "description": "Modern instant-messaging desktop email client powered by Tauri v2 & declarative config.toml",
+              "homepage": f"https://github.com/{repo}",
+              "license": "MIT",
+              "architecture": {
+                  "64bit": {
+                      "url": f"https://github.com/{repo}/releases/download/v{ver}/MailChat_{ver}_x64-portable.zip",
+                      "hash": h_win,
+                  }
+              },
+              "bin": "mailchat.exe",
+              "shortcuts": [["mailchat.exe", "MailChat"]],
+              "checkver": {"github": f"https://github.com/{repo}"},
+              "autoupdate": {
+                  "architecture": {
+                      "64bit": {
+                          "url": f"https://github.com/{repo}/releases/download/v$version/MailChat_$version_x64-portable.zip"
+                      }
+                  }
+              },
+          }
+          with open("mailchat.scoop.json", "w", encoding="utf-8") as f:
+              json.dump(scoop, f, indent=2)
+              f.write("\n")
+
+          cask = textwrap.dedent(f"""\
+              cask "mailchat" do
+                version "{ver}"
+
+                on_arm do
+                  sha256 "{h_arm}"
+                  url "https://github.com/{repo}/releases/download/v#{{version}}/MailChat_#{{version}}_aarch64.dmg"
+                end
+                on_intel do
+                  sha256 "{h_x64}"
+                  url "https://github.com/{repo}/releases/download/v#{{version}}/MailChat_#{{version}}_x64.dmg"
+                end
+
+                name "MailChat"
+                desc "Instant-messaging style desktop email client with declarative config.toml"
+                homepage "https://github.com/{repo}"
+
+                app "MailChat.app"
+
+                postflight do
+                  system_command "/usr/bin/xattr",
+                                 args: ["-cr", "#{{appdir}}/MailChat.app"],
+                                 sudo: false
+                end
+
+                zap trash: [
+                  "~/Library/Application Support/com.mailchat.app",
+                  "~/Library/Caches/com.mailchat.app",
+                  "~/Library/Preferences/com.mailchat.app.plist",
+                ]
+              end
+          """)
+          with open("mailchat.rb", "w", encoding="utf-8") as f:
+              f.write(cask)
+          PY
+
+          {
+            echo "### Package Manager Manifests for v${VERSION}"
+            echo "- Windows Portable SHA256: \`${HASH_WIN}\`"
+            echo "- macOS ARM64 DMG SHA256: \`${HASH_ARM}\`"
+            echo "- macOS x64 DMG SHA256: \`${HASH_X64}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -z "${PKG_TOKEN:-}" ]; then
+            echo "::notice::PACKAGE_MANAGER_TOKEN secret not set; manifests written to Job Summary only."
+            exit 0
+          fi
+
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # 1. Push Scoop manifest
+          if git clone "https://x-access-token:${PKG_TOKEN}@github.com/${SCOOP_REPO}.git" scoop-repo 2>/dev/null; then
+            if [ -d "scoop-repo/bucket" ]; then
+              cp -f mailchat.scoop.json scoop-repo/bucket/mailchat.json
+            else
+              cp -f mailchat.scoop.json scoop-repo/mailchat.json
+            fi
+            (
+              cd scoop-repo
+              git add -A
+              if ! git diff --cached --quiet; then
+                git commit -m "mailchat: update to v${VERSION}"
+                git push
+              fi
+            )
+          fi
+
+          # 2. Push Homebrew Cask
+          if git clone "https://x-access-token:${PKG_TOKEN}@github.com/${TAP_REPO}.git" tap-repo 2>/dev/null; then
+            mkdir -p tap-repo/Casks
+            cp -f mailchat.rb tap-repo/Casks/mailchat.rb
+            (
+              cd tap-repo
+              git add -A
+              if ! git diff --cached --quiet; then
+                git commit -m "mailchat: update to v${VERSION}"
+                git push
+              fi
+            )
+          fi

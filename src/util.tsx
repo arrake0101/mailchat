@@ -29,7 +29,8 @@ function hash(s: string) {
 }
 
 export function senderColor(seed: string) {
-  return NAME_COLORS[hash(seed) % NAME_COLORS.length];
+  const idx = hash(seed) % NAME_COLORS.length;
+  return `var(--sender-color-${idx}, ${NAME_COLORS[idx]})`;
 }
 
 export function Avatar({

@@ -6,10 +6,12 @@ import { useContextMenu } from "./ContextMenu";
 import { buildConversationMenuEntries } from "./ConversationList";
 import {
   BrandAppIcon,
+  IconAgentDock,
   IconBell,
   IconChat,
   IconCheck,
   IconCode,
+  IconCompose,
   IconKey,
   IconLock,
   IconMailRead,
@@ -18,6 +20,7 @@ import {
   IconPin,
   IconPlus,
   IconRefresh,
+  IconReplyHub,
   IconShield,
   IconSliders,
   IconSparkles,
@@ -66,6 +69,10 @@ export interface FirstScreenWorkspaceProps {
   onSelectConversation: (peer: string) => void;
   onOpenConversationDrawer: (peer: string) => void;
   onOpenComposePanel: (mode: "direct" | "group") => void;
+  onOpenComposeStudio?: () => void;
+  onOpenReplyHub?: () => void;
+  agentDockOpen?: boolean;
+  onToggleAgentDock?: () => void;
   onConnectAccount: (presetDomain?: string) => void;
   onManageAccounts: () => void;
   onOpenAssistant: () => void;
@@ -90,6 +97,10 @@ export function FirstScreenWorkspace({
   onSelectConversation,
   onOpenConversationDrawer,
   onOpenComposePanel,
+  onOpenComposeStudio,
+  onOpenReplyHub,
+  agentDockOpen = false,
+  onToggleAgentDock,
   onConnectAccount,
   onManageAccounts,
   onOpenAssistant,
@@ -159,6 +170,29 @@ export function FirstScreenWorkspace({
             label: "发起多人邮件群聊",
             icon: <IconUsers size={14} />,
             onSelect: () => onOpenComposePanel("group"),
+          }
+        : null,
+      onOpenComposeStudio
+        ? {
+            label: "打开写信工坊（传统写信 + HTML Agent）",
+            icon: <IconCompose size={14} />,
+            onSelect: onOpenComposeStudio,
+          }
+        : null,
+      onOpenReplyHub
+        ? {
+            label: "打开跨邮箱隐私统一批复",
+            icon: <IconReplyHub size={14} />,
+            onSelect: onOpenReplyHub,
+          }
+        : null,
+      onToggleAgentDock
+        ? {
+            label: agentDockOpen
+              ? "收起右侧邮件 AI 面板 (Ctrl+J)"
+              : "向右展开邮件 AI 面板 (Ctrl+J)",
+            icon: <IconAgentDock size={14} open={!agentDockOpen} />,
+            onSelect: onToggleAgentDock,
           }
         : null,
       { kind: "divider" },
@@ -392,6 +426,17 @@ export function FirstScreenWorkspace({
           </div>
 
           <div className="fs-overview-actions">
+            {onOpenComposeStudio && (
+              <button
+                type="button"
+                className="soft-btn"
+                onClick={onOpenComposeStudio}
+                title="传统邮件写信与 Agent HTML 排版工坊"
+              >
+                <IconCompose size={14} />
+                <span>写信工坊</span>
+              </button>
+            )}
             <button
               type="button"
               className="soft-btn"
@@ -408,6 +453,21 @@ export function FirstScreenWorkspace({
               <IconUsers size={14} />
               <span>新建群聊</span>
             </button>
+            {onToggleAgentDock && (
+              <button
+                type="button"
+                className={`soft-btn ${agentDockOpen ? "active-soft" : ""}`}
+                onClick={onToggleAgentDock}
+                title={
+                  agentDockOpen
+                    ? "收起右侧邮件 AI 面板 (Ctrl+J)"
+                    : "向右展开邮件 AI 面板 (Ctrl+J)"
+                }
+              >
+                <IconAgentDock size={14} open={agentDockOpen} />
+                <span>{agentDockOpen ? "收起邮件 AI" : "邮件 AI"}</span>
+              </button>
+            )}
             {account ? (
               <button
                 type="button"
@@ -687,6 +747,39 @@ export function FirstScreenWorkspace({
 
         {/* 底部快捷能力入口与桌面操作提示 */}
         <div className="fs-quick-grid">
+          {onOpenComposeStudio && (
+            <button
+              type="button"
+              className="fs-quick-tile"
+              onClick={onOpenComposeStudio}
+            >
+              <IconCompose size={16} />
+              <div className="fs-quick-text">
+                <span className="fs-quick-title">传统写信 + Agent HTML 工坊</span>
+                <span className="fs-quick-sub">多邮箱切换、抄送密送与内联 HTML 实时双栏预览</span>
+              </div>
+            </button>
+          )}
+
+          {onOpenReplyHub && (
+            <button
+              type="button"
+              className="fs-quick-tile"
+              onClick={onOpenReplyHub}
+            >
+              <IconReplyHub size={16} />
+              <div className="fs-quick-text">
+                <span className="fs-quick-title">
+                  跨邮箱隐私统一批复
+                  {(stats.reply_pending_count ?? 0) > 0
+                    ? ` · ${stats.reply_pending_count} 封待审`
+                    : ""}
+                </span>
+                <span className="fs-quick-sub">本地入模 PII 脱敏、范围隔离与分级权限放行</span>
+              </div>
+            </button>
+          )}
+
           <button
             type="button"
             className="fs-quick-tile"
